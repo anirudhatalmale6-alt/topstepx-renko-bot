@@ -89,15 +89,22 @@ class RenkoAlignmentBot:
         print()
 
         # Initialize TradingSuite - handles auth, websocket, data
-        self.suite = await TradingSuite.create(
-            self.symbol,
-            timeframes=SDK_TIMEFRAMES,
-            initial_days=2,  # Load 2 days of history to warm up Renko
-        )
+        import os
+        account_name = os.environ.get("PROJECT_X_ACCOUNT_NAME", "")
+        create_kwargs = {
+            "instruments": self.symbol,
+            "timeframes": SDK_TIMEFRAMES,
+            "initial_days": 2,
+        }
+
+        self.suite = await TradingSuite.create(**create_kwargs)
+
+        # Access instrument context
+        self.ctx = self.suite[self.symbol]
 
         print(f"[BOT] Connected to TopstepX")
         print(f"[BOT] Account: {self.suite.client.account_info.name}")
-        print(f"[BOT] Contract: {self.suite.instrument_info.id}")
+        print(f"[BOT] Contract: {self.ctx.instrument_info.id}")
         print()
 
         # Build Renko bricks from historical data
@@ -128,7 +135,7 @@ class RenkoAlignmentBot:
 
         # Direct SDK timeframes: 1min, 5min, 15min
         for tf_label in ["1min", "5min", "15min"]:
-            data = await self.suite.data.get_data(tf_label, bars=500)
+            data = await self.ctx.data.get_data(tf_label, bars=500)
             if data is not None and len(data) > 0:
                 bars = []
                 for row in data.iter_rows(named=True):
@@ -146,7 +153,7 @@ class RenkoAlignmentBot:
                 print(f"  {tf_label}: No data available!")
 
         # Build 3min from 1min data (aggregate every 3 bars)
-        data_1m = await self.suite.data.get_data("1min", bars=1500)
+        data_1m = await self.ctx.data.get_data("1min", bars=1500)
         if data_1m is not None and len(data_1m) > 0:
             rows = list(data_1m.iter_rows(named=True))
             bars_3m = []
@@ -168,7 +175,7 @@ class RenkoAlignmentBot:
     async def _tick(self):
         """Single tick of the bot loop."""
         # Get current price
-        price = await self.suite.data.get_current_price()
+        price = await self.ctx.data.get_current_price()
         if price is None:
             return
 
@@ -221,8 +228,8 @@ class RenkoAlignmentBot:
         """Place a market buy order."""
         print(f"\n[TRADE] >>> ENTERING LONG @ {price:.2f}")
         try:
-            response = await self.suite.orders.place_market_order(
-                contract_id=self.suite.instrument_info.id,
+            response = await self.ctx.orders.place_market_order(
+                contract_id=self.ctx.instrument_info.id,
                 side=0,  # Buy
                 size=self.qty,
             )
@@ -239,8 +246,8 @@ class RenkoAlignmentBot:
         """Place a market sell order."""
         print(f"\n[TRADE] >>> ENTERING SHORT @ {price:.2f}")
         try:
-            response = await self.suite.orders.place_market_order(
-                contract_id=self.suite.instrument_info.id,
+            response = await self.ctx.orders.place_market_order(
+                contract_id=self.ctx.instrument_info.id,
                 side=1,  # Sell
                 size=self.qty,
             )
@@ -260,16 +267,16 @@ class RenkoAlignmentBot:
         print(f"\n[TRADE] <<< EXITING {direction} @ {price:.2f} | P&L: {pnl:+.2f} pts | Reason: {reason}")
 
         try:
-            result = await self.suite.positions.close_position_direct(
-                contract_id=self.suite.instrument_info.id,
+            result = await self.ctx.positions.close_position_direct(
+                contract_id=self.ctx.instrument_info.id,
             )
             if result.get("success"):
                 print(f"[TRADE] Position closed. Order: {result.get('orderId')}")
             else:
                 # Fallback: place opposite market order
                 side = 1 if self.position == 1 else 0
-                response = await self.suite.orders.place_market_order(
-                    contract_id=self.suite.instrument_info.id,
+                response = await self.ctx.orders.place_market_order(
+                    contract_id=self.ctx.instrument_info.id,
                     side=side,
                     size=self.qty,
                 )
@@ -308,7 +315,7 @@ class RenkoAlignmentBot:
         """Clean shutdown."""
         print("\n[BOT] Shutting down...")
         if self.position != 0:
-            price = await self.suite.data.get_current_price()
+            price = await self.ctx.data.get_current_price()
             if price:
                 await self._flatten(price, reason="SHUTDOWN")
 
