@@ -1,0 +1,2 @@
+project-x-py>=3.5.0
+pytz
