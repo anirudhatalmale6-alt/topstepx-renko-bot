@@ -31,8 +31,8 @@ import pytz
 
 ET = pytz.timezone("America/New_York")
 
-SESSION_BREAK_START = dtime(16, 0)
-SESSION_BREAK_END = dtime(18, 0)
+SESSION_START = dtime(9, 0)
+SESSION_END = dtime(16, 0)
 
 TIMEFRAME = "15min"
 DOJI_THRESHOLD = 0.01
@@ -47,9 +47,7 @@ POINT_VALUE = 20.0
 
 def in_session() -> bool:
     now = datetime.now(ET).time()
-    if SESSION_BREAK_START <= now < SESSION_BREAK_END:
-        return False
-    return True
+    return SESSION_START <= now < SESSION_END
 
 
 # ============================================================
@@ -92,7 +90,7 @@ class CandleColorBot:
         print(f"[BOT] Symbol: {self.symbol}, Qty: {self.qty}")
         print(f"[BOT] Timeframe: {TIMEFRAME}")
         print(f"[BOT] TP Target: ${self.tp_dollars:.0f} ({tp_pts:.2f} pts per milestone)")
-        print(f"[BOT] Session: 18:00 - 16:00 ET (break 16:00-18:00)")
+        print(f"[BOT] Session: 09:00 - 16:00 ET")
         print()
 
         self.suite = await TradingSuite.create(
