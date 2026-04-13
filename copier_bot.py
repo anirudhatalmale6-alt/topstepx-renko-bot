@@ -6,15 +6,15 @@ to your TopstepX account automatically.
 
 This script contains NO strategy logic - it just copies signals.
 
-Signal format: SIGNAL|LONG|NQ|25385.50|1
-               SIGNAL|SHORT|NQ|25380.00|1
-               SIGNAL|FLAT|NQ|25382.00|0
+Signal format: SIGNAL|KEY|LONG|NQ|25385.50|1
+               SIGNAL|KEY|SHORT|NQ|25380.00|1
+               SIGNAL|KEY|FLAT|NQ|25382.00|0
 
 Usage:
     export PROJECT_X_USERNAME="your_email"
     export PROJECT_X_API_KEY="your_api_key"
     export PROJECT_X_ACCOUNT_NAME="your_account"
-    python copier_bot.py --tg-token YOUR_BOT_TOKEN --tg-chat CHAT_ID --symbol NQ --qty 1
+    python copier_bot.py --tg-token YOUR_BOT_TOKEN --tg-chat CHAT_ID --tg-key PASSWORD --symbol NQ --qty 1
 """
 
 import asyncio
@@ -31,9 +31,10 @@ ET = pytz.timezone("America/New_York")
 
 
 class SignalCopier:
-    def __init__(self, tg_token: str, tg_chat: str, symbol: str, qty: int = 1):
+    def __init__(self, tg_token: str, tg_chat: str, tg_key: str, symbol: str, qty: int = 1):
         self.tg_token = tg_token
         self.tg_chat = tg_chat
+        self.tg_key = tg_key
         self.symbol = symbol
         self.qty = qty
 
@@ -109,15 +110,20 @@ class SignalCopier:
         """Parse and execute a trade signal."""
         now = datetime.now(ET).strftime("%H:%M:%S")
         parts = signal_text.strip().split("|")
-        # Format: SIGNAL|DIRECTION|SYMBOL|PRICE|QTY
+        # Format: SIGNAL|KEY|DIRECTION|SYMBOL|PRICE|QTY
 
-        if len(parts) < 4:
+        if len(parts) < 5:
             print(f"[{now}] [COPIER] Bad signal: {signal_text}")
             return
 
-        direction = parts[1]   # LONG, SHORT, or FLAT
-        sig_symbol = parts[2]  # NQ
-        sig_price = parts[3]   # reference price from sender
+        sig_key = parts[1]     # passkey
+        direction = parts[2]   # LONG, SHORT, or FLAT
+        sig_symbol = parts[3]  # NQ
+        sig_price = parts[4]   # reference price from sender
+
+        if sig_key != self.tg_key:
+            print(f"[{now}] [COPIER] Invalid key - signal rejected")
+            return
 
         print(f"[{now}] [COPIER] Received signal: {direction} {sig_symbol} @ {sig_price}")
 
@@ -216,6 +222,7 @@ def main():
     parser = argparse.ArgumentParser(description="TopstepX Signal Copier")
     parser.add_argument("--tg-token", required=True, help="Telegram bot token")
     parser.add_argument("--tg-chat", required=True, help="Telegram chat/channel ID")
+    parser.add_argument("--tg-key", required=True, help="Passkey to authenticate signals")
     parser.add_argument("--symbol", default="NQ", help="Contract symbol")
     parser.add_argument("--qty", type=int, default=1, help="Order quantity")
     args = parser.parse_args()
@@ -223,6 +230,7 @@ def main():
     bot = SignalCopier(
         tg_token=args.tg_token,
         tg_chat=args.tg_chat,
+        tg_key=args.tg_key,
         symbol=args.symbol,
         qty=args.qty,
     )

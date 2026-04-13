@@ -17,7 +17,7 @@ Usage:
     python color_bot.py --symbol NQ --qty 1 --tp 99999
 
     # With Telegram signals:
-    python color_bot.py --symbol NQ --qty 1 --tp 99999 --tg-token YOUR_BOT_TOKEN --tg-chat YOUR_CHAT_ID
+    python color_bot.py --symbol NQ --qty 1 --tp 99999 --tg-token YOUR_BOT_TOKEN --tg-chat YOUR_CHAT_ID --tg-key mypassword
 """
 
 import asyncio
@@ -78,12 +78,13 @@ def in_session() -> bool:
 
 class CandleColorBot:
     def __init__(self, symbol: str, qty: int = 1, tp_dollars: float = 100.0,
-                 tg_token: str = "", tg_chat: str = ""):
+                 tg_token: str = "", tg_chat: str = "", tg_key: str = ""):
         self.symbol = symbol
         self.qty = qty
         self.tp_dollars = tp_dollars
         self.tg_token = tg_token
         self.tg_chat = tg_chat
+        self.tg_key = tg_key
 
         # Position state
         self.position = 0  # 1=long, -1=short, 0=flat
@@ -253,7 +254,7 @@ class CandleColorBot:
                 self.entry_price = price
                 print(f"[TRADE] Order filled. ID: {response.orderId}")
                 send_telegram(self.tg_token, self.tg_chat,
-                              f"SIGNAL|LONG|{self.symbol}|{price}|{self.qty}")
+                              f"SIGNAL|{self.tg_key}|LONG|{self.symbol}|{price}|{self.qty}")
             else:
                 print(f"[TRADE] Order FAILED: {response.errorMessage}")
         except Exception as e:
@@ -273,7 +274,7 @@ class CandleColorBot:
                 self.entry_price = price
                 print(f"[TRADE] Order filled. ID: {response.orderId}")
                 send_telegram(self.tg_token, self.tg_chat,
-                              f"SIGNAL|SHORT|{self.symbol}|{price}|{self.qty}")
+                              f"SIGNAL|{self.tg_key}|SHORT|{self.symbol}|{price}|{self.qty}")
             else:
                 print(f"[TRADE] Order FAILED: {response.errorMessage}")
         except Exception as e:
@@ -288,7 +289,7 @@ class CandleColorBot:
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [TRADE] <<< EXITING {direction} @ {price:.2f} | Trade P&L: ${trade_pnl_dollars:+.2f} | Session P&L: ${self.session_pnl:.2f} | Reason: {reason}")
         send_telegram(self.tg_token, self.tg_chat,
-                      f"SIGNAL|FLAT|{self.symbol}|{price}|0")
+                      f"SIGNAL|{self.tg_key}|FLAT|{self.symbol}|{price}|0")
 
         try:
             result = await self.ctx.positions.close_position_direct(
@@ -341,6 +342,7 @@ def main():
     parser.add_argument("--tp", type=float, default=100.0, help="Take profit target in dollars per milestone")
     parser.add_argument("--tg-token", default="", help="Telegram bot token for signal broadcasting")
     parser.add_argument("--tg-chat", default="", help="Telegram chat/channel ID for signals")
+    parser.add_argument("--tg-key", default="", help="Passkey for signal authentication (friends need this to copy)")
     args = parser.parse_args()
 
     bot = CandleColorBot(
@@ -349,6 +351,7 @@ def main():
         tp_dollars=args.tp,
         tg_token=args.tg_token,
         tg_chat=args.tg_chat,
+        tg_key=args.tg_key,
     )
 
     loop = asyncio.new_event_loop()
