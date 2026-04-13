@@ -38,7 +38,11 @@ TIMEFRAME = "15min"
 POINT_VALUE = 20.0  # NQ: $20 per point per contract
 
 # Trailing stop
-TRAIL_POINTS = 2.0  # Trail 2 points behind best price
+TRAIL_POINTS = 3.0  # Trail 3 points behind best price
+
+# Anti-whipsaw
+BUFFER_POINTS = 1.5  # Price must be this far past level to trigger
+COOLDOWN_SECS = 45   # Minimum seconds between trades
 
 
 # ============================================================
@@ -57,10 +61,13 @@ def in_session() -> bool:
 # ============================================================
 
 class PingPongBot:
-    def __init__(self, symbol: str, qty: int = 1, trail: float = TRAIL_POINTS):
+    def __init__(self, symbol: str, qty: int = 1, trail: float = TRAIL_POINTS,
+                 buffer: float = BUFFER_POINTS, cooldown: int = COOLDOWN_SECS):
         self.symbol = symbol
         self.qty = qty
         self.trail = trail
+        self.buffer = buffer
+        self.cooldown = cooldown
 
         # Levels from previous candle body
         self.body_top = None    # Higher of open/close
@@ -80,6 +87,7 @@ class PingPongBot:
         # P&L tracking
         self.session_pnl = 0.0
         self.trade_count = 0
+        self.last_trade_time = 0  # Cooldown tracking
 
         # Session
         self.was_in_session = False
@@ -96,6 +104,8 @@ class PingPongBot:
         print(f"[BOT] Symbol: {self.symbol}, Qty: {self.qty}")
         print(f"[BOT] Timeframe: {TIMEFRAME}")
         print(f"[BOT] Trailing Stop: {self.trail} pts")
+        print(f"[BOT] Buffer: {self.buffer} pts (price must move past level)")
+        print(f"[BOT] Cooldown: {self.cooldown}s between trades")
         print(f"[BOT] Session: 18:00 - 16:00 ET")
         print()
 
@@ -203,9 +213,21 @@ class PingPongBot:
         if not currently_in_session:
             return
 
-        # Determine which side of each level price is on
-        side_top = "ABOVE" if price > self.body_top else "BELOW"
-        side_bottom = "ABOVE" if price > self.body_bottom else "BELOW"
+        # Determine which side of each level price is on (with buffer)
+        # Price must be buffer points PAST the level to count as crossed
+        if price > self.body_top + self.buffer:
+            side_top = "ABOVE"
+        elif price < self.body_top - self.buffer:
+            side_top = "BELOW"
+        else:
+            side_top = self.prev_side_top  # In the buffer zone - keep previous side
+
+        if price > self.body_bottom + self.buffer:
+            side_bottom = "ABOVE"
+        elif price < self.body_bottom - self.buffer:
+            side_bottom = "BELOW"
+        else:
+            side_bottom = self.prev_side_bottom  # In the buffer zone - keep previous side
 
         # === MANAGE EXISTING POSITION ===
         if self.position != 0:
@@ -269,6 +291,9 @@ class PingPongBot:
         self.prev_side_bottom = side_bottom
 
     async def _enter_long(self, price: float, level: str):
+        elapsed = time.time() - self.last_trade_time
+        if elapsed < self.cooldown:
+            return
         now = datetime.now(ET).strftime("%H:%M:%S")
         self.trade_count += 1
         target = self.body_bottom if level == "TOP" else self.body_top
@@ -284,6 +309,7 @@ class PingPongBot:
                 self.entry_price = price
                 self.best_price = price
                 self.active_level = level
+                self.last_trade_time = time.time()
                 print(f"[TRADE] Filled. Trail stop: {price - self.trail:.2f}")
             else:
                 print(f"[TRADE] FAILED: {response.errorMessage}")
@@ -291,6 +317,9 @@ class PingPongBot:
             print(f"[TRADE] ERROR: {e}")
 
     async def _enter_short(self, price: float, level: str):
+        elapsed = time.time() - self.last_trade_time
+        if elapsed < self.cooldown:
+            return
         now = datetime.now(ET).strftime("%H:%M:%S")
         self.trade_count += 1
         print(f"\n[{now}] [#{self.trade_count}] >>> SHORT @ {price:.2f} | Level: {level}={self.body_top if level == 'TOP' else self.body_bottom:.2f} | Session P&L: ${self.session_pnl:.2f}")
@@ -305,6 +334,7 @@ class PingPongBot:
                 self.entry_price = price
                 self.best_price = price
                 self.active_level = level
+                self.last_trade_time = time.time()
                 print(f"[TRADE] Filled. Trail stop: {price + self.trail:.2f}")
             else:
                 print(f"[TRADE] FAILED: {response.errorMessage}")
@@ -344,6 +374,7 @@ class PingPongBot:
         self.entry_price = 0.0
         self.best_price = 0.0
         self.active_level = None
+        self.last_trade_time = time.time()
 
     async def _shutdown(self):
         print("\n[BOT] Shutting down...")
@@ -370,13 +401,17 @@ def main():
     parser = argparse.ArgumentParser(description="TopstepX Ping Pong Bot")
     parser.add_argument("--symbol", default="NQ", help="Contract symbol")
     parser.add_argument("--qty", type=int, default=1, help="Order quantity")
-    parser.add_argument("--trail", type=float, default=2.0, help="Trailing stop in points")
+    parser.add_argument("--trail", type=float, default=3.0, help="Trailing stop in points")
+    parser.add_argument("--buffer", type=float, default=1.5, help="Buffer points past level to trigger")
+    parser.add_argument("--cooldown", type=int, default=45, help="Seconds between trades")
     args = parser.parse_args()
 
     bot = PingPongBot(
         symbol=args.symbol,
         qty=args.qty,
         trail=args.trail,
+        buffer=args.buffer,
+        cooldown=args.cooldown,
     )
 
     loop = asyncio.new_event_loop()
