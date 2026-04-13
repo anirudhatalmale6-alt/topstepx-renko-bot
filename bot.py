@@ -76,7 +76,7 @@ class GhostEmaBot:
         """Main bot loop."""
         from project_x_py import TradingSuite
 
-        print(f"[BOT] Ghost Candle + 9 EMA Bot")
+        print(f"[BOT] Ghost Candle + 9 EMA Bot (1H Renko)")
         print(f"[BOT] Symbol: {self.symbol}, Brick Size: {self.brick_size}, Qty: {self.qty}")
         print(f"[BOT] Session: {SESSION_START} - {SESSION_END} ET")
         print(f"[BOT] EMA Period: {EMA_PERIOD}")
@@ -85,8 +85,8 @@ class GhostEmaBot:
         import os
         self.suite = await TradingSuite.create(
             instruments=self.symbol,
-            timeframes=["1min"],
-            initial_days=2,
+            timeframes=["1hr"],
+            initial_days=5,
         )
 
         self.ctx = self.suite[self.symbol]
@@ -126,7 +126,7 @@ class GhostEmaBot:
         """Build Renko bricks from historical data."""
         print("[BOT] Warming up Renko from historical data...")
 
-        data = await self.ctx.data.get_data("1min", bars=500)
+        data = await self.ctx.data.get_data("1hr", bars=500)
         if data is not None and len(data) > 0:
             bars = []
             for row in data.iter_rows(named=True):
