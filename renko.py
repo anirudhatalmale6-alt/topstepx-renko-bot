@@ -126,18 +126,19 @@ class RenkoEngine:
 
         return ema_val
 
-    def ghost_vs_ema(self, period: int = 9) -> str | None:
+    def ghost_vs_ema(self, period: int = 9, buffer: float = 0.0) -> str | None:
         """
-        Compare ghost candle price to the EMA.
-        Returns 'ABOVE' if ghost > EMA, 'BELOW' if ghost < EMA, None if not enough data.
+        Compare ghost candle price to the EMA with optional buffer.
+        Returns 'ABOVE' if ghost > EMA + buffer, 'BELOW' if ghost < EMA - buffer,
+        'NEUTRAL' if within buffer zone, None if not enough data.
         """
         ema_val = self.ema(period)
         if ema_val is None:
             return None
 
-        if self.ghost_price > ema_val:
+        if self.ghost_price > ema_val + buffer:
             return "ABOVE"
-        elif self.ghost_price < ema_val:
+        elif self.ghost_price < ema_val - buffer:
             return "BELOW"
         else:
-            return "AT"
+            return "NEUTRAL"

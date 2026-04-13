@@ -33,6 +33,8 @@ SESSION_START = dtime(9, 27)
 SESSION_END = dtime(16, 0)
 
 EMA_PERIOD = 9
+EMA_BUFFER = 0.50  # Must be this many points past EMA to count as crossed
+TRADE_COOLDOWN = 30  # Seconds between trades to prevent rapid flipping
 
 
 # ============================================================
@@ -63,6 +65,7 @@ class GhostEmaBot:
 
         # Ghost vs EMA state for crossover detection
         self.prev_side = None  # "ABOVE" or "BELOW"
+        self.last_trade_time = 0  # timestamp of last trade
 
         # Session tracking
         self.was_in_session = False
@@ -103,7 +106,7 @@ class GhostEmaBot:
         self.was_in_session = in_session()
 
         ema_val = self.engine.ema(EMA_PERIOD)
-        side = self.engine.ghost_vs_ema(EMA_PERIOD)
+        side = self.engine.ghost_vs_ema(EMA_PERIOD, buffer=EMA_BUFFER)
         self.prev_side = side
 
         print(f"[BOT] Renko bricks: {len(self.engine.bricks)}")
@@ -157,8 +160,8 @@ class GhostEmaBot:
         if ema_val is None:
             return
 
-        side = self.engine.ghost_vs_ema(EMA_PERIOD)
-        if side is None or side == "AT":
+        side = self.engine.ghost_vs_ema(EMA_PERIOD, buffer=EMA_BUFFER)
+        if side is None or side == "NEUTRAL":
             return
 
         # Check session
@@ -194,18 +197,27 @@ class GhostEmaBot:
                 cross_str = " ** CROSS BELOW **"
             print(f"[{now}] Price={price:.2f} EMA={ema_val:.2f} Ghost={side} POS={pos_str}{cross_str}")
 
+        # Cooldown check
+        import time as _time
+        now_ts = _time.time()
+        on_cooldown = (now_ts - self.last_trade_time) < TRADE_COOLDOWN
+
         # Trading logic on crossover
-        if crossed_above:
+        if crossed_above and not on_cooldown:
             if self.position == -1:
                 await self._flatten(price, reason="GHOST_CROSS_ABOVE")
+                self.last_trade_time = _time.time()
             if self.position == 0:
                 await self._enter_long(price)
+                self.last_trade_time = _time.time()
 
-        elif crossed_below:
+        elif crossed_below and not on_cooldown:
             if self.position == 1:
                 await self._flatten(price, reason="GHOST_CROSS_BELOW")
+                self.last_trade_time = _time.time()
             if self.position == 0:
                 await self._enter_short(price)
+                self.last_trade_time = _time.time()
 
         self.prev_side = side
 
