@@ -365,15 +365,16 @@ class MomentumBot:
 # ============================================================
 
 def main():
+    global TRAILING_STOP, MOMENTUM_THRESHOLD
+
     parser = argparse.ArgumentParser(description="TopstepX Momentum Scalper Bot")
     parser.add_argument("--symbol", default="NQ", help="Contract symbol")
     parser.add_argument("--qty", type=int, default=1, help="Order quantity")
     parser.add_argument("--tp", type=float, default=100.0, help="TP milestone in dollars")
-    parser.add_argument("--trail", type=float, default=TRAILING_STOP, help="Trailing stop in points")
-    parser.add_argument("--threshold", type=float, default=MOMENTUM_THRESHOLD, help="Momentum threshold in points")
+    parser.add_argument("--trail", type=float, default=3.0, help="Trailing stop in points")
+    parser.add_argument("--threshold", type=float, default=2.0, help="Momentum threshold in points")
     args = parser.parse_args()
 
-    global TRAILING_STOP, MOMENTUM_THRESHOLD
     TRAILING_STOP = args.trail
     MOMENTUM_THRESHOLD = args.threshold
 
