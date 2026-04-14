@@ -253,6 +253,7 @@ class CandleColorBot:
                     self.initial_color = current_color
                     now = datetime.now(ET).strftime("%H:%M:%S")
                     print(f"[{now}] [FLIP] Initial color: {current_color} - waiting for flip...")
+                    return  # Don't enter yet, wait for flip
                 elif current_color != self.initial_color:
                     # Color flipped! Now we can start trading
                     self.waiting_for_flip = False
