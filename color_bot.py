@@ -47,6 +47,12 @@ def send_telegram(token: str, chat_id: str, message: str):
         print(f"[TG] Send failed: {e}")
 
 
+def send_signals(token: str, chat_id: str, keys: list, direction: str, symbol: str, price: float, qty: int):
+    """Send a signal for each key."""
+    for key in keys:
+        send_telegram(token, chat_id, f"SIGNAL|{key}|{direction}|{symbol}|{price}|{qty}")
+
+
 # ============================================================
 # Configuration
 # ============================================================
@@ -78,13 +84,13 @@ def in_session() -> bool:
 
 class CandleColorBot:
     def __init__(self, symbol: str, qty: int = 1, tp_dollars: float = 100.0,
-                 tg_token: str = "", tg_chat: str = "", tg_key: str = ""):
+                 tg_token: str = "", tg_chat: str = "", tg_keys: list = None):
         self.symbol = symbol
         self.qty = qty
         self.tp_dollars = tp_dollars
         self.tg_token = tg_token
         self.tg_chat = tg_chat
-        self.tg_key = tg_key
+        self.tg_keys = tg_keys or []
 
         # Position state
         self.position = 0  # 1=long, -1=short, 0=flat
@@ -117,10 +123,10 @@ class CandleColorBot:
         print(f"[BOT] Timeframe: {TIMEFRAME}")
         print(f"[BOT] TP Target: ${self.tp_dollars:.0f} ({tp_pts:.2f} pts per milestone)")
         print(f"[BOT] Session: 09:00 - 16:00 ET")
-        if self.tg_token and self.tg_chat:
-            print(f"[BOT] Telegram signals: ENABLED")
+        if self.tg_token and self.tg_chat and self.tg_keys:
+            print(f"[BOT] Telegram signals: ENABLED ({len(self.tg_keys)} keys)")
         else:
-            print(f"[BOT] Telegram signals: OFF (use --tg-token and --tg-chat to enable)")
+            print(f"[BOT] Telegram signals: OFF (use --tg-token, --tg-chat, --tg-keys to enable)")
         print()
 
         self.suite = await TradingSuite.create(
@@ -253,8 +259,8 @@ class CandleColorBot:
                 self.position = 1
                 self.entry_price = price
                 print(f"[TRADE] Order filled. ID: {response.orderId}")
-                send_telegram(self.tg_token, self.tg_chat,
-                              f"SIGNAL|{self.tg_key}|LONG|{self.symbol}|{price}|{self.qty}")
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "LONG", self.symbol, price, self.qty)
             else:
                 print(f"[TRADE] Order FAILED: {response.errorMessage}")
         except Exception as e:
@@ -273,8 +279,8 @@ class CandleColorBot:
                 self.position = -1
                 self.entry_price = price
                 print(f"[TRADE] Order filled. ID: {response.orderId}")
-                send_telegram(self.tg_token, self.tg_chat,
-                              f"SIGNAL|{self.tg_key}|SHORT|{self.symbol}|{price}|{self.qty}")
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "SHORT", self.symbol, price, self.qty)
             else:
                 print(f"[TRADE] Order FAILED: {response.errorMessage}")
         except Exception as e:
@@ -288,8 +294,8 @@ class CandleColorBot:
 
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [TRADE] <<< EXITING {direction} @ {price:.2f} | Trade P&L: ${trade_pnl_dollars:+.2f} | Session P&L: ${self.session_pnl:.2f} | Reason: {reason}")
-        send_telegram(self.tg_token, self.tg_chat,
-                      f"SIGNAL|{self.tg_key}|FLAT|{self.symbol}|{price}|0")
+        send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                     "FLAT", self.symbol, price, 0)
 
         try:
             result = await self.ctx.positions.close_position_direct(
@@ -342,8 +348,10 @@ def main():
     parser.add_argument("--tp", type=float, default=100.0, help="Take profit target in dollars per milestone")
     parser.add_argument("--tg-token", default="", help="Telegram bot token for signal broadcasting")
     parser.add_argument("--tg-chat", default="", help="Telegram chat/channel ID for signals")
-    parser.add_argument("--tg-key", default="", help="Passkey for signal authentication (friends need this to copy)")
+    parser.add_argument("--tg-keys", default="", help="Comma-separated passkeys for each friend")
     args = parser.parse_args()
+
+    keys = [k.strip() for k in args.tg_keys.split(",") if k.strip()] if args.tg_keys else []
 
     bot = CandleColorBot(
         symbol=args.symbol,
@@ -351,7 +359,7 @@ def main():
         tp_dollars=args.tp,
         tg_token=args.tg_token,
         tg_chat=args.tg_chat,
-        tg_key=args.tg_key,
+        tg_keys=keys,
     )
 
     loop = asyncio.new_event_loop()
