@@ -59,7 +59,7 @@ def send_signals(token: str, chat_id: str, keys: list, direction: str, symbol: s
 
 ET = pytz.timezone("America/New_York")
 
-SESSION_START = dtime(9, 0)
+SESSION_START = dtime(9, 30, 5)  # 9:30:05 ET - skip opening chaos
 SESSION_END = dtime(16, 0)
 
 TIMEFRAME = "15min"
@@ -106,6 +106,10 @@ class CandleColorBot:
         self.current_candle_open = None
         self.last_candle_time = None
 
+        # Opening flip logic - wait for first color change before entering
+        self.waiting_for_flip = True  # True at session start
+        self.initial_color = None     # First color seen after session starts
+
         # Session tracking
         self.was_in_session = False
 
@@ -122,7 +126,7 @@ class CandleColorBot:
         print(f"[BOT] Symbol: {self.symbol}, Qty: {self.qty}")
         print(f"[BOT] Timeframe: {TIMEFRAME}")
         print(f"[BOT] TP Target: ${self.tp_dollars:.0f} ({tp_pts:.2f} pts per milestone)")
-        print(f"[BOT] Session: 09:00 - 16:00 ET")
+        print(f"[BOT] Session: 09:30:05 - 16:00 ET")
         if self.tg_token and self.tg_chat and self.tg_keys:
             print(f"[BOT] Telegram signals: ENABLED ({len(self.tg_keys)} keys)")
         else:
@@ -210,6 +214,13 @@ class CandleColorBot:
             self.was_in_session = currently_in_session
             return
 
+        # Reset flip logic when new session starts
+        sess_started = not self.was_in_session and currently_in_session
+        if sess_started:
+            self.waiting_for_flip = True
+            self.initial_color = None
+            print(f"[SESSION] New session started - waiting for first color flip before entering")
+
         self.was_in_session = currently_in_session
 
         if not currently_in_session:
@@ -232,6 +243,26 @@ class CandleColorBot:
         # Don't enter new trades if paused after TP
         if self.tp_paused:
             return
+
+        # Opening flip logic: at session start, record initial color and wait for flip
+        if self.waiting_for_flip:
+            if is_green or is_red:
+                current_color = "GREEN" if is_green else "RED"
+                if self.initial_color is None:
+                    # First non-doji reading after session start
+                    self.initial_color = current_color
+                    now = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now}] [FLIP] Initial color: {current_color} - waiting for flip...")
+                elif current_color != self.initial_color:
+                    # Color flipped! Now we can start trading
+                    self.waiting_for_flip = False
+                    now = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now}] [FLIP] Color flipped from {self.initial_color} to {current_color} - TRADING ENABLED")
+                    # Fall through to normal trading logic below
+                else:
+                    return  # Same color as initial, keep waiting
+            else:
+                return  # Doji, keep waiting
 
         # Trading logic based on candle color
         if is_green and self.position != 1:
