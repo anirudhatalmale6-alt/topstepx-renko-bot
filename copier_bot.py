@@ -235,6 +235,11 @@ def main():
         qty=args.qty,
     )
 
+    # Windows compatibility: use SelectorEventLoop instead of ProactorEventLoop
+    import sys
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     loop = asyncio.new_event_loop()
 
     def handle_sig(sig, frame):
