@@ -137,6 +137,12 @@ class CandleColorBot:
         # Session tracking
         self.was_in_session = False
 
+        # Connection health monitoring
+        self.last_price_time = None      # Last time we got a valid price
+        self.connection_alive = True      # Current connection status
+        self.disconnect_alert_sent = False
+        self.STALE_THRESHOLD = 60        # Seconds without price = disconnected
+
         # SDK objects
         self.suite = None
         self.ctx = None
@@ -229,10 +235,36 @@ class CandleColorBot:
         print(f"[{now}] [MODE] Waiting for -${self.shadow_loss:.0f} before going live again...")
         print(f"[{now}] [MODE] ========================================\n")
 
+    def _send_status_alert(self, message: str):
+        """Send a status alert to Telegram (not a trade signal)."""
+        send_telegram(self.tg_token, self.tg_chat, f"STATUS|{message}")
+
     async def _tick(self):
         price = await self.ctx.data.get_current_price()
+        now_ts = time.time()
+
         if price is None:
+            # Check if we've lost connection
+            if self.last_price_time and in_session():
+                elapsed = now_ts - self.last_price_time
+                if elapsed > self.STALE_THRESHOLD and not self.disconnect_alert_sent:
+                    self.connection_alive = False
+                    self.disconnect_alert_sent = True
+                    now = datetime.now(ET).strftime("%H:%M:%S")
+                    msg = f"DISCONNECTED - No price data for {int(elapsed)}s ({now} ET)"
+                    print(f"[{now}] [ALERT] {msg}")
+                    self._send_status_alert(msg)
             return
+
+        # Price received - update health tracking
+        self.last_price_time = now_ts
+        if not self.connection_alive:
+            self.connection_alive = True
+            self.disconnect_alert_sent = False
+            now = datetime.now(ET).strftime("%H:%M:%S")
+            msg = f"RECONNECTED - Price data restored ({now} ET)"
+            print(f"[{now}] [ALERT] {msg}")
+            self._send_status_alert(msg)
 
         # Check for new candle
         data = await self.ctx.data.get_data(TIMEFRAME, bars=1)
