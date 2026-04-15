@@ -1,23 +1,20 @@
 """
-TopstepX Realtime Candle Color Strategy Bot
+TopstepX Realtime Candle Color Strategy Bot (Shadow Mode)
 
 Strategy: Trades based on the current 15-minute candle color.
 - Green candle (close > open) = LONG
 - Red candle (close < open) = SHORT
-- Doji (body < 1% of range) = ignored
 
-Optional: Sends trade signals to Telegram for copy-trading.
-
-Session: 9:00 AM - 4:00 PM ET
+Shadow Mode: Bot starts in SHADOW mode, simulating trades without real orders.
+Once shadow P&L hits the loss threshold (e.g. -$700), switches to LIVE mode.
+LIVE mode places real trades. Once real P&L hits profit target (e.g. +$500),
+goes back to SHADOW and repeats.
 
 Usage:
     export PROJECT_X_USERNAME="your_email"
     export PROJECT_X_API_KEY="your_api_key"
     export PROJECT_X_ACCOUNT_NAME="your_account"
-    python color_bot.py --symbol NQ --qty 1 --tp 99999
-
-    # With Telegram signals:
-    python color_bot.py --symbol NQ --qty 1 --tp 99999 --tg-token YOUR_BOT_TOKEN --tg-chat YOUR_CHAT_ID --tg-key mypassword
+    python color_bot.py --symbol NQ --qty 1 --shadow-loss 700 --live-profit 500
 """
 
 import asyncio
@@ -46,10 +43,10 @@ def send_telegram(token: str, chat_id: str, message: str):
             data = json.dumps({"chat_id": chat_id, "text": message}).encode("utf-8")
             req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=10)
-            return  # success
+            return
         except urllib.error.HTTPError as e:
             if e.code == 429 and attempt < 2:
-                time.sleep(2 * (attempt + 1))  # 2s, 4s backoff
+                time.sleep(2 * (attempt + 1))
                 continue
             print(f"[TG] Send failed: {e}")
             return
@@ -62,7 +59,7 @@ def send_signals(token: str, chat_id: str, keys: list, direction: str, symbol: s
     """Send a signal for each key with spacing to avoid rate limits."""
     for i, key in enumerate(keys):
         if i > 0:
-            time.sleep(0.5)  # 500ms between messages to avoid Telegram rate limit
+            time.sleep(0.5)
         send_telegram(token, chat_id, f"SIGNAL|{key}|{direction}|{symbol}|{price}|{qty}")
 
 
@@ -72,11 +69,10 @@ def send_signals(token: str, chat_id: str, keys: list, direction: str, symbol: s
 
 ET = pytz.timezone("America/New_York")
 
-SESSION_START = dtime(9, 30, 5)  # 9:30:05 ET - skip opening chaos
+SESSION_START = dtime(9, 44, 0)  # 9:44 ET
 SESSION_END = dtime(16, 0)
 
 TIMEFRAME = "15min"
-DOJI_THRESHOLD = 0.01
 
 # NQ: 1 point = $20 per contract
 POINT_VALUE = 20.0
@@ -96,32 +92,44 @@ def in_session() -> bool:
 # ============================================================
 
 class CandleColorBot:
-    def __init__(self, symbol: str, qty: int = 1, tp_dollars: float = 100.0,
+    def __init__(self, symbol: str, qty: int = 1,
+                 shadow_loss: float = 700.0, live_profit: float = 500.0,
                  tg_token: str = "", tg_chat: str = "", tg_keys: list = None):
         self.symbol = symbol
         self.qty = qty
-        self.tp_dollars = tp_dollars
+        self.shadow_loss = shadow_loss    # Shadow P&L threshold to go LIVE
+        self.live_profit = live_profit    # Live P&L target to go back to SHADOW
         self.tg_token = tg_token
         self.tg_chat = tg_chat
         self.tg_keys = tg_keys or []
 
-        # Position state
-        self.position = 0  # 1=long, -1=short, 0=flat
+        # Mode: "SHADOW" or "LIVE"
+        self.mode = "SHADOW"
+
+        # Real position state (LIVE mode only)
+        self.position = 0       # 1=long, -1=short, 0=flat
         self.entry_price = 0.0
 
-        # P&L tracking
-        self.session_pnl = 0.0  # Total session P&L in dollars
-        self.next_tp_target = tp_dollars  # First target is +$100
-        self.milestone_count = 0
-        self.tp_paused = False  # Paused after hitting TP, waiting for next candle
+        # Shadow position state (SHADOW mode only)
+        self.shadow_position = 0
+        self.shadow_entry_price = 0.0
+        self.shadow_pnl = 0.0
+
+        # Live P&L tracking (resets each time we enter LIVE)
+        self.live_pnl = 0.0
+
+        # Total session stats
+        self.total_live_pnl = 0.0
+        self.total_shadow_pnl = 0.0
+        self.live_cycles = 0
 
         # Candle tracking
         self.current_candle_open = None
         self.last_candle_time = None
 
         # Opening flip logic - wait for first color change before entering
-        self.waiting_for_flip = True  # True at session start
-        self.initial_color = None     # First color seen after session starts
+        self.waiting_for_flip = True
+        self.initial_color = None
 
         # Session tracking
         self.was_in_session = False
@@ -134,16 +142,16 @@ class CandleColorBot:
     async def run(self):
         from project_x_py import TradingSuite
 
-        tp_pts = self.tp_dollars / (POINT_VALUE * self.qty)
-        print(f"[BOT] Realtime Candle Color Bot + ${self.tp_dollars:.0f} TP Milestones")
+        print(f"[BOT] Candle Color Bot - SHADOW MODE")
         print(f"[BOT] Symbol: {self.symbol}, Qty: {self.qty}")
         print(f"[BOT] Timeframe: {TIMEFRAME}")
-        print(f"[BOT] TP Target: ${self.tp_dollars:.0f} ({tp_pts:.2f} pts per milestone)")
-        print(f"[BOT] Session: 09:30:05 - 16:00 ET")
+        print(f"[BOT] Shadow loss trigger: -${self.shadow_loss:.0f}")
+        print(f"[BOT] Live profit target: +${self.live_profit:.0f}")
+        print(f"[BOT] Session: 09:44 - 16:00 ET")
         if self.tg_token and self.tg_chat and self.tg_keys:
             print(f"[BOT] Telegram signals: ENABLED ({len(self.tg_keys)} keys)")
         else:
-            print(f"[BOT] Telegram signals: OFF (use --tg-token, --tg-chat, --tg-keys to enable)")
+            print(f"[BOT] Telegram signals: OFF")
         print()
 
         self.suite = await TradingSuite.create(
@@ -165,6 +173,7 @@ class CandleColorBot:
         self.was_in_session = in_session()
 
         print(f"[BOT] Session active: {self.was_in_session}")
+        print(f"[BOT] Starting in SHADOW mode")
         print(f"[BOT] Press Ctrl+C to stop")
         print()
 
@@ -188,6 +197,35 @@ class CandleColorBot:
         else:
             print("[BOT] No candle data available!")
 
+    def _switch_to_live(self):
+        """Switch from SHADOW to LIVE mode."""
+        self.mode = "LIVE"
+        self.live_pnl = 0.0
+        self.live_cycles += 1
+        self.waiting_for_flip = True
+        self.initial_color = None
+        now = datetime.now(ET).strftime("%H:%M:%S")
+        print(f"\n[{now}] [MODE] ========================================")
+        print(f"[{now}] [MODE] >>> SWITCHING TO LIVE (cycle #{self.live_cycles})")
+        print(f"[{now}] [MODE] Shadow P&L was: ${self.shadow_pnl:.2f}")
+        print(f"[{now}] [MODE] Waiting for color flip before first trade...")
+        print(f"[{now}] [MODE] ========================================\n")
+
+    def _switch_to_shadow(self):
+        """Switch from LIVE to SHADOW mode."""
+        self.mode = "SHADOW"
+        self.shadow_pnl = 0.0
+        self.shadow_position = 0
+        self.shadow_entry_price = 0.0
+        self.waiting_for_flip = True
+        self.initial_color = None
+        now = datetime.now(ET).strftime("%H:%M:%S")
+        print(f"\n[{now}] [MODE] ========================================")
+        print(f"[{now}] [MODE] >>> SWITCHING TO SHADOW")
+        print(f"[{now}] [MODE] Live P&L was: ${self.live_pnl:.2f} (total live: ${self.total_live_pnl:.2f})")
+        print(f"[{now}] [MODE] Waiting for -${self.shadow_loss:.0f} before going live again...")
+        print(f"[{now}] [MODE] ========================================\n")
+
     async def _tick(self):
         price = await self.ctx.data.get_current_price()
         if price is None:
@@ -204,7 +242,6 @@ class CandleColorBot:
             if candle_time != self.last_candle_time:
                 self.current_candle_open = candle_open
                 self.last_candle_time = candle_time
-                self.tp_paused = False  # Resume trading on new candle
                 now = datetime.now(ET).strftime("%H:%M:%S")
                 print(f"[{now}] New {TIMEFRAME} candle opened @ {candle_open:.2f}")
 
@@ -213,7 +250,7 @@ class CandleColorBot:
 
         # Calculate candle color
         body = abs(price - self.current_candle_open)
-        is_doji = body < 0.01  # Less than 1 cent movement = doji
+        is_doji = body < 0.01
         is_green = price > self.current_candle_open and not is_doji
         is_red = price < self.current_candle_open and not is_doji
 
@@ -221,64 +258,133 @@ class CandleColorBot:
         currently_in_session = in_session()
         sess_ended = self.was_in_session and not currently_in_session
 
-        if sess_ended and self.position != 0:
-            print(f"[SESSION] Session break - flattening")
-            await self._flatten(price, reason="SESSION_BREAK")
+        if sess_ended:
+            if self.position != 0:
+                print(f"[SESSION] Session ended - flattening LIVE position")
+                await self._flatten(price, reason="SESSION_END")
+            if self.shadow_position != 0:
+                self._shadow_flatten(price, reason="SESSION_END")
             self.was_in_session = currently_in_session
             return
 
-        # Reset flip logic when new session starts
+        # Reset at session start
         sess_started = not self.was_in_session and currently_in_session
         if sess_started:
+            self.mode = "SHADOW"
+            self.shadow_pnl = 0.0
+            self.shadow_position = 0
+            self.live_pnl = 0.0
+            self.total_live_pnl = 0.0
+            self.total_shadow_pnl = 0.0
+            self.live_cycles = 0
             self.waiting_for_flip = True
             self.initial_color = None
-            print(f"[SESSION] New session started - waiting for first color flip before entering")
+            print(f"[SESSION] New session started - SHADOW mode, waiting for color flip")
 
         self.was_in_session = currently_in_session
 
         if not currently_in_session:
             return
 
-        # Check TP milestone while in position
-        if self.position != 0:
-            unrealized_pnl = (price - self.entry_price) * self.position * POINT_VALUE * self.qty
-            total_pnl = self.session_pnl + unrealized_pnl
-
-            if total_pnl >= self.next_tp_target:
-                self.milestone_count += 1
-                print(f"\n[TP] *** MILESTONE #{self.milestone_count} HIT! Session P&L: ${total_pnl:.2f} (target was ${self.next_tp_target:.2f}) ***")
-                await self._flatten(price, reason=f"TP_MILESTONE_{self.milestone_count}")
-                self.next_tp_target = self.session_pnl + self.tp_dollars
-                self.tp_paused = True  # Wait for next candle before re-entering
-                print(f"[TP] Next target: ${self.next_tp_target:.2f}")
-                return
-
-        # Don't enter new trades if paused after TP
-        if self.tp_paused:
-            return
-
-        # Opening flip logic: at session start, record initial color and wait for flip
+        # Flip logic: wait for first color change before entering/simulating
         if self.waiting_for_flip:
             if is_green or is_red:
                 current_color = "GREEN" if is_green else "RED"
                 if self.initial_color is None:
-                    # First non-doji reading after session start
                     self.initial_color = current_color
                     now = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now}] [FLIP] Initial color: {current_color} - waiting for flip...")
-                    return  # Don't enter yet, wait for flip
+                    print(f"[{now}] [{self.mode}] [FLIP] Initial color: {current_color} - waiting for flip...")
+                    return
                 elif current_color != self.initial_color:
-                    # Color flipped! Now we can start trading
                     self.waiting_for_flip = False
                     now = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now}] [FLIP] Color flipped from {self.initial_color} to {current_color} - TRADING ENABLED")
-                    # Fall through to normal trading logic below
+                    print(f"[{now}] [{self.mode}] [FLIP] Color flipped from {self.initial_color} to {current_color} - TRADING ENABLED")
                 else:
-                    return  # Same color as initial, keep waiting
+                    return
             else:
-                return  # Doji, keep waiting
+                return
 
-        # Trading logic based on candle color
+        # Route to shadow or live logic
+        if self.mode == "SHADOW":
+            self._shadow_tick(price, is_green, is_red)
+        else:
+            await self._live_tick(price, is_green, is_red)
+
+    # ==========================================================
+    # SHADOW MODE - simulated trades, no real orders
+    # ==========================================================
+
+    def _shadow_tick(self, price: float, is_green: bool, is_red: bool):
+        # Check if shadow should go LIVE
+        if self.shadow_pnl <= -self.shadow_loss:
+            now = datetime.now(ET).strftime("%H:%M:%S")
+            print(f"[{now}] [SHADOW] Shadow P&L hit -${self.shadow_loss:.0f} threshold!")
+            if self.shadow_position != 0:
+                self._shadow_flatten(price, reason="SWITCHING_TO_LIVE")
+            self.total_shadow_pnl += self.shadow_pnl
+            self._switch_to_live()
+            return
+
+        # Track unrealized shadow P&L
+        if self.shadow_position != 0:
+            unrealized = (price - self.shadow_entry_price) * self.shadow_position * POINT_VALUE * self.qty
+            total = self.shadow_pnl + unrealized
+            # Check threshold with unrealized
+            if total <= -self.shadow_loss:
+                self._shadow_flatten(price, reason="SWITCHING_TO_LIVE")
+                self.total_shadow_pnl += self.shadow_pnl
+                self._switch_to_live()
+                return
+
+        # Simulated trading logic
+        if is_green and self.shadow_position != 1:
+            if self.shadow_position == -1:
+                self._shadow_flatten(price, reason="CANDLE_GREEN")
+            if self.shadow_position == 0:
+                self._shadow_enter(price, 1, "LONG")
+
+        elif is_red and self.shadow_position != -1:
+            if self.shadow_position == 1:
+                self._shadow_flatten(price, reason="CANDLE_RED")
+            if self.shadow_position == 0:
+                self._shadow_enter(price, -1, "SHORT")
+
+    def _shadow_enter(self, price: float, direction: int, label: str):
+        self.shadow_position = direction
+        self.shadow_entry_price = price
+        now = datetime.now(ET).strftime("%H:%M:%S")
+        print(f"[{now}] [SHADOW] >>> {label} @ {price:.2f} | Shadow P&L: ${self.shadow_pnl:.2f}")
+
+    def _shadow_flatten(self, price: float, reason: str = ""):
+        direction = "LONG" if self.shadow_position == 1 else "SHORT"
+        trade_pnl = (price - self.shadow_entry_price) * self.shadow_position * POINT_VALUE * self.qty
+        self.shadow_pnl += trade_pnl
+        now = datetime.now(ET).strftime("%H:%M:%S")
+        print(f"[{now}] [SHADOW] <<< EXIT {direction} @ {price:.2f} | Trade: ${trade_pnl:+.2f} | Shadow P&L: ${self.shadow_pnl:.2f} | {reason}")
+        self.shadow_position = 0
+        self.shadow_entry_price = 0.0
+
+    # ==========================================================
+    # LIVE MODE - real trades
+    # ==========================================================
+
+    async def _live_tick(self, price: float, is_green: bool, is_red: bool):
+        # Check if we hit live profit target
+        if self.position != 0:
+            unrealized = (price - self.entry_price) * self.position * POINT_VALUE * self.qty
+            total = self.live_pnl + unrealized
+
+            if total >= self.live_profit:
+                now = datetime.now(ET).strftime("%H:%M:%S")
+                print(f"\n[{now}] [LIVE] *** PROFIT TARGET HIT! Live P&L: ${total:.2f} ***")
+                await self._flatten(price, reason="PROFIT_TARGET")
+                self.total_live_pnl += self.live_pnl
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "FLAT", self.symbol, price, 0)
+                self._switch_to_shadow()
+                return
+
+        # Trading logic
         if is_green and self.position != 1:
             if self.position == -1:
                 await self._flatten(price, reason="CANDLE_GREEN")
@@ -293,7 +399,7 @@ class CandleColorBot:
 
     async def _enter_long(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [TRADE] >>> ENTERING LONG @ {price:.2f} (candle GREEN) | Session P&L: ${self.session_pnl:.2f} | Target: ${self.next_tp_target:.2f}")
+        print(f"\n[{now}] [LIVE] >>> ENTERING LONG @ {price:.2f} | Live P&L: ${self.live_pnl:.2f} | Target: +${self.live_profit:.0f}")
         try:
             response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
@@ -303,17 +409,17 @@ class CandleColorBot:
             if response.success:
                 self.position = 1
                 self.entry_price = price
-                print(f"[TRADE] Order filled. ID: {response.orderId}")
+                print(f"[LIVE] Order filled. ID: {response.orderId}")
                 send_signals(self.tg_token, self.tg_chat, self.tg_keys,
                              "LONG", self.symbol, price, self.qty)
             else:
-                print(f"[TRADE] Order FAILED: {response.errorMessage}")
+                print(f"[LIVE] Order FAILED: {response.errorMessage}")
         except Exception as e:
-            print(f"[TRADE] Order ERROR: {e}")
+            print(f"[LIVE] Order ERROR: {e}")
 
     async def _enter_short(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [TRADE] >>> ENTERING SHORT @ {price:.2f} (candle RED) | Session P&L: ${self.session_pnl:.2f} | Target: ${self.next_tp_target:.2f}")
+        print(f"\n[{now}] [LIVE] >>> ENTERING SHORT @ {price:.2f} | Live P&L: ${self.live_pnl:.2f} | Target: +${self.live_profit:.0f}")
         try:
             response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
@@ -323,31 +429,28 @@ class CandleColorBot:
             if response.success:
                 self.position = -1
                 self.entry_price = price
-                print(f"[TRADE] Order filled. ID: {response.orderId}")
+                print(f"[LIVE] Order filled. ID: {response.orderId}")
                 send_signals(self.tg_token, self.tg_chat, self.tg_keys,
                              "SHORT", self.symbol, price, self.qty)
             else:
-                print(f"[TRADE] Order FAILED: {response.errorMessage}")
+                print(f"[LIVE] Order FAILED: {response.errorMessage}")
         except Exception as e:
-            print(f"[TRADE] Order ERROR: {e}")
+            print(f"[LIVE] Order ERROR: {e}")
 
     async def _flatten(self, price: float, reason: str = ""):
         direction = "LONG" if self.position == 1 else "SHORT"
-        trade_pnl_pts = (price - self.entry_price) * self.position
-        trade_pnl_dollars = trade_pnl_pts * POINT_VALUE * self.qty
-        self.session_pnl += trade_pnl_dollars
+        trade_pnl = (price - self.entry_price) * self.position * POINT_VALUE * self.qty
+        self.live_pnl += trade_pnl
 
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [TRADE] <<< EXITING {direction} @ {price:.2f} | Trade P&L: ${trade_pnl_dollars:+.2f} | Session P&L: ${self.session_pnl:.2f} | Reason: {reason}")
-        send_signals(self.tg_token, self.tg_chat, self.tg_keys,
-                     "FLAT", self.symbol, price, 0)
+        print(f"\n[{now}] [LIVE] <<< EXITING {direction} @ {price:.2f} | Trade: ${trade_pnl:+.2f} | Live P&L: ${self.live_pnl:.2f} | {reason}")
 
         try:
             result = await self.ctx.positions.close_position_direct(
                 contract_id=self.ctx.instrument_info.id,
             )
             if result.get("success"):
-                print(f"[TRADE] Position closed. Order: {result.get('orderId')}")
+                print(f"[LIVE] Position closed. Order: {result.get('orderId')}")
             else:
                 side = 1 if self.position == 1 else 0
                 response = await self.ctx.orders.place_market_order(
@@ -356,11 +459,11 @@ class CandleColorBot:
                     size=self.qty,
                 )
                 if response.success:
-                    print(f"[TRADE] Closed via market order. ID: {response.orderId}")
+                    print(f"[LIVE] Closed via market order. ID: {response.orderId}")
                 else:
-                    print(f"[TRADE] CLOSE FAILED: {response.errorMessage}")
+                    print(f"[LIVE] CLOSE FAILED: {response.errorMessage}")
         except Exception as e:
-            print(f"[TRADE] Close ERROR: {e}")
+            print(f"[LIVE] Close ERROR: {e}")
 
         self.position = 0
         self.entry_price = 0.0
@@ -371,10 +474,21 @@ class CandleColorBot:
             price = await self.ctx.data.get_current_price()
             if price:
                 await self._flatten(price, reason="SHUTDOWN")
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "FLAT", self.symbol, price, 0)
+
+        if self.shadow_position != 0:
+            price = await self.ctx.data.get_current_price()
+            if price:
+                self._shadow_flatten(price, reason="SHUTDOWN")
+
+        self.total_live_pnl += self.live_pnl
+        self.total_shadow_pnl += self.shadow_pnl
 
         print(f"\n[BOT] === SESSION SUMMARY ===")
-        print(f"[BOT] Total P&L: ${self.session_pnl:.2f}")
-        print(f"[BOT] Milestones hit: {self.milestone_count}")
+        print(f"[BOT] Live cycles: {self.live_cycles}")
+        print(f"[BOT] Total LIVE P&L: ${self.total_live_pnl:.2f}")
+        print(f"[BOT] Total SHADOW P&L: ${self.total_shadow_pnl:.2f} (not real)")
         print(f"[BOT] ========================")
 
         if self.suite:
@@ -387,13 +501,16 @@ class CandleColorBot:
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="TopstepX Candle Color Bot")
+    parser = argparse.ArgumentParser(description="TopstepX Candle Color Bot (Shadow Mode)")
     parser.add_argument("--symbol", default="NQ", help="Contract symbol")
     parser.add_argument("--qty", type=int, default=1, help="Order quantity")
-    parser.add_argument("--tp", type=float, default=100.0, help="Take profit target in dollars per milestone")
-    parser.add_argument("--tg-token", default="", help="Telegram bot token for signal broadcasting")
-    parser.add_argument("--tg-chat", default="", help="Telegram chat/channel ID for signals")
-    parser.add_argument("--tg-keys", default="", help="Comma-separated passkeys for each friend")
+    parser.add_argument("--shadow-loss", type=float, default=700.0,
+                        help="Shadow P&L loss threshold to switch to LIVE (default: 700)")
+    parser.add_argument("--live-profit", type=float, default=500.0,
+                        help="Live P&L profit target to switch back to SHADOW (default: 500)")
+    parser.add_argument("--tg-token", default="", help="Telegram bot token")
+    parser.add_argument("--tg-chat", default="", help="Telegram chat/channel ID")
+    parser.add_argument("--tg-keys", default="", help="Comma-separated passkeys")
     args = parser.parse_args()
 
     keys = [k.strip() for k in args.tg_keys.split(",") if k.strip()] if args.tg_keys else []
@@ -401,7 +518,8 @@ def main():
     bot = CandleColorBot(
         symbol=args.symbol,
         qty=args.qty,
-        tp_dollars=args.tp,
+        shadow_loss=args.shadow_loss,
+        live_profit=args.live_profit,
         tg_token=args.tg_token,
         tg_chat=args.tg_chat,
         tg_keys=keys,
