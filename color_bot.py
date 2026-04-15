@@ -96,7 +96,7 @@ def in_session() -> bool:
 
 class CandleColorBot:
     def __init__(self, symbol: str, qty: int = 1,
-                 shadow_loss: float = 500.0, live_profit: float = 500.0,
+                 shadow_loss: float = 700.0, live_profit: float = 500.0,
                  tg_token: str = "", tg_chat: str = "", tg_keys: list = None):
         self.symbol = symbol
         self.qty = qty
@@ -504,7 +504,7 @@ def main():
     parser.add_argument("--symbol", default="NQ", help="Contract symbol")
     parser.add_argument("--qty", type=int, default=1, help="Order quantity")
     parser.add_argument("--shadow-loss", type=float, default=700.0,
-                        help="Shadow P&L loss threshold to switch to LIVE (default: 500)")
+                        help="Shadow P&L loss threshold to switch to LIVE (default: 700)")
     parser.add_argument("--live-profit", type=float, default=500.0,
                         help="Live P&L profit target to switch back to SHADOW (default: 500)")
     parser.add_argument("--tg-token", default="", help="Telegram bot token")
