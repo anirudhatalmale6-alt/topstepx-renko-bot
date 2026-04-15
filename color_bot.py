@@ -1,7 +1,7 @@
 """
 TopstepX Multi-Timeframe Candle Close Strategy (Shadow Mode)
 
-Strategy: All 4 timeframes (1min, 3min, 5min, 15min) must have their last
+Strategy: All 4 timeframes (1min, 5min, 15min, 30min) must have their last
 CLOSED candle be the same color to enter a position.
 - All green = LONG
 - All red = SHORT
@@ -75,7 +75,7 @@ ET = pytz.timezone("America/New_York")
 SESSION_START = dtime(9, 44, 0)  # 9:44 ET
 SESSION_END = dtime(16, 0)
 
-TIMEFRAMES = ["1min", "3min", "5min", "15min"]
+TIMEFRAMES = ["1min", "5min", "15min", "30min"]
 
 # NQ: 1 point = $20 per contract
 POINT_VALUE = 20.0
