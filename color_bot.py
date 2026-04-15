@@ -446,22 +446,18 @@ class CandleColorBot:
         print(f"\n[{now}] [LIVE] <<< EXITING {direction} @ {price:.2f} | Trade: ${trade_pnl:+.2f} | Live P&L: ${self.live_pnl:.2f} | {reason}")
 
         try:
-            result = await self.ctx.positions.close_position_direct(
+            # Use direct market order to close - avoids double-order bug
+            # with close_position_direct which can execute even on non-success
+            close_side = 1 if self.position == 1 else 0  # sell to close long, buy to close short
+            response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
+                side=close_side,
+                size=self.qty,
             )
-            if result.get("success"):
-                print(f"[LIVE] Position closed. Order: {result.get('orderId')}")
+            if response.success:
+                print(f"[LIVE] Position closed. ID: {response.orderId}")
             else:
-                side = 1 if self.position == 1 else 0
-                response = await self.ctx.orders.place_market_order(
-                    contract_id=self.ctx.instrument_info.id,
-                    side=side,
-                    size=self.qty,
-                )
-                if response.success:
-                    print(f"[LIVE] Closed via market order. ID: {response.orderId}")
-                else:
-                    print(f"[LIVE] CLOSE FAILED: {response.errorMessage}")
+                print(f"[LIVE] CLOSE FAILED: {response.errorMessage}")
         except Exception as e:
             print(f"[LIVE] Close ERROR: {e}")
 
