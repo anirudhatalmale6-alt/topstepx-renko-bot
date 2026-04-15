@@ -24,7 +24,9 @@ import asyncio
 import argparse
 import signal
 import json
+import time
 import urllib.request
+import urllib.error
 from datetime import datetime, time as dtime
 
 import pytz
@@ -35,21 +37,32 @@ import pytz
 # ============================================================
 
 def send_telegram(token: str, chat_id: str, message: str):
-    """Send a message to Telegram channel. Fire and forget."""
+    """Send a message to Telegram channel with retry on rate limit."""
     if not token or not chat_id:
         return
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = json.dumps({"chat_id": chat_id, "text": message}).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=5)
-    except Exception as e:
-        print(f"[TG] Send failed: {e}")
+    for attempt in range(3):
+        try:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            data = json.dumps({"chat_id": chat_id, "text": message}).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10)
+            return  # success
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                time.sleep(2 * (attempt + 1))  # 2s, 4s backoff
+                continue
+            print(f"[TG] Send failed: {e}")
+            return
+        except Exception as e:
+            print(f"[TG] Send failed: {e}")
+            return
 
 
 def send_signals(token: str, chat_id: str, keys: list, direction: str, symbol: str, price: float, qty: int):
-    """Send a signal for each key."""
-    for key in keys:
+    """Send a signal for each key with spacing to avoid rate limits."""
+    for i, key in enumerate(keys):
+        if i > 0:
+            time.sleep(0.5)  # 500ms between messages to avoid Telegram rate limit
         send_telegram(token, chat_id, f"SIGNAL|{key}|{direction}|{symbol}|{price}|{qty}")
 
 
