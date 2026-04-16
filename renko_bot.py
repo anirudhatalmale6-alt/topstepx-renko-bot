@@ -9,7 +9,8 @@ Multi-timeframe: builds separate Renko from 1min, 3min, 5min, 15min closes.
 
 Shadow Mode: Starts in SHADOW, simulating trades.
 Once shadow P&L hits loss threshold (e.g. -$700), switches to LIVE.
-LIVE stays LIVE for rest of session (no TP cycling).
+LIVE places real trades. Once profit target hit (e.g. +$500),
+goes back to SHADOW and repeats.
 
 Usage:
     export PROJECT_X_USERNAME="your_email"
@@ -141,12 +142,13 @@ def in_session() -> bool:
 class RenkoBot:
     def __init__(self, symbol: str, qty: int = 1,
                  brick_size: float = 0.25,
-                 shadow_loss: float = 700.0,
+                 shadow_loss: float = 700.0, live_profit: float = 500.0,
                  tg_token: str = "", tg_chat: str = "", tg_keys: list = None):
         self.symbol = symbol
         self.qty = qty
         self.brick_size = brick_size
         self.shadow_loss = shadow_loss
+        self.live_profit = live_profit
         self.tg_token = tg_token
         self.tg_chat = tg_chat
         self.tg_keys = tg_keys or []
@@ -173,7 +175,9 @@ class RenkoBot:
 
         # P&L tracking
         self.live_pnl = 0.0
+        self.total_live_pnl = 0.0
         self.total_shadow_pnl = 0.0
+        self.live_cycles = 0
 
         # Session
         self.was_in_session = False
@@ -203,8 +207,7 @@ class RenkoBot:
         print(f"[BOT] Timeframes: {', '.join(self.tf_labels[tf] for tf in TF_MINUTES)}")
         print(f"[BOT] ENTRY: all 4 timeframes ALIGNED")
         print(f"[BOT] EXIT: any timeframe MISALIGNS (brick close)")
-        print(f"[BOT] NO fixed TP - hold until trend turns off")
-        print(f"[BOT] Shadow loss: -${self.shadow_loss:.0f} -> LIVE (stays LIVE)")
+        print(f"[BOT] Shadow loss: -${self.shadow_loss:.0f} | Live profit: +${self.live_profit:.0f}")
         print(f"[BOT] Session: {SESSION_START.strftime('%H:%M')} - {SESSION_END.strftime('%H:%M')} ET")
         if self.tg_token and self.tg_chat and self.tg_keys:
             print(f"[BOT] Telegram signals: ENABLED ({len(self.tg_keys)} keys)")
@@ -344,6 +347,9 @@ class RenkoBot:
             self.shadow_pnl = 0.0
             self.shadow_position = 0
             self.live_pnl = 0.0
+            self.total_live_pnl = 0.0
+            self.total_shadow_pnl = 0.0
+            self.live_cycles = 0
             self.bar_count = 0
             now = datetime.now(ET).strftime("%H:%M:%S")
             print(f"[{now}] [SESSION] New session started - SHADOW mode")
@@ -404,6 +410,18 @@ class RenkoBot:
                             print(f"[{now}] [RENKO 15min] {color} brick #{self.engines[15].brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
 
         if not new_renko_event:
+            # Still check profit target on every tick when LIVE
+            if self.mode == "LIVE" and self.position != 0:
+                unrealized = (price - self.entry_price) * self.position * POINT_VALUE * self.qty
+                total = self.live_pnl + unrealized
+                if total >= self.live_profit:
+                    now = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"\n[{now}] [LIVE] *** PROFIT TARGET +${self.live_profit:.0f} HIT! P&L: ${total:.2f} ***")
+                    await self._flatten(price, reason="PROFIT_TARGET")
+                    self.total_live_pnl += self.live_pnl
+                    send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                                 "FLAT", self.symbol, price, 0)
+                    self._switch_to_shadow()
             return
 
         # Get alignment status
@@ -484,7 +502,21 @@ class RenkoBot:
     # ==========================================================
 
     async def _live_logic(self, price: float, all_up: bool, all_down: bool, misaligned: bool):
-        # Exit on misalignment (this IS the exit signal - no fixed TP)
+        # Check profit target
+        if self.position != 0:
+            unrealized = (price - self.entry_price) * self.position * POINT_VALUE * self.qty
+            total = self.live_pnl + unrealized
+            if total >= self.live_profit:
+                now = datetime.now(ET).strftime("%H:%M:%S")
+                print(f"\n[{now}] [LIVE] *** PROFIT TARGET +${self.live_profit:.0f} HIT! P&L: ${total:.2f} ***")
+                await self._flatten(price, reason="PROFIT_TARGET")
+                self.total_live_pnl += self.live_pnl
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "FLAT", self.symbol, price, 0)
+                self._switch_to_shadow()
+                return
+
+        # Exit on misalignment
         if self.position != 0 and misaligned:
             await self._flatten(price, reason="MISALIGNED")
             send_signals(self.tg_token, self.tg_chat, self.tg_keys,
@@ -575,14 +607,27 @@ class RenkoBot:
     def _switch_to_live(self):
         self.mode = "LIVE"
         self.live_pnl = 0.0
+        self.live_cycles += 1
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [MODE] ========================================")
-        print(f"[{now}] [MODE] >>> SWITCHING TO LIVE")
+        print(f"[{now}] [MODE] >>> SWITCHING TO LIVE (cycle #{self.live_cycles})")
         print(f"[{now}] [MODE] Shadow P&L was: ${self.shadow_pnl:.2f}")
-        print(f"[{now}] [MODE] LIVE for rest of session (no TP)")
+        print(f"[{now}] [MODE] Target: +${self.live_profit:.0f}")
         print(f"[{now}] [MODE] ========================================")
         self._print_alignment()
         print()
+
+    def _switch_to_shadow(self):
+        self.mode = "SHADOW"
+        self.shadow_pnl = 0.0
+        self.shadow_position = 0
+        self.shadow_entry_price = 0.0
+        now = datetime.now(ET).strftime("%H:%M:%S")
+        print(f"\n[{now}] [MODE] ========================================")
+        print(f"[{now}] [MODE] >>> SWITCHING TO SHADOW")
+        print(f"[{now}] [MODE] Live P&L was: ${self.live_pnl:.2f} (total: ${self.total_live_pnl:.2f})")
+        print(f"[{now}] [MODE] Waiting for -${self.shadow_loss:.0f} before going live again...")
+        print(f"[{now}] [MODE] ========================================\n")
 
     # ==========================================================
     # Shutdown
@@ -602,11 +647,13 @@ class RenkoBot:
             if price:
                 self._shadow_flatten(price, reason="SHUTDOWN")
 
+        self.total_live_pnl += self.live_pnl
         self.total_shadow_pnl += self.shadow_pnl
 
         print(f"\n[BOT] === SESSION SUMMARY ===")
-        print(f"[BOT] LIVE P&L: ${self.live_pnl:.2f}")
-        print(f"[BOT] SHADOW P&L: ${self.total_shadow_pnl:.2f} (not real)")
+        print(f"[BOT] Live cycles: {self.live_cycles}")
+        print(f"[BOT] Total LIVE P&L: ${self.total_live_pnl:.2f}")
+        print(f"[BOT] Total SHADOW P&L: ${self.total_shadow_pnl:.2f} (not real)")
         print(f"[BOT] ========================")
 
         if self.suite:
@@ -626,6 +673,8 @@ def main():
                         help="Renko brick size in points (default: 0.25)")
     parser.add_argument("--shadow-loss", type=float, default=700.0,
                         help="Shadow P&L loss to trigger LIVE mode")
+    parser.add_argument("--live-profit", type=float, default=500.0,
+                        help="Live P&L profit target to cycle back to SHADOW")
     parser.add_argument("--tg-token", default="", help="Telegram bot token")
     parser.add_argument("--tg-chat", default="", help="Telegram chat ID")
     parser.add_argument("--tg-keys", default="", help="Comma-separated passkeys")
@@ -638,6 +687,7 @@ def main():
         qty=args.qty,
         brick_size=args.brick_size,
         shadow_loss=args.shadow_loss,
+        live_profit=args.live_profit,
         tg_token=args.tg_token,
         tg_chat=args.tg_chat,
         tg_keys=keys,
