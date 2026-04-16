@@ -5,6 +5,7 @@ Listens to a Telegram channel for trade signals and copies them
 to your TopstepX account automatically.
 
 This script contains NO strategy logic - it just copies signals.
+Uses ntfy.sh as signal relay (no Telegram bot privacy issues).
 
 Signal format: SIGNAL|KEY|LONG|NQ|25385.50|1
                SIGNAL|KEY|SHORT|NQ|25380.00|1
@@ -14,7 +15,7 @@ Usage:
     export PROJECT_X_USERNAME="your_email"
     export PROJECT_X_API_KEY="your_api_key"
     export PROJECT_X_ACCOUNT_NAME="your_account"
-    python copier_bot.py --tg-token YOUR_BOT_TOKEN --tg-chat CHAT_ID --tg-key PASSWORD --symbol NQ --qty 1
+    python copier_bot.py --ntfy-topic TOPIC --tg-key PASSWORD --symbol NQ --qty 1
 """
 
 import asyncio
@@ -36,18 +37,17 @@ ET = pytz.timezone("America/New_York")
 
 
 class SignalCopier:
-    def __init__(self, tg_token: str, tg_chat: str, tg_key: str, symbol: str, qty: int = 1):
-        self.tg_token = tg_token
-        self.tg_chat = tg_chat
+    def __init__(self, tg_key: str, symbol: str, qty: int = 1, ntfy_topic: str = ""):
         self.tg_key = tg_key
         self.symbol = symbol
         self.qty = qty
+        self.ntfy_topic = ntfy_topic
 
         # Position state
         self.position = 0  # 1=long, -1=short, 0=flat
 
-        # Telegram polling
-        self.last_update_id = 0
+        # ntfy.sh polling timestamp
+        self.last_poll_time = None
 
         # SDK
         self.suite = None
@@ -86,47 +86,63 @@ class SignalCopier:
     async def run(self):
         print(f"[COPIER] Signal Copier Bot")
         print(f"[COPIER] Symbol: {self.symbol}, Qty: {self.qty}")
-        print(f"[COPIER] Listening to Telegram for signals...")
+        print(f"[COPIER] Key: {self.tg_key}")
+        print(f"[COPIER] Signal relay: ntfy.sh/{self.ntfy_topic}")
         print()
 
         await self._connect()
 
+        print(f"[COPIER] Listening for signals...")
         print(f"[COPIER] Press Ctrl+C to stop")
         print()
 
         self.running = True
+        import time as _time
+        self.last_poll_time = int(_time.time())
+
+        self._poll_interval = 5  # seconds between ntfy polls (avoid 429 rate limit)
 
         try:
             while self.running:
                 await self._poll_signals()
-                await asyncio.sleep(1)
+                await asyncio.sleep(self._poll_interval)
         except asyncio.CancelledError:
             pass
         finally:
             await self._shutdown()
 
     async def _poll_signals(self):
-        """Poll Telegram for new messages containing signals."""
+        """Poll ntfy.sh for new signal messages."""
         try:
-            url = f"https://api.telegram.org/bot{self.tg_token}/getUpdates?offset={self.last_update_id + 1}&timeout=1"
+            url = f"https://ntfy.sh/{self.ntfy_topic}/json?poll=1&since={self.last_poll_time}"
             req = urllib.request.Request(url)
             resp = urllib.request.urlopen(req, timeout=5)
-            data = json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8").strip()
 
-            if not data.get("ok"):
+            if not raw:
                 return
 
-            for update in data.get("result", []):
-                self.last_update_id = update["update_id"]
-                msg = update.get("message", {}) or update.get("channel_post", {})
-                text = msg.get("text", "")
+            import time as _time
+            self.last_poll_time = int(_time.time())
 
-                if text.startswith("SIGNAL|"):
-                    await self._process_signal(text)
+            for line in raw.split("\n"):
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                    text = obj.get("message", "")
+                    if text.startswith("SIGNAL|"):
+                        await self._process_signal(text)
+                except json.JSONDecodeError:
+                    continue
 
         except Exception as e:
-            # Timeout or network error - just retry next loop
-            if "timed out" not in str(e).lower():
+            err_str = str(e).lower()
+            if "429" in str(e):
+                # Rate limited - back off
+                self._poll_interval = min(self._poll_interval + 5, 30)
+                print(f"[COPIER] Rate limited, slowing to {self._poll_interval}s polling")
+            elif "timed out" not in err_str:
                 print(f"[COPIER] Poll error: {e}")
 
     async def _process_signal(self, signal_text: str):
@@ -266,19 +282,17 @@ class SignalCopier:
 
 def main():
     parser = argparse.ArgumentParser(description="TopstepX Signal Copier")
-    parser.add_argument("--tg-token", required=True, help="Telegram bot token")
-    parser.add_argument("--tg-chat", required=True, help="Telegram chat/channel ID")
+    parser.add_argument("--ntfy-topic", required=True, help="ntfy.sh topic for signal relay")
     parser.add_argument("--tg-key", required=True, help="Passkey to authenticate signals")
     parser.add_argument("--symbol", default="NQ", help="Contract symbol")
     parser.add_argument("--qty", type=int, default=1, help="Order quantity")
     args = parser.parse_args()
 
     bot = SignalCopier(
-        tg_token=args.tg_token,
-        tg_chat=args.tg_chat,
         tg_key=args.tg_key,
         symbol=args.symbol,
         qty=args.qty,
+        ntfy_topic=args.ntfy_topic,
     )
 
     # Windows compatibility: use SelectorEventLoop instead of ProactorEventLoop
