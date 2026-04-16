@@ -1,9 +1,10 @@
 """
-TopstepX Renko Strategy Bot (Shadow Mode)
+TopstepX Renko Multi-Timeframe Strategy Bot (Shadow Mode)
 
-Strategy: Builds virtual Renko bricks from live tick data.
-Multi-timeframe: multiple brick sizes must all agree on direction to enter.
-Exit: primary (smallest) brick changes direction.
+Strategy: Traditional Renko 0.25 bricks built from candle CLOSE prices.
+Multi-timeframe: builds separate Renko from 1min, 3min, 5min, 15min closes.
+- ENTRY: all 4 timeframes must show same Renko direction (all green = LONG)
+- EXIT: any timeframe closes a brick in opposite direction = immediate exit
 
 Shadow Mode: Starts in SHADOW, simulating trades.
 Once shadow P&L hits loss threshold (e.g. -$700), switches to LIVE.
@@ -14,7 +15,7 @@ Usage:
     export PROJECT_X_USERNAME="your_email"
     export PROJECT_X_API_KEY="your_api_key"
     export PROJECT_X_ACCOUNT_NAME="your_account"
-    python renko_bot.py --symbol NQ --qty 1 --brick-sizes "0.25,2.0,10.0"
+    python renko_bot.py --symbol NQ --qty 1 --brick-size 0.25
 """
 
 import asyncio
@@ -62,44 +63,48 @@ def send_signals(token: str, chat_id: str, keys: list, direction: str, symbol: s
 
 
 # ============================================================
-# Renko Engine
+# Renko Engine (Traditional - TradingView exact)
 # ============================================================
 
 class RenkoEngine:
-    """Virtual Renko brick engine built from tick data.
+    """Traditional Renko engine matching TradingView's calculation.
 
-    Traditional Renko:
-    - New UP brick when price >= last_close + brick_size
-    - New DOWN brick when price <= last_close - brick_size
-    - Multiple bricks can form in one update if price gaps
+    Builds bricks from CLOSE prices only (not ticks).
+    - New UP brick: close >= last_brick_close + brick_size
+    - New DOWN brick: close <= last_brick_close - brick_size
+    - Multiple bricks can form if price gaps past multiple levels.
     """
 
-    def __init__(self, brick_size: float):
+    def __init__(self, brick_size: float, label: str = ""):
         self.brick_size = brick_size
-        self.last_close = None
-        self.direction = 0   # 1=up (green), -1=down (red), 0=not started
+        self.label = label
+        self.last_close = None       # Close of most recent completed brick
+        self.direction = 0           # 1=up (green), -1=down (red), 0=not started
         self.brick_count = 0
 
     def initialize(self, price: float):
+        """Snap starting reference to the brick grid."""
         self.last_close = round(price / self.brick_size) * self.brick_size
 
-    def update(self, price: float) -> list:
-        """Feed a tick price. Returns list of new bricks: [(open, close, direction), ...]"""
+    def feed_close(self, close_price: float) -> list:
+        """Feed a candle close price. Returns list of new bricks formed.
+        Each brick: (open, close, direction)
+        """
         if self.last_close is None:
-            self.initialize(price)
+            self.initialize(close_price)
             return []
 
         new_bricks = []
 
         while True:
-            if price >= self.last_close + self.brick_size:
+            if close_price >= self.last_close + self.brick_size:
                 new_open = self.last_close
                 new_close = self.last_close + self.brick_size
                 new_bricks.append((new_open, new_close, 1))
                 self.last_close = new_close
                 self.direction = 1
                 self.brick_count += 1
-            elif price <= self.last_close - self.brick_size:
+            elif close_price <= self.last_close - self.brick_size:
                 new_open = self.last_close
                 new_close = self.last_close - self.brick_size
                 new_bricks.append((new_open, new_close, -1))
@@ -118,10 +123,14 @@ class RenkoEngine:
 
 ET = pytz.timezone("America/New_York")
 
-SESSION_START = dtime(9, 44, 0)   # 9:44 AM ET
-SESSION_END = dtime(16, 0)        # 4:00 PM ET
+SESSION_START = dtime(9, 44, 0)    # 9:44 AM ET
+SESSION_END = dtime(16, 0)         # 4:00 PM ET
 
 POINT_VALUE = 20.0  # NQ: $20 per point per contract
+
+# Timeframes for multi-TF Renko (in minutes)
+# 1min, 3min, 5min, 15min - all using same brick size
+TF_MINUTES = [1, 3, 5, 15]
 
 
 def in_session() -> bool:
@@ -137,41 +146,48 @@ def in_session() -> bool:
 
 class RenkoBot:
     def __init__(self, symbol: str, qty: int = 1,
-                 brick_sizes: list = None,
+                 brick_size: float = 0.25,
                  shadow_loss: float = 700.0, live_profit: float = 500.0,
                  tg_token: str = "", tg_chat: str = "", tg_keys: list = None):
         self.symbol = symbol
         self.qty = qty
+        self.brick_size = brick_size
         self.shadow_loss = shadow_loss
         self.live_profit = live_profit
         self.tg_token = tg_token
         self.tg_chat = tg_chat
         self.tg_keys = tg_keys or []
 
-        # Renko engines - multiple brick sizes for multi-TF
-        self.brick_sizes = brick_sizes or [0.25, 2.0, 10.0]
-        self.engines = []  # populated in run()
-        self.primary_idx = 0  # smallest brick size = primary trigger
+        # Renko engines - one per timeframe, all same brick size
+        self.engines = {}        # {tf_minutes: RenkoEngine}
+        self.tf_labels = {}      # {tf_minutes: "1min", "3min", etc.}
 
-        # Mode: "SHADOW" or "LIVE"
+        # 1-minute bar tracking (to build 3min, 5min from 1min closes)
+        self.bar_count = 0       # Count of 1-min bars since session start
+        self.last_1min_time = None
+
+        # 15-min bar tracking (use API's native 15min for accuracy)
+        self.last_15min_time = None
+
+        # Mode
         self.mode = "SHADOW"
 
-        # Real position state (LIVE)
+        # Real position (LIVE)
         self.position = 0
         self.entry_price = 0.0
 
-        # Shadow position state
+        # Shadow position
         self.shadow_position = 0
         self.shadow_entry_price = 0.0
         self.shadow_pnl = 0.0
 
-        # Live P&L tracking
+        # P&L
         self.live_pnl = 0.0
         self.total_live_pnl = 0.0
         self.total_shadow_pnl = 0.0
         self.live_cycles = 0
 
-        # Session tracking
+        # Session
         self.was_in_session = False
 
         # Connection health
@@ -184,33 +200,34 @@ class RenkoBot:
         self.suite = None
         self.ctx = None
         self.running = False
-        self.last_price = None
 
     async def run(self):
         from project_x_py import TradingSuite
 
-        # Sort brick sizes - smallest first (primary trigger)
-        self.brick_sizes.sort()
+        # Create engines for each timeframe
+        for tf in TF_MINUTES:
+            label = f"{tf}min"
+            self.engines[tf] = RenkoEngine(self.brick_size, label)
+            self.tf_labels[tf] = label
 
-        # Create Renko engines
-        self.engines = [RenkoEngine(bs) for bs in self.brick_sizes]
-
-        print(f"[BOT] Renko Strategy Bot - SHADOW MODE")
+        print(f"[BOT] Renko Multi-TF Strategy Bot - SHADOW MODE")
         print(f"[BOT] Symbol: {self.symbol}, Qty: {self.qty}")
-        print(f"[BOT] Brick sizes: {', '.join(f'{bs}' for bs in self.brick_sizes)}")
-        print(f"[BOT] Primary (trigger): {self.brick_sizes[0]} | Confirmations: {', '.join(f'{bs}' for bs in self.brick_sizes[1:])}")
+        print(f"[BOT] Brick size: {self.brick_size} (Traditional)")
+        print(f"[BOT] Timeframes: {', '.join(self.tf_labels[tf] for tf in TF_MINUTES)}")
+        print(f"[BOT] Entry: ALL timeframes must align")
+        print(f"[BOT] Exit: ANY timeframe closes opposite brick")
         print(f"[BOT] Shadow loss: -${self.shadow_loss:.0f} | Live profit: +${self.live_profit:.0f}")
         print(f"[BOT] Session: {SESSION_START.strftime('%H:%M')} - {SESSION_END.strftime('%H:%M')} ET")
         if self.tg_token and self.tg_chat and self.tg_keys:
             print(f"[BOT] Telegram signals: ENABLED ({len(self.tg_keys)} keys)")
         print()
 
+        # Subscribe to 1min and 15min candles
         self.suite = await TradingSuite.create(
             instruments=self.symbol,
-            timeframes=["1min"],
-            initial_days=0,
+            timeframes=["1min", "15min"],
+            initial_days=1,
         )
-
         self.ctx = self.suite[self.symbol]
 
         print(f"[BOT] Connected to TopstepX")
@@ -221,14 +238,17 @@ class RenkoBot:
         # Initialize engines with current price
         price = await self.ctx.data.get_current_price()
         if price:
-            for eng in self.engines:
-                eng.initialize(price)
-            self.last_price = price
-            print(f"[BOT] Renko initialized at {price:.2f}")
-            for eng in self.engines:
-                print(f"  Brick {eng.brick_size}: ref={eng.last_close:.2f}")
-        print()
+            for tf in TF_MINUTES:
+                self.engines[tf].initialize(price)
+            print(f"[BOT] Renko engines initialized at {price:.2f}")
+            for tf in TF_MINUTES:
+                eng = self.engines[tf]
+                print(f"  {self.tf_labels[tf]}: ref={eng.last_close:.2f}")
 
+        # Seed with historical data
+        await self._seed_history()
+
+        print()
         self.running = True
         self.was_in_session = in_session()
 
@@ -240,11 +260,47 @@ class RenkoBot:
         try:
             while self.running:
                 await self._tick()
-                await asyncio.sleep(0.25)  # Poll 4x/sec for tick-level detection
+                await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             pass
         finally:
             await self._shutdown()
+
+    async def _seed_history(self):
+        """Feed historical 1min candles to warm up all Renko engines."""
+        data = await self.ctx.data.get_data("1min", bars=200)
+        if data is None or len(data) == 0:
+            print("[BOT] No historical data for seeding")
+            return
+
+        rows = list(data.iter_rows(named=True))
+        print(f"[BOT] Seeding Renko with {len(rows)} historical 1min bars...")
+
+        for i, row in enumerate(rows):
+            close = float(row["close"])
+
+            # Feed to 1min engine
+            bricks_1 = self.engines[1].feed_close(close)
+
+            # Feed to 3min engine (every 3rd bar)
+            if (i + 1) % 3 == 0:
+                self.engines[3].feed_close(close)
+
+            # Feed to 5min engine (every 5th bar)
+            if (i + 1) % 5 == 0:
+                self.engines[5].feed_close(close)
+
+            # Feed to 15min engine (every 15th bar)
+            if (i + 1) % 15 == 0:
+                self.engines[15].feed_close(close)
+
+        for tf in TF_MINUTES:
+            eng = self.engines[tf]
+            dir_str = "UP" if eng.direction == 1 else "DN" if eng.direction == -1 else "??"
+            print(f"  {self.tf_labels[tf]}: {eng.brick_count} bricks, last={dir_str}, ref={eng.last_close:.2f}")
+
+        # Set bar count to track 3min/5min alignment
+        self.bar_count = len(rows)
 
     async def _tick(self):
         price = await self.ctx.data.get_current_price()
@@ -271,26 +327,7 @@ class RenkoBot:
             print(f"[{now}] [ALERT] {msg}")
             send_telegram(self.tg_token, self.tg_chat, f"STATUS|{msg}")
 
-        # Skip if price hasn't changed
-        if price == self.last_price:
-            return
-        self.last_price = price
-
-        # Feed tick to ALL Renko engines
-        all_new_bricks = []
-        for eng in self.engines:
-            bricks = eng.update(price)
-            all_new_bricks.append(bricks)
-
-        # Log new bricks
-        for i, bricks in enumerate(all_new_bricks):
-            for brick in bricks:
-                b_open, b_close, b_dir = brick
-                color = "GREEN" if b_dir == 1 else "RED"
-                now = datetime.now(ET).strftime("%H:%M:%S")
-                print(f"[{now}] [RENKO {self.brick_sizes[i]}] New {color} brick: {b_open:.2f} -> {b_close:.2f} (#{self.engines[i].brick_count})")
-
-        # Check session
+        # Check session boundaries
         currently_in_session = in_session()
         sess_ended = self.was_in_session and not currently_in_session
 
@@ -312,6 +349,7 @@ class RenkoBot:
             self.total_live_pnl = 0.0
             self.total_shadow_pnl = 0.0
             self.live_cycles = 0
+            self.bar_count = 0
             now = datetime.now(ET).strftime("%H:%M:%S")
             print(f"[{now}] [SESSION] New session started - SHADOW mode")
 
@@ -320,35 +358,101 @@ class RenkoBot:
         if not currently_in_session:
             return
 
-        # Only act when the primary (smallest) brick engine forms a new brick
-        primary_bricks = all_new_bricks[self.primary_idx]
-        if not primary_bricks:
+        # Check for new 1-minute bar close
+        new_renko_event = False
+        data_1m = await self.ctx.data.get_data("1min", bars=1)
+        if data_1m is not None and len(data_1m) > 0:
+            rows = list(data_1m.iter_rows(named=True))
+            last_row = rows[-1]
+            bar_time = last_row.get("timestamp") or last_row.get("time")
+
+            if bar_time != self.last_1min_time:
+                self.last_1min_time = bar_time
+                self.bar_count += 1
+                close_1m = float(last_row["close"])
+
+                now = datetime.now(ET).strftime("%H:%M:%S")
+
+                # Feed 1min Renko
+                bricks = self.engines[1].feed_close(close_1m)
+                if bricks:
+                    new_renko_event = True
+                    for b in bricks:
+                        color = "GREEN" if b[2] == 1 else "RED"
+                        print(f"[{now}] [RENKO 1min] {color} brick #{self.engines[1].brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
+
+                # Feed 3min Renko (every 3 bars)
+                if self.bar_count % 3 == 0:
+                    bricks = self.engines[3].feed_close(close_1m)
+                    if bricks:
+                        new_renko_event = True
+                        for b in bricks:
+                            color = "GREEN" if b[2] == 1 else "RED"
+                            print(f"[{now}] [RENKO 3min] {color} brick #{self.engines[3].brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
+
+                # Feed 5min Renko (every 5 bars)
+                if self.bar_count % 5 == 0:
+                    bricks = self.engines[5].feed_close(close_1m)
+                    if bricks:
+                        new_renko_event = True
+                        for b in bricks:
+                            color = "GREEN" if b[2] == 1 else "RED"
+                            print(f"[{now}] [RENKO 5min] {color} brick #{self.engines[5].brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
+
+                # Feed 15min Renko (every 15 bars)
+                if self.bar_count % 15 == 0:
+                    bricks = self.engines[15].feed_close(close_1m)
+                    if bricks:
+                        new_renko_event = True
+                        for b in bricks:
+                            color = "GREEN" if b[2] == 1 else "RED"
+                            print(f"[{now}] [RENKO 15min] {color} brick #{self.engines[15].brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
+
+        # Only evaluate strategy when a Renko brick formed
+        if not new_renko_event:
+            # Still check profit target on live positions
+            if self.mode == "LIVE" and self.position != 0:
+                unrealized = (price - self.entry_price) * self.position * POINT_VALUE * self.qty
+                total = self.live_pnl + unrealized
+                if total >= self.live_profit:
+                    now = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"\n[{now}] [LIVE] *** PROFIT TARGET HIT! Live P&L: ${total:.2f} ***")
+                    await self._flatten(price, reason="PROFIT_TARGET")
+                    self.total_live_pnl += self.live_pnl
+                    send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                                 "FLAT", self.symbol, price, 0)
+                    self._switch_to_shadow()
             return
 
-        # Get direction from each engine
-        directions = [eng.direction for eng in self.engines]
+        # Get current direction from each engine
+        directions = {tf: self.engines[tf].direction for tf in TF_MINUTES}
 
-        # Multi-TF confirmation: all engines must agree on direction
-        all_up = all(d == 1 for d in directions)
-        all_down = all(d == -1 for d in directions)
+        # Check alignment
+        all_up = all(d == 1 for d in directions.values())
+        all_down = all(d == -1 for d in directions.values())
 
-        # Primary brick's latest direction (the trigger)
-        primary_dir = primary_bricks[-1][2]
+        # Check if ANY engine disagrees with position
+        position_dir = self.position if self.mode == "LIVE" else self.shadow_position
+        any_against = False
+        if position_dir == 1:
+            any_against = any(d == -1 for d in directions.values())
+        elif position_dir == -1:
+            any_against = any(d == 1 for d in directions.values())
 
         now = datetime.now(ET).strftime("%H:%M:%S")
-        dir_str = " | ".join(f"{self.brick_sizes[i]}={'UP' if d==1 else 'DN' if d==-1 else '??'}" for i, d in enumerate(directions))
-        print(f"[{now}] [MTF] {dir_str} | AllUp={all_up} AllDn={all_down}")
+        dir_str = " | ".join(f"{self.tf_labels[tf]}={'UP' if d==1 else 'DN' if d==-1 else '??'}" for tf, d in directions.items())
+        print(f"[{now}] [MTF] {dir_str} | AllUp={all_up} AllDn={all_down} Against={any_against}")
 
         if self.mode == "SHADOW":
-            self._shadow_logic(price, all_up, all_down, primary_dir)
+            self._shadow_logic(price, all_up, all_down, any_against)
         else:
-            await self._live_logic(price, all_up, all_down, primary_dir)
+            await self._live_logic(price, all_up, all_down, any_against)
 
     # ==========================================================
     # SHADOW MODE
     # ==========================================================
 
-    def _shadow_logic(self, price: float, all_up: bool, all_down: bool, primary_dir: int):
+    def _shadow_logic(self, price: float, all_up: bool, all_down: bool, any_against: bool):
         # Check threshold
         if self.shadow_position != 0:
             unrealized = (price - self.shadow_entry_price) * self.shadow_position * POINT_VALUE * self.qty
@@ -363,25 +467,22 @@ class RenkoBot:
             self._switch_to_live()
             return
 
+        # Exit: any timeframe disagrees
+        if self.shadow_position != 0 and any_against:
+            self._shadow_flatten(price, reason="TF_MISALIGN")
+
         # Entry: all timeframes agree
         if all_up and self.shadow_position != 1:
             if self.shadow_position == -1:
-                self._shadow_flatten(price, reason="RENKO_UP")
+                self._shadow_flatten(price, reason="FLIP_LONG")
             if self.shadow_position == 0:
                 self._shadow_enter(price, 1, "LONG")
 
         elif all_down and self.shadow_position != -1:
             if self.shadow_position == 1:
-                self._shadow_flatten(price, reason="RENKO_DOWN")
+                self._shadow_flatten(price, reason="FLIP_SHORT")
             if self.shadow_position == 0:
                 self._shadow_enter(price, -1, "SHORT")
-
-        # Exit: primary brick changes against position (even if larger TFs disagree)
-        elif self.shadow_position == 1 and primary_dir == -1:
-            self._shadow_flatten(price, reason="PRIMARY_REVERSAL")
-
-        elif self.shadow_position == -1 and primary_dir == 1:
-            self._shadow_flatten(price, reason="PRIMARY_REVERSAL")
 
     def _shadow_enter(self, price: float, direction: int, label: str):
         self.shadow_position = direction
@@ -402,12 +503,11 @@ class RenkoBot:
     # LIVE MODE
     # ==========================================================
 
-    async def _live_logic(self, price: float, all_up: bool, all_down: bool, primary_dir: int):
+    async def _live_logic(self, price: float, all_up: bool, all_down: bool, any_against: bool):
         # Check profit target
         if self.position != 0:
             unrealized = (price - self.entry_price) * self.position * POINT_VALUE * self.qty
             total = self.live_pnl + unrealized
-
             if total >= self.live_profit:
                 now = datetime.now(ET).strftime("%H:%M:%S")
                 print(f"\n[{now}] [LIVE] *** PROFIT TARGET HIT! Live P&L: ${total:.2f} ***")
@@ -418,25 +518,24 @@ class RenkoBot:
                 self._switch_to_shadow()
                 return
 
+        # Exit: any timeframe disagrees with position
+        if self.position != 0 and any_against:
+            await self._flatten(price, reason="TF_MISALIGN")
+            send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                         "FLAT", self.symbol, price, 0)
+
         # Entry: all timeframes agree
         if all_up and self.position != 1:
             if self.position == -1:
-                await self._flatten(price, reason="RENKO_UP")
+                await self._flatten(price, reason="FLIP_LONG")
             if self.position == 0:
                 await self._enter_long(price)
 
         elif all_down and self.position != -1:
             if self.position == 1:
-                await self._flatten(price, reason="RENKO_DOWN")
+                await self._flatten(price, reason="FLIP_SHORT")
             if self.position == 0:
                 await self._enter_short(price)
-
-        # Exit: primary brick reversal
-        elif self.position == 1 and primary_dir == -1:
-            await self._flatten(price, reason="PRIMARY_REVERSAL")
-
-        elif self.position == -1 and primary_dir == 1:
-            await self._flatten(price, reason="PRIMARY_REVERSAL")
 
     async def _enter_long(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
@@ -565,11 +664,11 @@ class RenkoBot:
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="TopstepX Renko Bot (Shadow Mode)")
+    parser = argparse.ArgumentParser(description="TopstepX Renko Multi-TF Bot (Shadow Mode)")
     parser.add_argument("--symbol", default="NQ", help="Contract symbol")
     parser.add_argument("--qty", type=int, default=1, help="Order quantity")
-    parser.add_argument("--brick-sizes", default="0.25,2.0,10.0",
-                        help="Comma-separated Renko brick sizes (smallest=trigger, rest=confirmation)")
+    parser.add_argument("--brick-size", type=float, default=0.25,
+                        help="Renko brick size in points (default: 0.25)")
     parser.add_argument("--shadow-loss", type=float, default=700.0,
                         help="Shadow P&L loss threshold to switch to LIVE")
     parser.add_argument("--live-profit", type=float, default=500.0,
@@ -579,13 +678,12 @@ def main():
     parser.add_argument("--tg-keys", default="", help="Comma-separated passkeys")
     args = parser.parse_args()
 
-    brick_sizes = [float(x.strip()) for x in args.brick_sizes.split(",") if x.strip()]
     keys = [k.strip() for k in args.tg_keys.split(",") if k.strip()] if args.tg_keys else []
 
     bot = RenkoBot(
         symbol=args.symbol,
         qty=args.qty,
-        brick_sizes=brick_sizes,
+        brick_size=args.brick_size,
         shadow_loss=args.shadow_loss,
         live_profit=args.live_profit,
         tg_token=args.tg_token,
