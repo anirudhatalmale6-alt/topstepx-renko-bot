@@ -1,7 +1,7 @@
 #!/bin/bash
 export PROJECT_X_USERNAME="nirmaljitsingh2012@gmail.com"
 export PROJECT_X_API_KEY="+bl7RBUffN2Gl+SJzf2pX7e4Kgt81OmBaTm3XdNEhNY="
-export PROJECT_X_ACCOUNT_NAME="PRAC-V2-343477-16822094"
+export PROJECT_X_ACCOUNT_NAME="PRAC-V2-343477-24742225"
 export PYTHONUNBUFFERED=1
 
 cd /home/ec2-user/renko-bot

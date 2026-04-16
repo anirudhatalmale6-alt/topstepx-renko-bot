@@ -353,8 +353,8 @@ class RenkoBot:
             if self.position != 0:
                 print(f"[SESSION] Session ended - flattening LIVE position")
                 await self._flatten(price, reason="SESSION_END")
-                send_signals(self.tg_token, self.tg_chat, self.tg_keys, ntfy_topic=self.ntfy_topic,
-                             "FLAT", self.symbol, price, 0)
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
             if self.shadow_position != 0:
                 self._shadow_flatten(price, reason="SESSION_END")
             self.was_in_session = currently_in_session
@@ -438,8 +438,8 @@ class RenkoBot:
                     print(f"\n[{now}] [LIVE] *** PROFIT TARGET +${self.live_profit:.0f} HIT! P&L: ${total:.2f} ***")
                     await self._flatten(price, reason="PROFIT_TARGET")
                     self.total_live_pnl += self.live_pnl
-                    send_signals(self.tg_token, self.tg_chat, self.tg_keys, ntfy_topic=self.ntfy_topic,
-                                 "FLAT", self.symbol, price, 0)
+                    send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                                 "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
                     self._switch_to_shadow()
             return
 
@@ -530,16 +530,16 @@ class RenkoBot:
                 print(f"\n[{now}] [LIVE] *** PROFIT TARGET +${self.live_profit:.0f} HIT! P&L: ${total:.2f} ***")
                 await self._flatten(price, reason="PROFIT_TARGET")
                 self.total_live_pnl += self.live_pnl
-                send_signals(self.tg_token, self.tg_chat, self.tg_keys, ntfy_topic=self.ntfy_topic,
-                             "FLAT", self.symbol, price, 0)
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
                 self._switch_to_shadow()
                 return
 
         # Exit on misalignment
         if self.position != 0 and misaligned:
             await self._flatten(price, reason="MISALIGNED")
-            send_signals(self.tg_token, self.tg_chat, self.tg_keys, ntfy_topic=self.ntfy_topic,
-                         "FLAT", self.symbol, price, 0)
+            send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                         "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
 
         # Entry when all aligned
         if all_up and self.position <= 0:
@@ -567,8 +567,8 @@ class RenkoBot:
                 self.position = 1
                 self.entry_price = price
                 print(f"[LIVE] Order filled. ID: {response.orderId}")
-                send_signals(self.tg_token, self.tg_chat, self.tg_keys, ntfy_topic=self.ntfy_topic,
-                             "LONG", self.symbol, price, self.qty)
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "LONG", self.symbol, price, self.qty, ntfy_topic=self.ntfy_topic)
             else:
                 print(f"[LIVE] Order FAILED: {response.errorMessage}")
         except Exception as e:
@@ -587,8 +587,8 @@ class RenkoBot:
                 self.position = -1
                 self.entry_price = price
                 print(f"[LIVE] Order filled. ID: {response.orderId}")
-                send_signals(self.tg_token, self.tg_chat, self.tg_keys, ntfy_topic=self.ntfy_topic,
-                             "SHORT", self.symbol, price, self.qty)
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "SHORT", self.symbol, price, self.qty, ntfy_topic=self.ntfy_topic)
             else:
                 print(f"[LIVE] Order FAILED: {response.errorMessage}")
         except Exception as e:
@@ -658,8 +658,8 @@ class RenkoBot:
             price = await self.ctx.data.get_current_price()
             if price:
                 await self._flatten(price, reason="SHUTDOWN")
-                send_signals(self.tg_token, self.tg_chat, self.tg_keys, ntfy_topic=self.ntfy_topic,
-                             "FLAT", self.symbol, price, 0)
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
 
         if self.shadow_position != 0:
             price = await self.ctx.data.get_current_price()
