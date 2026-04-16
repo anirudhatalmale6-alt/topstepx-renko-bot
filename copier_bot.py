@@ -48,26 +48,44 @@ class SignalCopier:
         self.suite = None
         self.ctx = None
         self.running = False
+        self.connected = False
+        self.consecutive_errors = 0
+        self.MAX_ERRORS_BEFORE_RECONNECT = 3
 
-    async def run(self):
+    async def _connect(self):
+        """Connect (or reconnect) to TopstepX."""
         from project_x_py import TradingSuite
 
-        print(f"[COPIER] Signal Copier Bot")
-        print(f"[COPIER] Symbol: {self.symbol}, Qty: {self.qty}")
-        print(f"[COPIER] Listening to Telegram for signals...")
-        print()
+        if self.suite:
+            try:
+                await self.suite.disconnect()
+            except Exception:
+                pass
+            self.suite = None
+            self.ctx = None
 
         self.suite = await TradingSuite.create(
             instruments=self.symbol,
             timeframes=["1min"],
             initial_days=0,
         )
-
         self.ctx = self.suite[self.symbol]
+        self.connected = True
+        self.consecutive_errors = 0
 
-        print(f"[COPIER] Connected to TopstepX")
+        now = datetime.now(ET).strftime("%H:%M:%S")
+        print(f"[{now}] [COPIER] Connected to TopstepX")
         print(f"[COPIER] Account: {self.suite.client.account_info.name}")
         print(f"[COPIER] Contract: {self.ctx.instrument_info.id}")
+
+    async def run(self):
+        print(f"[COPIER] Signal Copier Bot")
+        print(f"[COPIER] Symbol: {self.symbol}, Qty: {self.qty}")
+        print(f"[COPIER] Listening to Telegram for signals...")
+        print()
+
+        await self._connect()
+
         print(f"[COPIER] Press Ctrl+C to stop")
         print()
 
@@ -144,6 +162,20 @@ class SignalCopier:
             if self.position >= 0:
                 await self._enter_short()
 
+    async def _try_reconnect(self):
+        """Attempt to reconnect to TopstepX."""
+        now = datetime.now(ET).strftime("%H:%M:%S")
+        print(f"[{now}] [COPIER] Connection lost - reconnecting...")
+        self.connected = False
+        try:
+            await self._connect()
+            print(f"[{now}] [COPIER] Reconnected successfully!")
+            return True
+        except Exception as e:
+            print(f"[{now}] [COPIER] Reconnect failed: {e}")
+            print(f"[{now}] [COPIER] Will retry on next signal...")
+            return False
+
     async def _enter_long(self):
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"[{now}] [TRADE] >>> ENTERING LONG")
@@ -155,11 +187,16 @@ class SignalCopier:
             )
             if response.success:
                 self.position = 1
+                self.consecutive_errors = 0
                 print(f"[TRADE] Filled. ID: {response.orderId}")
             else:
                 print(f"[TRADE] FAILED: {response.errorMessage}")
         except Exception as e:
             print(f"[TRADE] ERROR: {e}")
+            self.consecutive_errors += 1
+            if self.consecutive_errors >= self.MAX_ERRORS_BEFORE_RECONNECT:
+                if await self._try_reconnect():
+                    await self._enter_long()  # Retry after reconnect
 
     async def _enter_short(self):
         now = datetime.now(ET).strftime("%H:%M:%S")
@@ -172,35 +209,39 @@ class SignalCopier:
             )
             if response.success:
                 self.position = -1
+                self.consecutive_errors = 0
                 print(f"[TRADE] Filled. ID: {response.orderId}")
             else:
                 print(f"[TRADE] FAILED: {response.errorMessage}")
         except Exception as e:
             print(f"[TRADE] ERROR: {e}")
+            self.consecutive_errors += 1
+            if self.consecutive_errors >= self.MAX_ERRORS_BEFORE_RECONNECT:
+                if await self._try_reconnect():
+                    await self._enter_short()  # Retry after reconnect
 
     async def _flatten(self, reason: str = ""):
         direction = "LONG" if self.position == 1 else "SHORT"
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"[{now}] [TRADE] <<< EXITING {direction} | {reason}")
         try:
-            result = await self.ctx.positions.close_position_direct(
+            close_side = 1 if self.position == 1 else 0
+            response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
+                side=close_side,
+                size=self.qty,
             )
-            if result.get("success"):
-                print(f"[TRADE] Closed. Order: {result.get('orderId')}")
+            if response.success:
+                print(f"[TRADE] Closed. ID: {response.orderId}")
+                self.consecutive_errors = 0
             else:
-                side = 1 if self.position == 1 else 0
-                response = await self.ctx.orders.place_market_order(
-                    contract_id=self.ctx.instrument_info.id,
-                    side=side,
-                    size=self.qty,
-                )
-                if response.success:
-                    print(f"[TRADE] Closed via market. ID: {response.orderId}")
-                else:
-                    print(f"[TRADE] CLOSE FAILED: {response.errorMessage}")
+                print(f"[TRADE] CLOSE FAILED: {response.errorMessage}")
         except Exception as e:
             print(f"[TRADE] Close ERROR: {e}")
+            self.consecutive_errors += 1
+            if self.consecutive_errors >= self.MAX_ERRORS_BEFORE_RECONNECT:
+                if await self._try_reconnect():
+                    await self._flatten(reason)  # Retry after reconnect
 
         self.position = 0
 
