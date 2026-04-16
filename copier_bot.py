@@ -21,10 +21,15 @@ import asyncio
 import argparse
 import signal
 import json
+import logging
 import urllib.request
 from datetime import datetime
 
 import pytz
+
+# Suppress noisy SDK background thread errors (position_processor "no running event loop")
+logging.getLogger("project_x_py.position_manager.core").setLevel(logging.CRITICAL)
+logging.getLogger("project_x_py.realtime.connection_management").setLevel(logging.WARNING)
 
 
 ET = pytz.timezone("America/New_York")
