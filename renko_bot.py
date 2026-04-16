@@ -56,11 +56,28 @@ def send_telegram(token: str, chat_id: str, message: str):
             return
 
 
-def send_signals(token: str, chat_id: str, keys: list, direction: str, symbol: str, price: float, qty: int):
+def send_ntfy(topic: str, message: str):
+    """Send signal to ntfy.sh relay for copier bots to read."""
+    if not topic:
+        return
+    try:
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{topic}",
+            data=message.encode("utf-8"),
+            headers={"Content-Type": "text/plain"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"[NTFY] Send failed: {e}")
+
+
+def send_signals(token: str, chat_id: str, keys: list, direction: str, symbol: str, price: float, qty: int, ntfy_topic: str = ""):
     for i, key in enumerate(keys):
         if i > 0:
             time.sleep(0.5)
-        send_telegram(token, chat_id, f"SIGNAL|{key}|{direction}|{symbol}|{price}|{qty}")
+        msg = f"SIGNAL|{key}|{direction}|{symbol}|{price}|{qty}"
+        send_telegram(token, chat_id, msg)
+        send_ntfy(ntfy_topic, msg)
 
 
 # ============================================================
@@ -143,7 +160,8 @@ class RenkoBot:
     def __init__(self, symbol: str, qty: int = 1,
                  brick_size: float = 0.25,
                  shadow_loss: float = 700.0, live_profit: float = 500.0,
-                 tg_token: str = "", tg_chat: str = "", tg_keys: list = None):
+                 tg_token: str = "", tg_chat: str = "", tg_keys: list = None,
+                 ntfy_topic: str = ""):
         self.symbol = symbol
         self.qty = qty
         self.brick_size = brick_size
@@ -152,6 +170,7 @@ class RenkoBot:
         self.tg_token = tg_token
         self.tg_chat = tg_chat
         self.tg_keys = tg_keys or []
+        self.ntfy_topic = ntfy_topic
 
         # Renko engines - one per timeframe, same brick size
         self.engines = {}
@@ -334,7 +353,7 @@ class RenkoBot:
             if self.position != 0:
                 print(f"[SESSION] Session ended - flattening LIVE position")
                 await self._flatten(price, reason="SESSION_END")
-                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys, ntfy_topic=self.ntfy_topic,
                              "FLAT", self.symbol, price, 0)
             if self.shadow_position != 0:
                 self._shadow_flatten(price, reason="SESSION_END")
@@ -419,7 +438,7 @@ class RenkoBot:
                     print(f"\n[{now}] [LIVE] *** PROFIT TARGET +${self.live_profit:.0f} HIT! P&L: ${total:.2f} ***")
                     await self._flatten(price, reason="PROFIT_TARGET")
                     self.total_live_pnl += self.live_pnl
-                    send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                    send_signals(self.tg_token, self.tg_chat, self.tg_keys, ntfy_topic=self.ntfy_topic,
                                  "FLAT", self.symbol, price, 0)
                     self._switch_to_shadow()
             return
@@ -511,7 +530,7 @@ class RenkoBot:
                 print(f"\n[{now}] [LIVE] *** PROFIT TARGET +${self.live_profit:.0f} HIT! P&L: ${total:.2f} ***")
                 await self._flatten(price, reason="PROFIT_TARGET")
                 self.total_live_pnl += self.live_pnl
-                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys, ntfy_topic=self.ntfy_topic,
                              "FLAT", self.symbol, price, 0)
                 self._switch_to_shadow()
                 return
@@ -519,7 +538,7 @@ class RenkoBot:
         # Exit on misalignment
         if self.position != 0 and misaligned:
             await self._flatten(price, reason="MISALIGNED")
-            send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+            send_signals(self.tg_token, self.tg_chat, self.tg_keys, ntfy_topic=self.ntfy_topic,
                          "FLAT", self.symbol, price, 0)
 
         # Entry when all aligned
@@ -548,7 +567,7 @@ class RenkoBot:
                 self.position = 1
                 self.entry_price = price
                 print(f"[LIVE] Order filled. ID: {response.orderId}")
-                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys, ntfy_topic=self.ntfy_topic,
                              "LONG", self.symbol, price, self.qty)
             else:
                 print(f"[LIVE] Order FAILED: {response.errorMessage}")
@@ -568,7 +587,7 @@ class RenkoBot:
                 self.position = -1
                 self.entry_price = price
                 print(f"[LIVE] Order filled. ID: {response.orderId}")
-                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys, ntfy_topic=self.ntfy_topic,
                              "SHORT", self.symbol, price, self.qty)
             else:
                 print(f"[LIVE] Order FAILED: {response.errorMessage}")
@@ -639,7 +658,7 @@ class RenkoBot:
             price = await self.ctx.data.get_current_price()
             if price:
                 await self._flatten(price, reason="SHUTDOWN")
-                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys, ntfy_topic=self.ntfy_topic,
                              "FLAT", self.symbol, price, 0)
 
         if self.shadow_position != 0:
@@ -678,6 +697,7 @@ def main():
     parser.add_argument("--tg-token", default="", help="Telegram bot token")
     parser.add_argument("--tg-chat", default="", help="Telegram chat ID")
     parser.add_argument("--tg-keys", default="", help="Comma-separated passkeys")
+    parser.add_argument("--ntfy-topic", default="", help="ntfy.sh topic for signal relay")
     args = parser.parse_args()
 
     keys = [k.strip() for k in args.tg_keys.split(",") if k.strip()] if args.tg_keys else []
@@ -691,6 +711,7 @@ def main():
         tg_token=args.tg_token,
         tg_chat=args.tg_chat,
         tg_keys=keys,
+        ntfy_topic=args.ntfy_topic,
     )
 
     loop = asyncio.new_event_loop()

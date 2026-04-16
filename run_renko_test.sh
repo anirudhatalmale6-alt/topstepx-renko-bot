@@ -14,4 +14,5 @@ python3.12 -u renko_bot.py \
     --live-profit 500 \
     --tg-token "8681033795:AAEMFVejp5KROBMbhmWrgZdzluwNfNlw-2U" \
     --tg-chat "-5132748957" \
-    --tg-keys "Noisewonderful,Tammara,Sajani,Beneficial949,Vbnitz,Demonbeast,Platatino"
+    --tg-keys "Noisewonderful,Tammara,Sajani,Beneficial949,Vbnitz,Demonbeast,Platatino" \
+    --ntfy-topic "nqsig-dbcced6e93549dc8"
