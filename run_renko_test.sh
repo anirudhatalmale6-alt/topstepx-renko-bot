@@ -9,9 +9,8 @@ cd /home/ec2-user/renko-bot
 python3.12 -u renko_bot.py \
     --symbol NQ \
     --qty 1 \
-    --brick-sizes "0.25,2.0,10.0" \
+    --brick-size 0.25 \
     --shadow-loss 700 \
-    --live-profit 500 \
     --tg-token "8681033795:AAEMFVejp5KROBMbhmWrgZdzluwNfNlw-2U" \
     --tg-chat "-5132748957" \
     --tg-keys "Noisewonderful,Tammara,Sajani,Beneficial949,Vbnitz,Demonbeast,Platatino"
