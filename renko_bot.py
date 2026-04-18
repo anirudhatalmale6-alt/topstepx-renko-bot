@@ -132,13 +132,13 @@ class RenkoEngine:
 
 ET = pytz.timezone("America/New_York")
 
-SESSION_START = dtime(11, 0, 0)    # 11:00 AM ET
+SESSION_START = dtime(9, 0, 0)     # 9:00 AM ET
 SESSION_END = dtime(16, 0)         # 4:00 PM ET
 
 POINT_VALUE = 20.0  # NQ: $20 per point per contract
 
 # Trading days (0=Monday, 1=Tuesday, ..., 4=Friday)
-TRADING_DAYS = [0, 1, 2]  # Mon, Tue, Wed only
+TRADING_DAYS = [0, 1, 2, 3, 4]  # Mon - Fri
 
 # Renko timeframes (in minutes) - all use same brick size
 TF_MINUTES = [1, 3, 5, 15]
