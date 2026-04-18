@@ -18,6 +18,7 @@ import asyncio
 import argparse
 import signal
 import json
+import os
 import time
 import urllib.request
 import urllib.error
@@ -136,15 +137,28 @@ SESSION_END = dtime(16, 0)         # 4:00 PM ET
 
 POINT_VALUE = 20.0  # NQ: $20 per point per contract
 
+# Trading days (0=Monday, 1=Tuesday, ..., 4=Friday)
+TRADING_DAYS = [0, 1, 2]  # Mon, Tue, Wed only
+
 # Renko timeframes (in minutes) - all use same brick size
 TF_MINUTES = [1, 3, 5, 15]
 
+# Sub-minute Renko timeframes (in seconds) - fed by SDK's native sub-minute bars
+TF_SECONDS = [15]  # 15-second Renko as 5th TF
+
+# Combined label for all timeframes
+ALL_TF_LABELS = ["15sec", "1min", "3min", "5min", "15min"]
+
 
 def in_session() -> bool:
-    now = datetime.now(ET).time()
+    now = datetime.now(ET)
+    # Check day of week first
+    if now.weekday() not in TRADING_DAYS:
+        return False
+    t = now.time()
     if SESSION_START > SESSION_END:
-        return now >= SESSION_START or now < SESSION_END
-    return SESSION_START <= now < SESSION_END
+        return t >= SESSION_START or t < SESSION_END
+    return SESSION_START <= t < SESSION_END
 
 
 # ============================================================
@@ -167,16 +181,25 @@ class RenkoBot:
         self.ntfy_topic = ntfy_topic
 
         # Renko engines - one per timeframe, same brick size
-        self.engines = {}
+        self.engines = {}       # keyed by minute TF: {1: engine, 3: engine, ...}
         self.tf_labels = {}
+        self.sec_engines = {}   # keyed by second TF: {15: engine}
+        self.sec_tf_labels = {}
 
         # Bar counting for 3min/5min derivation
         self.bar_count = 0
         self.last_1min_time = None
+        self.last_15sec_time = None
 
         # Real position
         self.position = 0       # 1=long, -1=short, 0=flat
         self.entry_price = 0.0
+        self.entry_time = None   # datetime of entry
+
+        # Trade log file
+        self.trade_log_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "trade_log.jsonl"
+        )
 
         # P&L tracking
         self.live_pnl = 0.0
@@ -205,21 +228,29 @@ class RenkoBot:
             self.engines[tf] = RenkoEngine(self.brick_size, label)
             self.tf_labels[tf] = label
 
+        for tf_s in TF_SECONDS:
+            label = f"{tf_s}sec"
+            self.sec_engines[tf_s] = RenkoEngine(self.brick_size, label)
+            self.sec_tf_labels[tf_s] = label
+
+        total_tfs = len(TF_MINUTES) + len(TF_SECONDS)
         print(f"[BOT] Renko Multi-TF Strategy Bot - LIVE MODE")
         print(f"[BOT] Symbol: {self.symbol}, Qty: {self.qty}")
         print(f"[BOT] Brick size: {self.brick_size} (Traditional)")
-        print(f"[BOT] Timeframes: {', '.join(self.tf_labels[tf] for tf in TF_MINUTES)}")
-        print(f"[BOT] ENTRY: all 4 timeframes ALIGNED")
+        print(f"[BOT] Timeframes: {', '.join(ALL_TF_LABELS)}")
+        print(f"[BOT] ENTRY: all {total_tfs} timeframes ALIGNED")
         print(f"[BOT] EXIT: any timeframe MISALIGNS (brick close)")
         print(f"[BOT] No TP / No Shadow - pure alignment trading")
-        print(f"[BOT] Session: {SESSION_START.strftime('%H:%M')} - {SESSION_END.strftime('%H:%M')} ET")
+        day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri"}
+        trading_day_str = ", ".join(day_names[d] for d in TRADING_DAYS)
+        print(f"[BOT] Session: {SESSION_START.strftime('%H:%M')} - {SESSION_END.strftime('%H:%M')} ET ({trading_day_str} only)")
         if self.tg_token and self.tg_chat and self.tg_keys:
             print(f"[BOT] Telegram signals: ENABLED ({len(self.tg_keys)} keys)")
         print()
 
         self.suite = await TradingSuite.create(
             instruments=self.symbol,
-            timeframes=["1min", "15min"],
+            timeframes=["15sec", "1min", "15min"],
             initial_days=1,
         )
         self.ctx = self.suite[self.symbol]
@@ -233,6 +264,8 @@ class RenkoBot:
         if price:
             for tf in TF_MINUTES:
                 self.engines[tf].initialize(price)
+            for tf_s in TF_SECONDS:
+                self.sec_engines[tf_s].initialize(price)
             print(f"[BOT] Renko engines initialized at {price:.2f}")
 
         await self._seed_history()
@@ -259,7 +292,8 @@ class RenkoBot:
             await self._shutdown()
 
     async def _seed_history(self):
-        """Feed historical 1min candles to warm up Renko engines."""
+        """Feed historical candles to warm up Renko engines."""
+        # Seed minute-based engines from 1min history
         data = await self.ctx.data.get_data("1min", bars=200)
         if data is None or len(data) == 0:
             print("[BOT] No historical data for seeding")
@@ -285,18 +319,50 @@ class RenkoBot:
 
         self.bar_count = len(rows)
 
+        # Seed 15-second engine from 15sec history
+        try:
+            data_15s = await self.ctx.data.get_data("15sec", bars=800)
+            if data_15s is not None and len(data_15s) > 0:
+                rows_15s = list(data_15s.iter_rows(named=True))
+                print(f"[BOT] Seeding with {len(rows_15s)} historical 15sec bars...")
+                for row in rows_15s:
+                    close = float(row["close"])
+                    self.sec_engines[15].feed_close(close)
+                eng = self.sec_engines[15]
+                dir_str = "BULLISH" if eng.direction == 1 else "BEARISH" if eng.direction == -1 else "NONE"
+                print(f"  15sec: {eng.brick_count} bricks, {dir_str}, ref={eng.last_close:.2f}")
+            else:
+                print("[BOT] No 15sec historical data - engine will warm up from live data")
+        except Exception as e:
+            print(f"[BOT] Could not seed 15sec history: {e} - will warm up from live data")
+
+    def _get_all_directions(self):
+        """Get direction dict for all engines (sub-minute + minute)."""
+        directions = {}
+        for tf_s in TF_SECONDS:
+            directions[self.sec_tf_labels[tf_s]] = self.sec_engines[tf_s].direction
+        for tf in TF_MINUTES:
+            directions[self.tf_labels[tf]] = self.engines[tf].direction
+        return directions
+
     def _print_alignment(self):
         """Print TradingView-style alignment table."""
         print(f"\n  {'Timeframe':<12} {'Direction':<12}")
         print(f"  {'-'*24}")
+
+        for tf_s in TF_SECONDS:
+            eng = self.sec_engines[tf_s]
+            d = "BULLISH" if eng.direction == 1 else "BEARISH" if eng.direction == -1 else "NONE"
+            print(f"  {self.sec_tf_labels[tf_s]:<12} {d:<12}")
+
         for tf in TF_MINUTES:
             eng = self.engines[tf]
             d = "BULLISH" if eng.direction == 1 else "BEARISH" if eng.direction == -1 else "NONE"
             print(f"  {self.tf_labels[tf]:<12} {d:<12}")
 
-        directions = [self.engines[tf].direction for tf in TF_MINUTES]
-        all_up = all(d == 1 for d in directions)
-        all_down = all(d == -1 for d in directions)
+        directions = self._get_all_directions()
+        all_up = all(d == 1 for d in directions.values())
+        all_down = all(d == -1 for d in directions.values())
         aligned = all_up or all_down
 
         pos_str = "LONG" if self.position == 1 else "SHORT" if self.position == -1 else "FLAT"
@@ -305,6 +371,9 @@ class RenkoBot:
         print(f"  {'POSITION':<12} {pos_str:<12}")
 
     async def _tick(self):
+        # If disconnected (between sessions), skip until reconnect
+        if self.ctx is None:
+            return
         price = await self.ctx.data.get_current_price()
         now_ts = time.time()
 
@@ -339,6 +408,16 @@ class RenkoBot:
                 await self._flatten(price, reason="SESSION_END")
                 send_signals(self.tg_token, self.tg_chat, self.tg_keys,
                              "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
+            # Disconnect to avoid stale WebSocket overnight
+            now = datetime.now(ET).strftime("%H:%M:%S")
+            print(f"[{now}] [SESSION] Disconnecting until next session...")
+            if self.suite:
+                try:
+                    await self.suite.disconnect()
+                except Exception:
+                    pass
+                self.suite = None
+                self.ctx = None
             self.was_in_session = currently_in_session
             return
 
@@ -348,6 +427,20 @@ class RenkoBot:
             self.total_live_pnl = 0.0
             self.session_done = False
             self.bar_count = 0
+            # Reconnect if disconnected
+            if self.suite is None:
+                from project_x_py import TradingSuite
+                now_str = datetime.now(ET).strftime("%H:%M:%S")
+                print(f"[{now_str}] [SESSION] Reconnecting to TopstepX...")
+                self.suite = await TradingSuite.create(
+                    instruments=self.symbol,
+                    timeframes=["1min", "15min"],
+                    initial_days=1,
+                )
+                self.ctx = self.suite[self.symbol]
+                print(f"[{now_str}] [SESSION] Connected fresh")
+                # Re-seed Renko engines with latest data
+                await self._seed_history()
             now = datetime.now(ET).strftime("%H:%M:%S")
             print(f"[{now}] [SESSION] New session started - LIVE mode")
             self._print_alignment()
@@ -357,8 +450,31 @@ class RenkoBot:
         if not currently_in_session:
             return
 
-        # Check for new 1-minute bar close
+        # Check for new 15-second bar close
         new_renko_event = False
+        now = datetime.now(ET).strftime("%H:%M:%S")
+
+        try:
+            data_15s = await self.ctx.data.get_data("15sec", bars=1)
+            if data_15s is not None and len(data_15s) > 0:
+                rows_15s = list(data_15s.iter_rows(named=True))
+                last_15s = rows_15s[-1]
+                bar_time_15s = last_15s.get("timestamp") or last_15s.get("time")
+
+                if bar_time_15s != self.last_15sec_time:
+                    self.last_15sec_time = bar_time_15s
+                    close_15s = float(last_15s["close"])
+
+                    bricks = self.sec_engines[15].feed_close(close_15s)
+                    if bricks:
+                        new_renko_event = True
+                        for b in bricks:
+                            color = "BULLISH" if b[2] == 1 else "BEARISH"
+                            print(f"[{now}] [RENKO 15sec] {color} brick #{self.sec_engines[15].brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
+        except Exception as e:
+            pass  # 15sec data might not be available yet during warmup
+
+        # Check for new 1-minute bar close
         data_1m = await self.ctx.data.get_data("1min", bars=1)
         if data_1m is not None and len(data_1m) > 0:
             rows = list(data_1m.iter_rows(named=True))
@@ -369,7 +485,6 @@ class RenkoBot:
                 self.last_1min_time = bar_time
                 self.bar_count += 1
                 close_1m = float(last_row["close"])
-                now = datetime.now(ET).strftime("%H:%M:%S")
 
                 # Feed 1min Renko (every bar)
                 bricks = self.engines[1].feed_close(close_1m)
@@ -409,8 +524,8 @@ class RenkoBot:
         if not new_renko_event:
             return
 
-        # Get alignment status
-        directions = {tf: self.engines[tf].direction for tf in TF_MINUTES}
+        # Get alignment status across ALL timeframes (15sec + 1min + 3min + 5min + 15min)
+        directions = self._get_all_directions()
         all_up = all(d == 1 for d in directions.values())
         all_down = all(d == -1 for d in directions.values())
         aligned = all_up or all_down
@@ -422,8 +537,7 @@ class RenkoBot:
         elif self.position == -1:
             misaligned = any(d == 1 for d in directions.values())
 
-        now = datetime.now(ET).strftime("%H:%M:%S")
-        dir_str = " | ".join(f"{self.tf_labels[tf]}={'BULL' if d==1 else 'BEAR' if d==-1 else '??'}" for tf, d in directions.items())
+        dir_str = " | ".join(f"{label}={'BULL' if d==1 else 'BEAR' if d==-1 else '??'}" for label, d in directions.items())
         align_str = "ALIGNED" if aligned else "NOT ALIGNED"
         print(f"[{now}] [MTF] {dir_str} | {align_str}")
 
@@ -465,6 +579,7 @@ class RenkoBot:
             if response.success:
                 self.position = 1
                 self.entry_price = price
+                self.entry_time = datetime.now(ET)
                 print(f"[LIVE] Order filled. ID: {response.orderId}")
                 send_signals(self.tg_token, self.tg_chat, self.tg_keys,
                              "LONG", self.symbol, price, self.qty, ntfy_topic=self.ntfy_topic)
@@ -485,6 +600,7 @@ class RenkoBot:
             if response.success:
                 self.position = -1
                 self.entry_price = price
+                self.entry_time = datetime.now(ET)
                 print(f"[LIVE] Order filled. ID: {response.orderId}")
                 send_signals(self.tg_token, self.tg_chat, self.tg_keys,
                              "SHORT", self.symbol, price, self.qty, ntfy_topic=self.ntfy_topic)
@@ -515,8 +631,33 @@ class RenkoBot:
         except Exception as e:
             print(f"[LIVE] Close ERROR: {e}")
 
+        # Log trade to file
+        self._log_trade(direction, self.entry_price, price, trade_pnl, reason)
+
         self.position = 0
         self.entry_price = 0.0
+        self.entry_time = None
+
+    def _log_trade(self, direction, entry_price, exit_price, pnl, reason):
+        """Append trade to JSONL log file for long-term data collection."""
+        now = datetime.now(ET)
+        trade = {
+            "date": now.strftime("%Y-%m-%d"),
+            "entry_time": self.entry_time.strftime("%H:%M:%S") if self.entry_time else "N/A",
+            "exit_time": now.strftime("%H:%M:%S"),
+            "direction": direction,
+            "entry": entry_price,
+            "exit": exit_price,
+            "pnl": pnl,
+            "reason": reason,
+            "account": os.environ.get("PROJECT_X_ACCOUNT_NAME", "unknown"),
+            "session_pnl": self.live_pnl,
+        }
+        try:
+            with open(self.trade_log_file, "a") as f:
+                f.write(json.dumps(trade) + "\n")
+        except Exception as e:
+            print(f"[BOT] Trade log write error: {e}")
 
     # ==========================================================
     # Shutdown
