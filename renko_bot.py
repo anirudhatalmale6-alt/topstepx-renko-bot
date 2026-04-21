@@ -1,11 +1,12 @@
 """
-TopstepX Renko Multi-Timeframe Strategy Bot (LIVE)
+TopstepX Renko 9 EMA Ghost Candle Cross Strategy Bot (LIVE)
 
-Strategy: Traditional Renko 0.25 bricks built from candle CLOSE prices.
-Multi-timeframe: builds separate Renko from 1min, 3min, 5min, 15min closes.
-- ENTRY: all 4 timeframes must show same Renko direction (all BULLISH = LONG)
-- EXIT: any timeframe closes a brick in opposite direction = immediate exit
-- $500 profit target per session cycle
+Strategy: 1sec Renko (0.25 bricks from candle CLOSE) + 9 EMA + Ghost Candle Cross
+- ENTRY: Ghost candle (real-time price) crosses 9 EMA on 1sec Renko
+         Above EMA = LONG, Below EMA = SHORT
+- EXIT: Ghost candle crosses 9 EMA opposite direction OR trailing profit
+- TRAILING: Trigger at $50 profit, lock in minimum $30
+- No stop loss
 
 Usage:
     export PROJECT_X_USERNAME="your_email"
@@ -28,7 +29,7 @@ import pytz
 
 
 # ============================================================
-# Telegram helper
+# Telegram / ntfy helpers
 # ============================================================
 
 def send_telegram(token: str, chat_id: str, message: str):
@@ -53,7 +54,6 @@ def send_telegram(token: str, chat_id: str, message: str):
 
 
 def send_ntfy(topic: str, message: str):
-    """Send signal to ntfy.sh relay for copier bots to read."""
     if not topic:
         return
     try:
@@ -82,11 +82,7 @@ def send_signals(token: str, chat_id: str, keys: list, direction: str, symbol: s
 
 class RenkoEngine:
     """Traditional Renko engine matching TradingView's calculation.
-
     Builds bricks from CLOSE prices only.
-    - New UP brick: close >= last_brick_close + brick_size
-    - New DOWN brick: close <= last_brick_close - brick_size
-    - Multiple bricks can form if price gaps past multiple levels.
     """
 
     def __init__(self, brick_size: float, label: str = ""):
@@ -132,27 +128,27 @@ class RenkoEngine:
 
 ET = pytz.timezone("America/New_York")
 
-SESSION_START = dtime(9, 0, 0)     # 9:00 AM ET
-SESSION_END = dtime(16, 0)         # 4:00 PM ET
+SESSION_START = dtime(18, 0, 0)    # 6:00 PM ET
+SESSION_END = dtime(16, 0)         # 4:00 PM ET (next day - wraps midnight)
 
 POINT_VALUE = 20.0  # NQ: $20 per point per contract
 
-# Trading days (0=Monday, 1=Tuesday, ..., 4=Friday)
-TRADING_DAYS = [0, 1, 2, 3, 4]  # Mon - Fri
+TRADING_DAYS = [0, 1, 2, 3, 4, 6]  # Sun-Fri (Sun 6PM start, Fri 4PM end)
 
-# Renko timeframes (in minutes) - all use same brick size
-TF_MINUTES = [1, 3, 5, 15]
+EMA_PERIOD = 9
+EMA_BUFFER = 3.0  # Price must move a full brick size away from EMA to trigger cross (prevents whipsaw)
 
-# Sub-minute Renko timeframes (in seconds) - fed by SDK's native sub-minute bars
-TF_SECONDS = [15]  # 15-second Renko as 5th TF
-
-# Combined label for all timeframes
-ALL_TF_LABELS = ["15sec", "1min", "3min", "5min", "15min"]
+# Stepped trailing profit: (trigger_level, lock_floor)
+# When profit reaches trigger_level, lock_floor becomes the exit floor
+TRAIL_STEPS = [
+    (70.0, 50.0),    # Hit $70 → lock $50
+    (100.0, 80.0),   # Hit $100 → lock $80
+    (130.0, 110.0),  # Hit $130 → lock $110
+]
 
 
 def in_session() -> bool:
     now = datetime.now(ET)
-    # Check day of week first
     if now.weekday() not in TRADING_DAYS:
         return False
     t = now.time()
@@ -168,43 +164,48 @@ def in_session() -> bool:
 class RenkoBot:
     def __init__(self, symbol: str, qty: int = 1,
                  brick_size: float = 0.25,
-                 live_profit: float = 500.0,
                  tg_token: str = "", tg_chat: str = "", tg_keys: list = None,
                  ntfy_topic: str = ""):
         self.symbol = symbol
         self.qty = qty
         self.brick_size = brick_size
-        self.live_profit = live_profit
         self.tg_token = tg_token
         self.tg_chat = tg_chat
         self.tg_keys = tg_keys or []
         self.ntfy_topic = ntfy_topic
 
-        # Renko engines - one per timeframe, same brick size
-        self.engines = {}       # keyed by minute TF: {1: engine, 3: engine, ...}
-        self.tf_labels = {}
-        self.sec_engines = {}   # keyed by second TF: {15: engine}
-        self.sec_tf_labels = {}
+        # 1sec Renko engine (main strategy)
+        self.renko = RenkoEngine(brick_size, "1sec")
 
-        # Bar counting for 3min/5min derivation
-        self.bar_count = 0
-        self.last_1min_time = None
-        self.last_15sec_time = None
+        # Bar tracking
+        self.last_bar_time = None
 
-        # Real position
+        # 9 EMA on 1sec Renko brick closes
+        self.ema_closes = []     # list of 1sec Renko brick close prices
+        self.ema_9 = None        # current 9 EMA value
+
+        # Ghost candle state
+        self.ghost_above_ema = None  # True/False/None
+        self.last_price = 0.0
+
+        # Trailing profit (stepped)
+        self.max_profit = 0.0
+        self.trailing_active = False
+        self.trail_lock_floor = 0.0   # current lock floor (moves up with steps)
+        self.trail_step_idx = -1      # index of highest reached step in TRAIL_STEPS
+
+        # Position
         self.position = 0       # 1=long, -1=short, 0=flat
         self.entry_price = 0.0
-        self.entry_time = None   # datetime of entry
+        self.entry_time = None
 
-        # Trade log file
+        # Trade log
         self.trade_log_file = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "trade_log.jsonl"
         )
 
-        # P&L tracking
+        # P&L
         self.live_pnl = 0.0
-        self.total_live_pnl = 0.0
-        self.session_done = False  # True after hitting profit target
 
         # Session
         self.was_in_session = False
@@ -214,43 +215,56 @@ class RenkoBot:
         self.connection_alive = True
         self.disconnect_alert_sent = False
         self.STALE_THRESHOLD = 60
+        self.RECONNECT_THRESHOLD = 90
+        self.reconnecting = False
+        self.last_reconnect_time = 0
 
         # SDK
         self.suite = None
         self.ctx = None
         self.running = False
 
+    def _calc_ema(self):
+        """Recalculate 9 EMA from ema_closes list."""
+        if len(self.ema_closes) < EMA_PERIOD:
+            # Not enough data - use SMA of available
+            if self.ema_closes:
+                self.ema_9 = sum(self.ema_closes) / len(self.ema_closes)
+            return
+
+        if self.ema_9 is None:
+            # First EMA = SMA of first EMA_PERIOD values
+            self.ema_9 = sum(self.ema_closes[:EMA_PERIOD]) / EMA_PERIOD
+            # Then apply EMA formula for remaining
+            k = 2.0 / (EMA_PERIOD + 1)
+            for price in self.ema_closes[EMA_PERIOD:]:
+                self.ema_9 = price * k + self.ema_9 * (1 - k)
+        else:
+            # Incremental: apply latest close
+            k = 2.0 / (EMA_PERIOD + 1)
+            self.ema_9 = self.ema_closes[-1] * k + self.ema_9 * (1 - k)
+
     async def run(self):
         from project_x_py import TradingSuite
 
-        for tf in TF_MINUTES:
-            label = f"{tf}min"
-            self.engines[tf] = RenkoEngine(self.brick_size, label)
-            self.tf_labels[tf] = label
-
-        for tf_s in TF_SECONDS:
-            label = f"{tf_s}sec"
-            self.sec_engines[tf_s] = RenkoEngine(self.brick_size, label)
-            self.sec_tf_labels[tf_s] = label
-
-        total_tfs = len(TF_MINUTES) + len(TF_SECONDS)
-        print(f"[BOT] Renko Multi-TF Strategy Bot - LIVE MODE")
+        print(f"[BOT] Renko 9 EMA Ghost Candle Cross Strategy - LIVE MODE")
         print(f"[BOT] Symbol: {self.symbol}, Qty: {self.qty}")
         print(f"[BOT] Brick size: {self.brick_size} (Traditional)")
-        print(f"[BOT] Timeframes: {', '.join(ALL_TF_LABELS)}")
-        print(f"[BOT] ENTRY: all {total_tfs} timeframes ALIGNED")
-        print(f"[BOT] EXIT: any timeframe MISALIGNS (brick close)")
-        print(f"[BOT] No TP / No Shadow - pure alignment trading")
-        day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri"}
+        print(f"[BOT] Strategy: 1sec Renko + 9 EMA + Ghost Candle Cross")
+        print(f"[BOT] ENTRY: Ghost candle crosses 9 EMA")
+        print(f"[BOT] EXIT: Ghost candle crosses EMA opposite OR trailing profit")
+        steps_str = " → ".join(f"${t}→lock${l}" for t, l in TRAIL_STEPS)
+        print(f"[BOT] Trail steps: {steps_str}")
+        day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
         trading_day_str = ", ".join(day_names[d] for d in TRADING_DAYS)
-        print(f"[BOT] Session: {SESSION_START.strftime('%H:%M')} - {SESSION_END.strftime('%H:%M')} ET ({trading_day_str} only)")
+        print(f"[BOT] Session: {SESSION_START.strftime('%H:%M')} - {SESSION_END.strftime('%H:%M')} ET ({trading_day_str})")
         if self.tg_token and self.tg_chat and self.tg_keys:
             print(f"[BOT] Telegram signals: ENABLED ({len(self.tg_keys)} keys)")
         print()
 
         self.suite = await TradingSuite.create(
             instruments=self.symbol,
-            timeframes=["15sec", "1min", "15min"],
+            timeframes=["1sec", "15min"],
             initial_days=1,
         )
         self.ctx = self.suite[self.symbol]
@@ -262,11 +276,9 @@ class RenkoBot:
 
         price = await self.ctx.data.get_current_price()
         if price:
-            for tf in TF_MINUTES:
-                self.engines[tf].initialize(price)
-            for tf_s in TF_SECONDS:
-                self.sec_engines[tf_s].initialize(price)
-            print(f"[BOT] Renko engines initialized at {price:.2f}")
+            self.renko.initialize(price)
+            self.last_price = price
+            print(f"[BOT] 1sec Renko initialized at {price:.2f}")
 
         await self._seed_history()
 
@@ -274,13 +286,11 @@ class RenkoBot:
         self.running = True
         self.was_in_session = in_session()
 
-        # Show current alignment
-        self._print_alignment()
+        self._print_status()
 
         print(f"\n[BOT] Session active: {self.was_in_session}")
-        print(f"[BOT] Trading LIVE - no shadow mode")
-        print(f"[BOT] Press Ctrl+C to stop")
-        print()
+        print(f"[BOT] Trading LIVE - 9 EMA Ghost Candle Cross")
+        print(f"[BOT] Press Ctrl+C to stop\n")
 
         try:
             while self.running:
@@ -292,88 +302,117 @@ class RenkoBot:
             await self._shutdown()
 
     async def _seed_history(self):
-        """Feed historical candles to warm up Renko engines."""
-        # Seed minute-based engines from 1min history
-        data = await self.ctx.data.get_data("1min", bars=200)
+        """Feed historical 10sec bars to warm up Renko + calculate initial 9 EMA."""
+        data = await self.ctx.data.get_data("1sec", bars=800)
         if data is None or len(data) == 0:
-            print("[BOT] No historical data for seeding")
+            print("[BOT] No historical 1sec data for seeding")
             return
 
         rows = list(data.iter_rows(named=True))
-        print(f"[BOT] Seeding with {len(rows)} historical 1min bars...")
+        print(f"[BOT] Seeding 1sec Renko from {len(rows)} historical bars...")
 
-        for i, row in enumerate(rows):
+        for row in rows:
             close = float(row["close"])
-            self.engines[1].feed_close(close)
-            if (i + 1) % 3 == 0:
-                self.engines[3].feed_close(close)
-            if (i + 1) % 5 == 0:
-                self.engines[5].feed_close(close)
-            if (i + 1) % 15 == 0:
-                self.engines[15].feed_close(close)
+            bricks = self.renko.feed_close(close)
+            for brick in bricks:
+                self.ema_closes.append(brick[1])
 
-        for tf in TF_MINUTES:
-            eng = self.engines[tf]
-            dir_str = "BULLISH" if eng.direction == 1 else "BEARISH" if eng.direction == -1 else "NONE"
-            print(f"  {self.tf_labels[tf]}: {eng.brick_count} bricks, {dir_str}, ref={eng.last_close:.2f}")
+        # Calculate initial EMA from all historical brick closes
+        if self.ema_closes:
+            self.ema_9 = None
+            if len(self.ema_closes) >= EMA_PERIOD:
+                self.ema_9 = sum(self.ema_closes[:EMA_PERIOD]) / EMA_PERIOD
+                k = 2.0 / (EMA_PERIOD + 1)
+                for price in self.ema_closes[EMA_PERIOD:]:
+                    self.ema_9 = price * k + self.ema_9 * (1 - k)
+            elif self.ema_closes:
+                self.ema_9 = sum(self.ema_closes) / len(self.ema_closes)
 
-        self.bar_count = len(rows)
+        dir_str = "BULLISH" if self.renko.direction == 1 else "BEARISH" if self.renko.direction == -1 else "NONE"
+        print(f"  1sec Renko: {self.renko.brick_count} bricks, {dir_str}, ref={self.renko.last_close:.2f}")
+        print(f"  EMA-9 data points: {len(self.ema_closes)} brick closes")
+        if self.ema_9:
+            print(f"  EMA-9 value: {self.ema_9:.2f}")
+        else:
+            print(f"  EMA-9: not enough data yet (need {EMA_PERIOD} bricks)")
 
-        # Seed 15-second engine from 15sec history
-        try:
-            data_15s = await self.ctx.data.get_data("15sec", bars=800)
-            if data_15s is not None and len(data_15s) > 0:
-                rows_15s = list(data_15s.iter_rows(named=True))
-                print(f"[BOT] Seeding with {len(rows_15s)} historical 15sec bars...")
-                for row in rows_15s:
-                    close = float(row["close"])
-                    self.sec_engines[15].feed_close(close)
-                eng = self.sec_engines[15]
-                dir_str = "BULLISH" if eng.direction == 1 else "BEARISH" if eng.direction == -1 else "NONE"
-                print(f"  15sec: {eng.brick_count} bricks, {dir_str}, ref={eng.last_close:.2f}")
-            else:
-                print("[BOT] No 15sec historical data - engine will warm up from live data")
-        except Exception as e:
-            print(f"[BOT] Could not seed 15sec history: {e} - will warm up from live data")
-
-    def _get_all_directions(self):
-        """Get direction dict for all engines (sub-minute + minute)."""
-        directions = {}
-        for tf_s in TF_SECONDS:
-            directions[self.sec_tf_labels[tf_s]] = self.sec_engines[tf_s].direction
-        for tf in TF_MINUTES:
-            directions[self.tf_labels[tf]] = self.engines[tf].direction
-        return directions
-
-    def _print_alignment(self):
-        """Print TradingView-style alignment table."""
-        print(f"\n  {'Timeframe':<12} {'Direction':<12}")
-        print(f"  {'-'*24}")
-
-        for tf_s in TF_SECONDS:
-            eng = self.sec_engines[tf_s]
-            d = "BULLISH" if eng.direction == 1 else "BEARISH" if eng.direction == -1 else "NONE"
-            print(f"  {self.sec_tf_labels[tf_s]:<12} {d:<12}")
-
-        for tf in TF_MINUTES:
-            eng = self.engines[tf]
-            d = "BULLISH" if eng.direction == 1 else "BEARISH" if eng.direction == -1 else "NONE"
-            print(f"  {self.tf_labels[tf]:<12} {d:<12}")
-
-        directions = self._get_all_directions()
-        all_up = all(d == 1 for d in directions.values())
-        all_down = all(d == -1 for d in directions.values())
-        aligned = all_up or all_down
-
+    def _print_status(self):
+        """Print current strategy status."""
+        now = datetime.now(ET).strftime("%H:%M:%S")
         pos_str = "LONG" if self.position == 1 else "SHORT" if self.position == -1 else "FLAT"
+        dir_str = "BULLISH" if self.renko.direction == 1 else "BEARISH" if self.renko.direction == -1 else "NONE"
 
-        print(f"  {'ALIGNMENT':<12} {'ALIGNED' if aligned else 'NOT ALIGNED':<12}")
-        print(f"  {'POSITION':<12} {pos_str:<12}")
+        print(f"\n  [STATUS @ {now}]")
+        print(f"  1sec Renko: {dir_str} | last_close={self.renko.last_close:.2f} | bricks={self.renko.brick_count}")
+        if self.ema_9:
+            print(f"  9 EMA: {self.ema_9:.2f}")
+            ghost_str = "ABOVE" if self.ghost_above_ema else "BELOW" if self.ghost_above_ema is False else "UNKNOWN"
+            print(f"  Ghost vs EMA: {ghost_str}")
+        else:
+            print(f"  9 EMA: waiting for data ({len(self.ema_closes)}/{EMA_PERIOD} bricks)")
+        print(f"  Position: {pos_str} | P&L: ${self.live_pnl:.2f}")
+
+    async def _auto_reconnect(self):
+        """Reconnect WebSocket without restarting Renko engine (preserves brick state)."""
+        from project_x_py import TradingSuite
+        self.reconnecting = True
+        self.last_reconnect_time = time.time()
+        now = datetime.now(ET).strftime("%H:%M:%S")
+        print(f"[{now}] [RECONNECT] Auto-reconnecting (Renko + EMA preserved)...")
+        send_telegram(self.tg_token, self.tg_chat, f"STATUS|Auto-reconnecting ({now} ET)")
+
+        if self.suite:
+            try:
+                await self.suite.disconnect()
+            except Exception:
+                pass
+
+        try:
+            self.suite = await TradingSuite.create(
+                instruments=self.symbol,
+                timeframes=["1sec", "15min"],
+                initial_days=1,
+            )
+            self.ctx = self.suite[self.symbol]
+            self.last_1min_time = None
+            self.last_price_time = time.time()
+            self.connection_alive = True
+            self.disconnect_alert_sent = False
+            now = datetime.now(ET).strftime("%H:%M:%S")
+            print(f"[{now}] [RECONNECT] WebSocket restored, Renko+EMA intact")
+            send_telegram(self.tg_token, self.tg_chat, f"STATUS|RECONNECTED ({now} ET)")
+
+            # SAFETY: Flatten if holding position during disconnect
+            if self.position != 0:
+                direction = "LONG" if self.position == 1 else "SHORT"
+                print(f"[{now}] [SAFETY] Was {direction} during disconnect - FLATTENING")
+                send_telegram(self.tg_token, self.tg_chat,
+                             f"STATUS|SAFETY FLATTEN - was {direction} ({now} ET)")
+                try:
+                    price = await self.ctx.data.get_current_price()
+                    if price:
+                        await self._flatten(price, reason="SAFETY_RECONNECT")
+                        send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                                     "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
+                except Exception as e:
+                    print(f"[{now}] [SAFETY] Flatten failed: {e} - will retry next tick")
+
+        except Exception as e:
+            now = datetime.now(ET).strftime("%H:%M:%S")
+            print(f"[{now}] [RECONNECT] Failed: {e} - will retry in 2 min")
+            self.suite = None
+            self.ctx = None
+        finally:
+            self.reconnecting = False
 
     async def _tick(self):
-        # If disconnected (between sessions), skip until reconnect
+        # If disconnected, try reconnect
         if self.ctx is None:
+            if in_session() and not self.reconnecting:
+                if time.time() - self.last_reconnect_time > 120:
+                    await self._auto_reconnect()
             return
+
         price = await self.ctx.data.get_current_price()
         now_ts = time.time()
 
@@ -384,19 +423,21 @@ class RenkoBot:
                     self.connection_alive = False
                     self.disconnect_alert_sent = True
                     now = datetime.now(ET).strftime("%H:%M:%S")
-                    msg = f"DISCONNECTED - No price data for {int(elapsed)}s ({now} ET)"
-                    print(f"[{now}] [ALERT] {msg}")
-                    send_telegram(self.tg_token, self.tg_chat, f"STATUS|{msg}")
+                    print(f"[{now}] [ALERT] No price data for {int(elapsed)}s")
+                    send_telegram(self.tg_token, self.tg_chat, f"STATUS|DISCONNECTED ({now} ET)")
+                if elapsed > self.RECONNECT_THRESHOLD and not self.reconnecting:
+                    if now_ts - self.last_reconnect_time > 120:
+                        await self._auto_reconnect()
             return
 
         self.last_price_time = now_ts
+        self.last_price = price
         if not self.connection_alive:
             self.connection_alive = True
             self.disconnect_alert_sent = False
             now = datetime.now(ET).strftime("%H:%M:%S")
-            msg = f"RECONNECTED - Price data restored ({now} ET)"
-            print(f"[{now}] [ALERT] {msg}")
-            send_telegram(self.tg_token, self.tg_chat, f"STATUS|{msg}")
+            print(f"[{now}] [ALERT] Price data restored")
+            send_telegram(self.tg_token, self.tg_chat, f"STATUS|RECONNECTED ({now} ET)")
 
         # Session boundaries
         currently_in_session = in_session()
@@ -404,11 +445,10 @@ class RenkoBot:
 
         if sess_ended:
             if self.position != 0:
-                print(f"[SESSION] Session ended - flattening position")
+                print(f"[SESSION] Session ended - flattening")
                 await self._flatten(price, reason="SESSION_END")
                 send_signals(self.tg_token, self.tg_chat, self.tg_keys,
                              "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
-            # Disconnect to avoid stale WebSocket overnight
             now = datetime.now(ET).strftime("%H:%M:%S")
             print(f"[{now}] [SESSION] Disconnecting until next session...")
             if self.suite:
@@ -424,152 +464,128 @@ class RenkoBot:
         sess_started = not self.was_in_session and currently_in_session
         if sess_started:
             self.live_pnl = 0.0
-            self.total_live_pnl = 0.0
-            self.session_done = False
             self.bar_count = 0
-            # Reconnect if disconnected
             if self.suite is None:
                 from project_x_py import TradingSuite
                 now_str = datetime.now(ET).strftime("%H:%M:%S")
-                print(f"[{now_str}] [SESSION] Reconnecting to TopstepX...")
+                print(f"[{now_str}] [SESSION] Reconnecting...")
                 self.suite = await TradingSuite.create(
                     instruments=self.symbol,
-                    timeframes=["1min", "15min"],
+                    timeframes=["1sec", "15min"],
                     initial_days=1,
                 )
                 self.ctx = self.suite[self.symbol]
-                print(f"[{now_str}] [SESSION] Connected fresh")
-                # Re-seed Renko engines with latest data
                 await self._seed_history()
             now = datetime.now(ET).strftime("%H:%M:%S")
-            print(f"[{now}] [SESSION] New session started - LIVE mode")
-            self._print_alignment()
+            print(f"[{now}] [SESSION] New session started - LIVE")
+            self._print_status()
 
         self.was_in_session = currently_in_session
 
         if not currently_in_session:
             return
 
-        # Check for new 15-second bar close
-        new_renko_event = False
+        # ---- Check for new 1min bar → feed 1sec Renko ----
         now = datetime.now(ET).strftime("%H:%M:%S")
+        new_brick = False
 
-        try:
-            data_15s = await self.ctx.data.get_data("15sec", bars=1)
-            if data_15s is not None and len(data_15s) > 0:
-                rows_15s = list(data_15s.iter_rows(named=True))
-                last_15s = rows_15s[-1]
-                bar_time_15s = last_15s.get("timestamp") or last_15s.get("time")
-
-                if bar_time_15s != self.last_15sec_time:
-                    self.last_15sec_time = bar_time_15s
-                    close_15s = float(last_15s["close"])
-
-                    bricks = self.sec_engines[15].feed_close(close_15s)
-                    if bricks:
-                        new_renko_event = True
-                        for b in bricks:
-                            color = "BULLISH" if b[2] == 1 else "BEARISH"
-                            print(f"[{now}] [RENKO 15sec] {color} brick #{self.sec_engines[15].brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
-        except Exception as e:
-            pass  # 15sec data might not be available yet during warmup
-
-        # Check for new 1-minute bar close
-        data_1m = await self.ctx.data.get_data("1min", bars=1)
-        if data_1m is not None and len(data_1m) > 0:
-            rows = list(data_1m.iter_rows(named=True))
+        data_10s = await self.ctx.data.get_data("1sec", bars=1)
+        if data_10s is not None and len(data_10s) > 0:
+            rows = list(data_10s.iter_rows(named=True))
             last_row = rows[-1]
             bar_time = last_row.get("timestamp") or last_row.get("time")
 
-            if bar_time != self.last_1min_time:
-                self.last_1min_time = bar_time
-                self.bar_count += 1
-                close_1m = float(last_row["close"])
+            if bar_time != self.last_bar_time:
+                self.last_bar_time = bar_time
+                close_10s = float(last_row["close"])
 
-                # Feed 1min Renko (every bar)
-                bricks = self.engines[1].feed_close(close_1m)
+                bricks = self.renko.feed_close(close_10s)
                 if bricks:
-                    new_renko_event = True
+                    new_brick = True
                     for b in bricks:
                         color = "BULLISH" if b[2] == 1 else "BEARISH"
-                        print(f"[{now}] [RENKO 1min] {color} brick #{self.engines[1].brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
+                        self.ema_closes.append(b[1])
+                        self._calc_ema()
+                        print(f"[{now}] [RENKO 1s] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | EMA-9: {self.ema_9:.2f}" if self.ema_9 else f"[{now}] [RENKO 1s] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
 
-                # Feed 3min Renko (every 3rd bar)
-                if self.bar_count % 3 == 0:
-                    bricks = self.engines[3].feed_close(close_1m)
-                    if bricks:
-                        new_renko_event = True
-                        for b in bricks:
-                            color = "BULLISH" if b[2] == 1 else "BEARISH"
-                            print(f"[{now}] [RENKO 3min] {color} brick #{self.engines[3].brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
-
-                # Feed 5min Renko (every 5th bar)
-                if self.bar_count % 5 == 0:
-                    bricks = self.engines[5].feed_close(close_1m)
-                    if bricks:
-                        new_renko_event = True
-                        for b in bricks:
-                            color = "BULLISH" if b[2] == 1 else "BEARISH"
-                            print(f"[{now}] [RENKO 5min] {color} brick #{self.engines[5].brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
-
-                # Feed 15min Renko (every 15th bar)
-                if self.bar_count % 15 == 0:
-                    bricks = self.engines[15].feed_close(close_1m)
-                    if bricks:
-                        new_renko_event = True
-                        for b in bricks:
-                            color = "BULLISH" if b[2] == 1 else "BEARISH"
-                            print(f"[{now}] [RENKO 15min] {color} brick #{self.engines[15].brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
-
-        if not new_renko_event:
+        # ---- Ghost candle vs 9 EMA check (every tick) ----
+        if self.ema_9 is None:
             return
 
-        # Get alignment status across ALL timeframes (15sec + 1min + 3min + 5min + 15min)
-        directions = self._get_all_directions()
-        all_up = all(d == 1 for d in directions.values())
-        all_down = all(d == -1 for d in directions.values())
-        aligned = all_up or all_down
+        prev_ghost = self.ghost_above_ema
+        # Use buffer zone: price must be > EMA + buffer to be "above", < EMA - buffer to be "below"
+        # When in the buffer zone, keep previous state (no flip)
+        if price > self.ema_9 + EMA_BUFFER:
+            self.ghost_above_ema = True
+        elif price < self.ema_9 - EMA_BUFFER:
+            self.ghost_above_ema = False
+        # else: in buffer zone, keep prev_ghost state (no change)
 
-        # Check misalignment against current position
-        misaligned = False
-        if self.position == 1:
-            misaligned = any(d == -1 for d in directions.values())
-        elif self.position == -1:
-            misaligned = any(d == 1 for d in directions.values())
+        # Detect crossover
+        crossed = False
+        cross_direction = 0
+        if prev_ghost is not None and self.ghost_above_ema is not None and prev_ghost != self.ghost_above_ema:
+            crossed = True
+            cross_direction = 1 if self.ghost_above_ema else -1
+            cross_str = "ABOVE (BULLISH)" if cross_direction == 1 else "BELOW (BEARISH)"
+            diff = abs(price - self.ema_9)
+            print(f"[{now}] [GHOST CROSS] Price {price:.2f} crossed EMA {self.ema_9:.2f} (diff {diff:.2f}) -> {cross_str}")
 
-        dir_str = " | ".join(f"{label}={'BULL' if d==1 else 'BEAR' if d==-1 else '??'}" for label, d in directions.items())
-        align_str = "ALIGNED" if aligned else "NOT ALIGNED"
-        print(f"[{now}] [MTF] {dir_str} | {align_str}")
+        # ---- Stepped trailing profit check ----
+        if self.position != 0:
+            unrealized = (price - self.entry_price) * self.position * POINT_VALUE * self.qty
+            if unrealized > self.max_profit:
+                self.max_profit = unrealized
 
-        await self._live_logic(price, all_up, all_down, misaligned)
+            # Check if we've reached a new trail step
+            for i, (trigger, lock) in enumerate(TRAIL_STEPS):
+                if unrealized >= trigger and i > self.trail_step_idx:
+                    self.trail_step_idx = i
+                    self.trail_lock_floor = lock
+                    self.trailing_active = True
+                    print(f"[{now}] [TRAIL] Step {i+1}: profit ${unrealized:.2f} >= ${trigger} → lock floor ${lock}")
 
-    # ==========================================================
-    # LIVE TRADING LOGIC
-    # ==========================================================
+            # Exit if profit drops below current lock floor
+            if self.trailing_active and unrealized <= self.trail_lock_floor:
+                print(f"[{now}] [TRAIL] Locking profit! ${unrealized:.2f} <= floor ${self.trail_lock_floor}")
+                await self._flatten(price, reason=f"TRAIL_LOCK_${self.trail_lock_floor:.0f}")
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
+                return
 
-    async def _live_logic(self, price: float, all_up: bool, all_down: bool, misaligned: bool):
-        # Exit on misalignment
-        if self.position != 0 and misaligned:
-            await self._flatten(price, reason="MISALIGNED")
-            send_signals(self.tg_token, self.tg_chat, self.tg_keys,
-                         "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
+        # ---- Entry/Exit logic on ghost candle EMA cross ----
+        if crossed:
+            await self._live_logic(price, cross_direction)
 
-        # Entry when all aligned
-        if all_up and self.position <= 0:
+    async def _live_logic(self, price: float, cross_direction: int):
+        """Handle entries and exits on ghost candle EMA cross."""
+
+        # EXIT: Ghost crosses opposite to position
+        if self.position != 0:
+            if (self.position == 1 and cross_direction == -1) or \
+               (self.position == -1 and cross_direction == 1):
+                await self._flatten(price, reason="GHOST_CROSS_EXIT")
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
+
+        # ENTRY: Ghost crosses EMA
+        if cross_direction == 1 and self.position <= 0:
             if self.position == -1:
                 await self._flatten(price, reason="FLIP_LONG")
-            if self.position == 0:
-                await self._enter_long(price)
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
+            await self._enter_long(price)
 
-        elif all_down and self.position >= 0:
+        elif cross_direction == -1 and self.position >= 0:
             if self.position == 1:
                 await self._flatten(price, reason="FLIP_SHORT")
-            if self.position == 0:
-                await self._enter_short(price)
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
+            await self._enter_short(price)
 
     async def _enter_long(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [LIVE] >>> ENTERING LONG @ {price:.2f} | Live P&L: ${self.live_pnl:.2f}")
+        print(f"\n[{now}] [LIVE] >>> ENTERING LONG @ {price:.2f} | EMA: {self.ema_9:.2f} | P&L: ${self.live_pnl:.2f}")
         try:
             response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
@@ -580,17 +596,25 @@ class RenkoBot:
                 self.position = 1
                 self.entry_price = price
                 self.entry_time = datetime.now(ET)
+                self.max_profit = 0.0
+                self.trailing_active = False
+                self.trail_lock_floor = 0.0
+                self.trail_step_idx = -1
                 print(f"[LIVE] Order filled. ID: {response.orderId}")
                 send_signals(self.tg_token, self.tg_chat, self.tg_keys,
                              "LONG", self.symbol, price, self.qty, ntfy_topic=self.ntfy_topic)
             else:
                 print(f"[LIVE] Order FAILED: {response.errorMessage}")
+                print(f"[LIVE] Triggering reconnect due to order failure...")
+                await self._auto_reconnect()
         except Exception as e:
             print(f"[LIVE] Order ERROR: {e}")
+            print(f"[LIVE] Triggering reconnect due to order exception...")
+            await self._auto_reconnect()
 
     async def _enter_short(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [LIVE] >>> ENTERING SHORT @ {price:.2f} | Live P&L: ${self.live_pnl:.2f}")
+        print(f"\n[{now}] [LIVE] >>> ENTERING SHORT @ {price:.2f} | EMA: {self.ema_9:.2f} | P&L: ${self.live_pnl:.2f}")
         try:
             response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
@@ -601,13 +625,21 @@ class RenkoBot:
                 self.position = -1
                 self.entry_price = price
                 self.entry_time = datetime.now(ET)
+                self.max_profit = 0.0
+                self.trailing_active = False
+                self.trail_lock_floor = 0.0
+                self.trail_step_idx = -1
                 print(f"[LIVE] Order filled. ID: {response.orderId}")
                 send_signals(self.tg_token, self.tg_chat, self.tg_keys,
                              "SHORT", self.symbol, price, self.qty, ntfy_topic=self.ntfy_topic)
             else:
                 print(f"[LIVE] Order FAILED: {response.errorMessage}")
+                print(f"[LIVE] Triggering reconnect due to order failure...")
+                await self._auto_reconnect()
         except Exception as e:
             print(f"[LIVE] Order ERROR: {e}")
+            print(f"[LIVE] Triggering reconnect due to order exception...")
+            await self._auto_reconnect()
 
     async def _flatten(self, price: float, reason: str = ""):
         direction = "LONG" if self.position == 1 else "SHORT"
@@ -615,7 +647,8 @@ class RenkoBot:
         self.live_pnl += trade_pnl
 
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [LIVE] <<< EXITING {direction} @ {price:.2f} | Trade: ${trade_pnl:+.2f} | Live P&L: ${self.live_pnl:.2f} | {reason}")
+        trail_str = f" | Trail: {'ACTIVE' if self.trailing_active else 'off'}" if self.trailing_active else ""
+        print(f"\n[{now}] [LIVE] <<< EXITING {direction} @ {price:.2f} | Trade: ${trade_pnl:+.2f} | P&L: ${self.live_pnl:.2f} | {reason}{trail_str}")
 
         try:
             close_side = 1 if self.position == 1 else 0
@@ -628,18 +661,24 @@ class RenkoBot:
                 print(f"[LIVE] Position closed. ID: {response.orderId}")
             else:
                 print(f"[LIVE] CLOSE FAILED: {response.errorMessage}")
+                print(f"[LIVE] Triggering reconnect due to close failure...")
+                await self._auto_reconnect()
         except Exception as e:
             print(f"[LIVE] Close ERROR: {e}")
+            print(f"[LIVE] Triggering reconnect due to close exception...")
+            await self._auto_reconnect()
 
-        # Log trade to file
         self._log_trade(direction, self.entry_price, price, trade_pnl, reason)
 
         self.position = 0
         self.entry_price = 0.0
         self.entry_time = None
+        self.max_profit = 0.0
+        self.trailing_active = False
+        self.trail_lock_floor = 0.0
+        self.trail_step_idx = -1
 
     def _log_trade(self, direction, entry_price, exit_price, pnl, reason):
-        """Append trade to JSONL log file for long-term data collection."""
         now = datetime.now(ET)
         trade = {
             "date": now.strftime("%Y-%m-%d"),
@@ -650,6 +689,7 @@ class RenkoBot:
             "exit": exit_price,
             "pnl": pnl,
             "reason": reason,
+            "ema_9": self.ema_9,
             "account": os.environ.get("PROJECT_X_ACCOUNT_NAME", "unknown"),
             "session_pnl": self.live_pnl,
         }
@@ -658,10 +698,6 @@ class RenkoBot:
                 f.write(json.dumps(trade) + "\n")
         except Exception as e:
             print(f"[BOT] Trade log write error: {e}")
-
-    # ==========================================================
-    # Shutdown
-    # ==========================================================
 
     async def _shutdown(self):
         print("\n[BOT] Shutting down...")
@@ -672,10 +708,8 @@ class RenkoBot:
                 send_signals(self.tg_token, self.tg_chat, self.tg_keys,
                              "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
 
-        self.total_live_pnl += self.live_pnl
-
         print(f"\n[BOT] === SESSION SUMMARY ===")
-        print(f"[BOT] Total P&L: ${self.total_live_pnl:.2f}")
+        print(f"[BOT] Total P&L: ${self.live_pnl:.2f}")
         print(f"[BOT] ========================")
 
         if self.suite:
@@ -688,15 +722,11 @@ class RenkoBot:
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="TopstepX Renko Multi-TF Bot (LIVE)")
+    parser = argparse.ArgumentParser(description="TopstepX Renko 9 EMA Ghost Candle Cross Bot")
     parser.add_argument("--symbol", default="NQ", help="Contract symbol")
     parser.add_argument("--qty", type=int, default=1, help="Order quantity")
-    parser.add_argument("--brick-size", type=float, default=0.25,
-                        help="Renko brick size in points (default: 0.25)")
-    parser.add_argument("--shadow-loss", type=float, default=700.0,
-                        help="(ignored, kept for backwards compat)")
-    parser.add_argument("--live-profit", type=float, default=500.0,
-                        help="Profit target to stop trading for the session")
+    parser.add_argument("--brick-size", type=float, default=3.0,
+                        help="Renko brick size in points (default: 3.0)")
     parser.add_argument("--tg-token", default="", help="Telegram bot token")
     parser.add_argument("--tg-chat", default="", help="Telegram chat ID")
     parser.add_argument("--tg-keys", default="", help="Comma-separated passkeys")
@@ -709,7 +739,6 @@ def main():
         symbol=args.symbol,
         qty=args.qty,
         brick_size=args.brick_size,
-        live_profit=args.live_profit,
         tg_token=args.tg_token,
         tg_chat=args.tg_chat,
         tg_keys=keys,
