@@ -17,9 +17,11 @@ Usage:
 
 import asyncio
 import argparse
+import fcntl
 import signal
 import json
 import os
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -832,7 +834,22 @@ class RenkoBot:
 # Entry point
 # ============================================================
 
+def acquire_lock():
+    """Prevent multiple bot instances via file lock."""
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot.lock")
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+        return lock_file  # keep reference alive
+    except OSError:
+        print("[BOT] ERROR: Another bot instance is already running! Exiting.")
+        sys.exit(1)
+
+
 def main():
+    lock = acquire_lock()  # noqa: F841 - must keep reference
     parser = argparse.ArgumentParser(description="TopstepX Renko 20 SMA + Ichimoku Cloud Bot")
     parser.add_argument("--symbol", default="NQ", help="Contract symbol")
     parser.add_argument("--qty", type=int, default=1, help="Order quantity")
