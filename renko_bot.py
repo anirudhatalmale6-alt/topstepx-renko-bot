@@ -1,10 +1,10 @@
 """
-TopstepX Renko 9 EMA Ghost Candle Cross Strategy Bot (LIVE)
+TopstepX Renko 20 SMA Ghost Candle Cross Strategy Bot (LIVE)
 
-Strategy: 1sec Renko (0.25 bricks from candle CLOSE) + 9 EMA + Ghost Candle Cross
-- ENTRY: Ghost candle (real-time price) crosses 9 EMA on 1sec Renko
+Strategy: 1sec Renko (0.25 bricks from candle CLOSE) + 20 SMA + Ghost Candle Cross
+- ENTRY: Ghost candle (real-time price) crosses 20 SMA on 1sec Renko
          Above EMA = LONG, Below EMA = SHORT
-- EXIT: Ghost candle crosses 9 EMA opposite direction OR trailing profit
+- EXIT: Ghost candle crosses 20 SMA opposite direction OR trailing profit
 - TRAILING: Trigger at $50 profit, lock in minimum $30
 - No stop loss
 
@@ -44,7 +44,7 @@ def send_telegram(token: str, chat_id: str, message: str):
             return
         except urllib.error.HTTPError as e:
             if e.code == 429 and attempt < 2:
-                time.sleep(2 * (attempt + 1))
+                time.sleep(3 * (attempt + 1))
                 continue
             print(f"[TG] Send failed: {e}")
             return
@@ -56,15 +56,24 @@ def send_telegram(token: str, chat_id: str, message: str):
 def send_ntfy(topic: str, message: str):
     if not topic:
         return
-    try:
-        req = urllib.request.Request(
-            f"https://ntfy.sh/{topic}",
-            data=message.encode("utf-8"),
-            headers={"Content-Type": "text/plain"},
-        )
-        urllib.request.urlopen(req, timeout=10)
-    except Exception as e:
-        print(f"[NTFY] Send failed: {e}")
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                f"https://ntfy.sh/{topic}",
+                data=message.encode("utf-8"),
+                headers={"Content-Type": "text/plain"},
+            )
+            urllib.request.urlopen(req, timeout=10)
+            return
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                time.sleep(3 * (attempt + 1))
+                continue
+            print(f"[NTFY] Send failed: {e}")
+            return
+        except Exception as e:
+            print(f"[NTFY] Send failed: {e}")
+            return
 
 
 def send_signals(token: str, chat_id: str, keys: list, direction: str, symbol: str, price: float, qty: int, ntfy_topic: str = ""):
@@ -135,8 +144,8 @@ POINT_VALUE = 20.0  # NQ: $20 per point per contract
 
 TRADING_DAYS = [0, 1, 2, 3, 4, 6]  # Sun-Fri (Sun 6PM start, Fri 4PM end)
 
-EMA_PERIOD = 9
-EMA_BUFFER = 3.0  # Price must move a full brick size away from EMA to trigger cross (prevents whipsaw)
+SMA_PERIOD = 20  # BB middle line = 20 SMA
+EMA_BUFFER = 3.0  # (legacy name) buffer zone uses brick_size dynamically
 
 # Stepped trailing profit: (trigger_level, lock_floor)
 # When profit reaches trigger_level, lock_floor becomes the exit floor
@@ -180,9 +189,9 @@ class RenkoBot:
         # Bar tracking
         self.last_bar_time = None
 
-        # 9 EMA on 1sec Renko brick closes
+        # 20 SMA on 1sec Renko brick closes
         self.ema_closes = []     # list of 1sec Renko brick close prices
-        self.ema_9 = None        # current 9 EMA value
+        self.ema_9 = None        # current 20 SMA value
 
         # Ghost candle state
         self.ghost_above_ema = None  # True/False/None
@@ -225,33 +234,21 @@ class RenkoBot:
         self.running = False
 
     def _calc_ema(self):
-        """Recalculate 9 EMA from ema_closes list."""
-        if len(self.ema_closes) < EMA_PERIOD:
-            # Not enough data - use SMA of available
-            if self.ema_closes:
-                self.ema_9 = sum(self.ema_closes) / len(self.ema_closes)
+        """Calculate 20 SMA (BB middle line) from brick closes."""
+        if not self.ema_closes:
             return
-
-        if self.ema_9 is None:
-            # First EMA = SMA of first EMA_PERIOD values
-            self.ema_9 = sum(self.ema_closes[:EMA_PERIOD]) / EMA_PERIOD
-            # Then apply EMA formula for remaining
-            k = 2.0 / (EMA_PERIOD + 1)
-            for price in self.ema_closes[EMA_PERIOD:]:
-                self.ema_9 = price * k + self.ema_9 * (1 - k)
-        else:
-            # Incremental: apply latest close
-            k = 2.0 / (EMA_PERIOD + 1)
-            self.ema_9 = self.ema_closes[-1] * k + self.ema_9 * (1 - k)
+        # Use last SMA_PERIOD closes for the average
+        window = self.ema_closes[-SMA_PERIOD:]
+        self.ema_9 = sum(window) / len(window)
 
     async def run(self):
         from project_x_py import TradingSuite
 
-        print(f"[BOT] Renko 9 EMA Ghost Candle Cross Strategy - LIVE MODE")
+        print(f"[BOT] Renko 20 SMA Ghost Candle Cross Strategy - LIVE MODE")
         print(f"[BOT] Symbol: {self.symbol}, Qty: {self.qty}")
         print(f"[BOT] Brick size: {self.brick_size} (Traditional)")
-        print(f"[BOT] Strategy: 1sec Renko + 9 EMA + Ghost Candle Cross")
-        print(f"[BOT] ENTRY: Ghost candle crosses 9 EMA")
+        print(f"[BOT] Strategy: 1sec Renko + 20 SMA + Ghost Candle Cross")
+        print(f"[BOT] ENTRY: Ghost candle crosses 20 SMA")
         print(f"[BOT] EXIT: Ghost candle crosses EMA opposite OR trailing profit")
         steps_str = " → ".join(f"${t}→lock${l}" for t, l in TRAIL_STEPS)
         print(f"[BOT] Trail steps: {steps_str}")
@@ -289,7 +286,7 @@ class RenkoBot:
         self._print_status()
 
         print(f"\n[BOT] Session active: {self.was_in_session}")
-        print(f"[BOT] Trading LIVE - 9 EMA Ghost Candle Cross")
+        print(f"[BOT] Trading LIVE - 20 SMA Ghost Candle Cross")
         print(f"[BOT] Press Ctrl+C to stop\n")
 
         try:
@@ -302,7 +299,7 @@ class RenkoBot:
             await self._shutdown()
 
     async def _seed_history(self):
-        """Feed historical 10sec bars to warm up Renko + calculate initial 9 EMA."""
+        """Feed historical 10sec bars to warm up Renko + calculate initial 20 SMA."""
         data = await self.ctx.data.get_data("1sec", bars=800)
         if data is None or len(data) == 0:
             print("[BOT] No historical 1sec data for seeding")
@@ -319,22 +316,15 @@ class RenkoBot:
 
         # Calculate initial EMA from all historical brick closes
         if self.ema_closes:
-            self.ema_9 = None
-            if len(self.ema_closes) >= EMA_PERIOD:
-                self.ema_9 = sum(self.ema_closes[:EMA_PERIOD]) / EMA_PERIOD
-                k = 2.0 / (EMA_PERIOD + 1)
-                for price in self.ema_closes[EMA_PERIOD:]:
-                    self.ema_9 = price * k + self.ema_9 * (1 - k)
-            elif self.ema_closes:
-                self.ema_9 = sum(self.ema_closes) / len(self.ema_closes)
+            self._calc_ema()
 
         dir_str = "BULLISH" if self.renko.direction == 1 else "BEARISH" if self.renko.direction == -1 else "NONE"
         print(f"  1sec Renko: {self.renko.brick_count} bricks, {dir_str}, ref={self.renko.last_close:.2f}")
-        print(f"  EMA-9 data points: {len(self.ema_closes)} brick closes")
+        print(f"  SMA-20 data points: {len(self.ema_closes)} brick closes")
         if self.ema_9:
-            print(f"  EMA-9 value: {self.ema_9:.2f}")
+            print(f"  SMA-20 value: {self.ema_9:.2f}")
         else:
-            print(f"  EMA-9: not enough data yet (need {EMA_PERIOD} bricks)")
+            print(f"  SMA-20: not enough data yet (need {SMA_PERIOD} bricks)")
 
     def _print_status(self):
         """Print current strategy status."""
@@ -345,11 +335,11 @@ class RenkoBot:
         print(f"\n  [STATUS @ {now}]")
         print(f"  1sec Renko: {dir_str} | last_close={self.renko.last_close:.2f} | bricks={self.renko.brick_count}")
         if self.ema_9:
-            print(f"  9 EMA: {self.ema_9:.2f}")
+            print(f"  20 SMA: {self.ema_9:.2f}")
             ghost_str = "ABOVE" if self.ghost_above_ema else "BELOW" if self.ghost_above_ema is False else "UNKNOWN"
-            print(f"  Ghost vs EMA: {ghost_str}")
+            print(f"  Ghost vs SMA: {ghost_str}")
         else:
-            print(f"  9 EMA: waiting for data ({len(self.ema_closes)}/{EMA_PERIOD} bricks)")
+            print(f"  20 SMA: waiting for data ({len(self.ema_closes)}/{SMA_PERIOD} bricks)")
         print(f"  Position: {pos_str} | P&L: ${self.live_pnl:.2f}")
 
     async def _auto_reconnect(self):
@@ -506,18 +496,18 @@ class RenkoBot:
                         color = "BULLISH" if b[2] == 1 else "BEARISH"
                         self.ema_closes.append(b[1])
                         self._calc_ema()
-                        print(f"[{now}] [RENKO 1s] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | EMA-9: {self.ema_9:.2f}" if self.ema_9 else f"[{now}] [RENKO 1s] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
+                        print(f"[{now}] [RENKO 1s] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | SMA-20: {self.ema_9:.2f}" if self.ema_9 else f"[{now}] [RENKO 1s] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
 
-        # ---- Ghost candle vs 9 EMA check (every tick) ----
+        # ---- Ghost candle vs 20 SMA check (every tick) ----
         if self.ema_9 is None:
             return
 
         prev_ghost = self.ghost_above_ema
         # Use buffer zone: price must be > EMA + buffer to be "above", < EMA - buffer to be "below"
         # When in the buffer zone, keep previous state (no flip)
-        if price > self.ema_9 + EMA_BUFFER:
+        if price > self.ema_9 + self.brick_size:
             self.ghost_above_ema = True
-        elif price < self.ema_9 - EMA_BUFFER:
+        elif price < self.ema_9 - self.brick_size:
             self.ghost_above_ema = False
         # else: in buffer zone, keep prev_ghost state (no change)
 
@@ -529,7 +519,7 @@ class RenkoBot:
             cross_direction = 1 if self.ghost_above_ema else -1
             cross_str = "ABOVE (BULLISH)" if cross_direction == 1 else "BELOW (BEARISH)"
             diff = abs(price - self.ema_9)
-            print(f"[{now}] [GHOST CROSS] Price {price:.2f} crossed EMA {self.ema_9:.2f} (diff {diff:.2f}) -> {cross_str}")
+            print(f"[{now}] [GHOST CROSS] Price {price:.2f} crossed SMA {self.ema_9:.2f} (diff {diff:.2f}) -> {cross_str}")
 
         # ---- Stepped trailing profit check ----
         if self.position != 0:
@@ -722,7 +712,7 @@ class RenkoBot:
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="TopstepX Renko 9 EMA Ghost Candle Cross Bot")
+    parser = argparse.ArgumentParser(description="TopstepX Renko 20 SMA Ghost Candle Cross Bot")
     parser.add_argument("--symbol", default="NQ", help="Contract symbol")
     parser.add_argument("--qty", type=int, default=1, help="Order quantity")
     parser.add_argument("--brick-size", type=float, default=3.0,
