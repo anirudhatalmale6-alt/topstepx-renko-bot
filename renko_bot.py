@@ -1,11 +1,11 @@
 """
-TopstepX Renko 20 SMA Ghost Candle Cross Strategy Bot (LIVE)
+TopstepX Renko 20 SMA + Ichimoku Cloud Strategy Bot (LIVE)
 
-Strategy: 1sec Renko (0.25 bricks from candle CLOSE) + 20 SMA + Ghost Candle Cross
-- ENTRY: Ghost candle (real-time price) crosses 20 SMA on 1sec Renko
-         Above EMA = LONG, Below EMA = SHORT
-- EXIT: Ghost candle crosses 20 SMA opposite direction OR trailing profit
-- TRAILING: Trigger at $50 profit, lock in minimum $30
+Strategy: 1sec Renko (bricks from candle CLOSE) + 20 SMA + Ichimoku Cloud
+- TRIGGER: Ghost candle (real-time price) crosses 20 SMA on 1sec Renko
+- DIRECTION: Determined by Ichimoku cloud (above cloud = LONG, below cloud = SHORT)
+- EXIT: Ghost candle crosses 20 SMA again OR trailing profit
+- TRAILING: Stepped locks ($70→$50, $100→$80, $130→$110)
 - No stop loss
 
 Usage:
@@ -147,6 +147,12 @@ TRADING_DAYS = [0, 1, 2, 3, 4, 6]  # Sun-Fri (Sun 6PM start, Fri 4PM end)
 SMA_PERIOD = 20  # BB middle line = 20 SMA
 EMA_BUFFER = 3.0  # (legacy name) buffer zone uses brick_size dynamically
 
+# Ichimoku Cloud parameters (on Renko bricks)
+TENKAN_PERIOD = 9
+KIJUN_PERIOD = 26
+SENKOU_B_PERIOD = 52
+CLOUD_DISPLACEMENT = 26
+
 # Stepped trailing profit: (trigger_level, lock_floor)
 # When profit reaches trigger_level, lock_floor becomes the exit floor
 TRAIL_STEPS = [
@@ -197,6 +203,11 @@ class RenkoBot:
         self.ghost_above_ema = None  # True/False/None
         self.last_price = 0.0
 
+        # Ichimoku cloud state
+        self.senkou_a = None  # Senkou Span A (current cloud top/bottom)
+        self.senkou_b = None  # Senkou Span B (current cloud top/bottom)
+        self.cloud_position = None  # "ABOVE", "BELOW", "IN_CLOUD", None
+
         # Trailing profit (stepped)
         self.max_profit = 0.0
         self.trailing_active = False
@@ -241,15 +252,66 @@ class RenkoBot:
         window = self.ema_closes[-SMA_PERIOD:]
         self.ema_9 = sum(window) / len(window)
 
+    def _calc_ichimoku(self):
+        """Calculate Ichimoku cloud (Senkou Span A & B) from Renko brick closes.
+
+        Uses displaced values: the cloud plotted 26 periods ahead on a chart
+        means we look at values calculated 26 bricks AGO for the current cloud.
+        """
+        closes = self.ema_closes
+        n = len(closes)
+
+        # Need enough data: SENKOU_B_PERIOD + CLOUD_DISPLACEMENT bricks minimum
+        min_needed = SENKOU_B_PERIOD + CLOUD_DISPLACEMENT
+        if n < min_needed:
+            return
+
+        # For the CURRENT cloud position, we need the Senkou values that were
+        # calculated CLOUD_DISPLACEMENT periods ago (they were projected forward)
+        # So we look at closes up to index [n - CLOUD_DISPLACEMENT]
+        offset = n - CLOUD_DISPLACEMENT
+
+        # Tenkan-sen (conversion line) = (highest high + lowest low) / 2 over TENKAN_PERIOD
+        tenkan_window = closes[offset - TENKAN_PERIOD:offset]
+        tenkan = (max(tenkan_window) + min(tenkan_window)) / 2.0
+
+        # Kijun-sen (base line) = (highest high + lowest low) / 2 over KIJUN_PERIOD
+        kijun_window = closes[offset - KIJUN_PERIOD:offset]
+        kijun = (max(kijun_window) + min(kijun_window)) / 2.0
+
+        # Senkou Span A = (Tenkan + Kijun) / 2, displaced forward by CLOUD_DISPLACEMENT
+        self.senkou_a = (tenkan + kijun) / 2.0
+
+        # Senkou Span B = (highest high + lowest low) / 2 over SENKOU_B_PERIOD, displaced forward
+        senkou_b_window = closes[offset - SENKOU_B_PERIOD:offset]
+        self.senkou_b = (max(senkou_b_window) + min(senkou_b_window)) / 2.0
+
+    def _get_cloud_position(self, price: float) -> str:
+        """Determine price position relative to Ichimoku cloud."""
+        if self.senkou_a is None or self.senkou_b is None:
+            return None
+
+        cloud_top = max(self.senkou_a, self.senkou_b)
+        cloud_bottom = min(self.senkou_a, self.senkou_b)
+
+        if price > cloud_top:
+            return "ABOVE"
+        elif price < cloud_bottom:
+            return "BELOW"
+        else:
+            return "IN_CLOUD"
+
     async def run(self):
         from project_x_py import TradingSuite
 
-        print(f"[BOT] Renko 20 SMA Ghost Candle Cross Strategy - LIVE MODE")
+        print(f"[BOT] Renko 20 SMA + Ichimoku Cloud Strategy - LIVE MODE")
         print(f"[BOT] Symbol: {self.symbol}, Qty: {self.qty}")
         print(f"[BOT] Brick size: {self.brick_size} (Traditional)")
-        print(f"[BOT] Strategy: 1sec Renko + 20 SMA + Ghost Candle Cross")
-        print(f"[BOT] ENTRY: Ghost candle crosses 20 SMA")
-        print(f"[BOT] EXIT: Ghost candle crosses EMA opposite OR trailing profit")
+        print(f"[BOT] Strategy: 1sec Renko + 20 SMA trigger + Ichimoku Cloud direction")
+        print(f"[BOT] TRIGGER: Ghost candle crosses 20 SMA")
+        print(f"[BOT] DIRECTION: Ichimoku cloud (above=LONG, below=SHORT, in cloud=SKIP)")
+        print(f"[BOT] Ichimoku: Tenkan={TENKAN_PERIOD}, Kijun={KIJUN_PERIOD}, SenkouB={SENKOU_B_PERIOD}, Disp={CLOUD_DISPLACEMENT}")
+        print(f"[BOT] EXIT: Ghost candle crosses SMA again OR trailing profit")
         steps_str = " → ".join(f"${t}→lock${l}" for t, l in TRAIL_STEPS)
         print(f"[BOT] Trail steps: {steps_str}")
         day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
@@ -286,7 +348,7 @@ class RenkoBot:
         self._print_status()
 
         print(f"\n[BOT] Session active: {self.was_in_session}")
-        print(f"[BOT] Trading LIVE - 20 SMA Ghost Candle Cross")
+        print(f"[BOT] Trading LIVE - 20 SMA + Ichimoku Cloud")
         print(f"[BOT] Press Ctrl+C to stop\n")
 
         try:
@@ -314,9 +376,10 @@ class RenkoBot:
             for brick in bricks:
                 self.ema_closes.append(brick[1])
 
-        # Calculate initial EMA from all historical brick closes
+        # Calculate initial SMA and Ichimoku from all historical brick closes
         if self.ema_closes:
             self._calc_ema()
+            self._calc_ichimoku()
 
         dir_str = "BULLISH" if self.renko.direction == 1 else "BEARISH" if self.renko.direction == -1 else "NONE"
         print(f"  1sec Renko: {self.renko.brick_count} bricks, {dir_str}, ref={self.renko.last_close:.2f}")
@@ -325,6 +388,13 @@ class RenkoBot:
             print(f"  SMA-20 value: {self.ema_9:.2f}")
         else:
             print(f"  SMA-20: not enough data yet (need {SMA_PERIOD} bricks)")
+        if self.senkou_a is not None:
+            cloud_top = max(self.senkou_a, self.senkou_b)
+            cloud_bottom = min(self.senkou_a, self.senkou_b)
+            print(f"  Ichimoku Cloud: top={cloud_top:.2f}, bottom={cloud_bottom:.2f}")
+        else:
+            min_needed = SENKOU_B_PERIOD + CLOUD_DISPLACEMENT
+            print(f"  Ichimoku Cloud: not enough data yet (need {min_needed} bricks, have {len(self.ema_closes)})")
 
     def _print_status(self):
         """Print current strategy status."""
@@ -340,6 +410,13 @@ class RenkoBot:
             print(f"  Ghost vs SMA: {ghost_str}")
         else:
             print(f"  20 SMA: waiting for data ({len(self.ema_closes)}/{SMA_PERIOD} bricks)")
+        if self.senkou_a is not None:
+            cloud_top = max(self.senkou_a, self.senkou_b)
+            cloud_bottom = min(self.senkou_a, self.senkou_b)
+            cloud_pos = self._get_cloud_position(self.last_price) or "UNKNOWN"
+            print(f"  Ichimoku Cloud: top={cloud_top:.2f}, bottom={cloud_bottom:.2f} | Price: {cloud_pos}")
+        else:
+            print(f"  Ichimoku Cloud: waiting for data")
         print(f"  Position: {pos_str} | P&L: ${self.live_pnl:.2f}")
 
     async def _auto_reconnect(self):
@@ -496,7 +573,13 @@ class RenkoBot:
                         color = "BULLISH" if b[2] == 1 else "BEARISH"
                         self.ema_closes.append(b[1])
                         self._calc_ema()
-                        print(f"[{now}] [RENKO 1s] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | SMA-20: {self.ema_9:.2f}" if self.ema_9 else f"[{now}] [RENKO 1s] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
+                        self._calc_ichimoku()
+                        cloud_str = ""
+                        if self.senkou_a is not None:
+                            cloud_top = max(self.senkou_a, self.senkou_b)
+                            cloud_bottom = min(self.senkou_a, self.senkou_b)
+                            cloud_str = f" | Cloud: {cloud_bottom:.2f}-{cloud_top:.2f}"
+                        print(f"[{now}] [RENKO 1s] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | SMA-20: {self.ema_9:.2f}{cloud_str}" if self.ema_9 else f"[{now}] [RENKO 1s] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f}")
 
         # ---- Ghost candle vs 20 SMA check (every tick) ----
         if self.ema_9 is None:
@@ -548,34 +631,63 @@ class RenkoBot:
             await self._live_logic(price, cross_direction)
 
     async def _live_logic(self, price: float, cross_direction: int):
-        """Handle entries and exits on ghost candle EMA cross."""
+        """Handle entries and exits on ghost candle SMA cross + Ichimoku cloud direction.
 
-        # EXIT: Ghost crosses opposite to position
+        TRIGGER: Any SMA cross (above or below)
+        DIRECTION: Ichimoku cloud determines entry direction
+          - Price ABOVE cloud → LONG
+          - Price BELOW cloud → SHORT
+          - Price IN cloud → SKIP (no entry)
+        EXIT: Next SMA cross closes the current position
+        """
+        now = datetime.now(ET).strftime("%H:%M:%S")
+
+        # Get cloud position
+        cloud_pos = self._get_cloud_position(price)
+
+        # EXIT: Any SMA cross while in a position → close it
         if self.position != 0:
-            if (self.position == 1 and cross_direction == -1) or \
-               (self.position == -1 and cross_direction == 1):
-                await self._flatten(price, reason="GHOST_CROSS_EXIT")
-                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
-                             "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
+            direction = "LONG" if self.position == 1 else "SHORT"
+            await self._flatten(price, reason="SMA_CROSS_EXIT")
+            send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                         "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
 
-        # ENTRY: Ghost crosses EMA
-        if cross_direction == 1 and self.position <= 0:
+        # ENTRY: Ichimoku cloud determines direction
+        if cloud_pos is None:
+            print(f"[{now}] [ICHIMOKU] Cloud not ready yet - skipping entry")
+            return
+
+        if cloud_pos == "IN_CLOUD":
+            cloud_top = max(self.senkou_a, self.senkou_b)
+            cloud_bottom = min(self.senkou_a, self.senkou_b)
+            print(f"[{now}] [ICHIMOKU] Price {price:.2f} IN CLOUD ({cloud_bottom:.2f}-{cloud_top:.2f}) - skipping entry")
+            return
+
+        if cloud_pos == "ABOVE" and self.position <= 0:
             if self.position == -1:
-                await self._flatten(price, reason="FLIP_LONG")
+                await self._flatten(price, reason="CLOUD_FLIP_LONG")
                 send_signals(self.tg_token, self.tg_chat, self.tg_keys,
                              "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
+            cloud_top = max(self.senkou_a, self.senkou_b)
+            print(f"[{now}] [ICHIMOKU] Price {price:.2f} ABOVE cloud (top={cloud_top:.2f}) → LONG")
             await self._enter_long(price)
 
-        elif cross_direction == -1 and self.position >= 0:
+        elif cloud_pos == "BELOW" and self.position >= 0:
             if self.position == 1:
-                await self._flatten(price, reason="FLIP_SHORT")
+                await self._flatten(price, reason="CLOUD_FLIP_SHORT")
                 send_signals(self.tg_token, self.tg_chat, self.tg_keys,
                              "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
+            cloud_bottom = min(self.senkou_a, self.senkou_b)
+            print(f"[{now}] [ICHIMOKU] Price {price:.2f} BELOW cloud (bottom={cloud_bottom:.2f}) → SHORT")
             await self._enter_short(price)
 
     async def _enter_long(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [LIVE] >>> ENTERING LONG @ {price:.2f} | EMA: {self.ema_9:.2f} | P&L: ${self.live_pnl:.2f}")
+        cloud_str = ""
+        if self.senkou_a is not None:
+            cloud_top = max(self.senkou_a, self.senkou_b)
+            cloud_str = f" | Cloud top: {cloud_top:.2f}"
+        print(f"\n[{now}] [LIVE] >>> ENTERING LONG @ {price:.2f} | SMA: {self.ema_9:.2f}{cloud_str} | P&L: ${self.live_pnl:.2f}")
         try:
             response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
@@ -604,7 +716,11 @@ class RenkoBot:
 
     async def _enter_short(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [LIVE] >>> ENTERING SHORT @ {price:.2f} | EMA: {self.ema_9:.2f} | P&L: ${self.live_pnl:.2f}")
+        cloud_str = ""
+        if self.senkou_a is not None:
+            cloud_bottom = min(self.senkou_a, self.senkou_b)
+            cloud_str = f" | Cloud bottom: {cloud_bottom:.2f}"
+        print(f"\n[{now}] [LIVE] >>> ENTERING SHORT @ {price:.2f} | SMA: {self.ema_9:.2f}{cloud_str} | P&L: ${self.live_pnl:.2f}")
         try:
             response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
@@ -640,8 +756,21 @@ class RenkoBot:
         trail_str = f" | Trail: {'ACTIVE' if self.trailing_active else 'off'}" if self.trailing_active else ""
         print(f"\n[{now}] [LIVE] <<< EXITING {direction} @ {price:.2f} | Trade: ${trade_pnl:+.2f} | P&L: ${self.live_pnl:.2f} | {reason}{trail_str}")
 
+        # Save entry price for logging before resetting
+        saved_entry_price = self.entry_price
+
+        # Reset position state BEFORE placing close order to prevent double-close on reconnect
+        old_position = self.position
+        self.position = 0
+        self.entry_price = 0.0
+        self.entry_time = None
+        self.max_profit = 0.0
+        self.trailing_active = False
+        self.trail_lock_floor = 0.0
+        self.trail_step_idx = -1
+
         try:
-            close_side = 1 if self.position == 1 else 0
+            close_side = 1 if old_position == 1 else 0
             response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
                 side=close_side,
@@ -658,15 +787,7 @@ class RenkoBot:
             print(f"[LIVE] Triggering reconnect due to close exception...")
             await self._auto_reconnect()
 
-        self._log_trade(direction, self.entry_price, price, trade_pnl, reason)
-
-        self.position = 0
-        self.entry_price = 0.0
-        self.entry_time = None
-        self.max_profit = 0.0
-        self.trailing_active = False
-        self.trail_lock_floor = 0.0
-        self.trail_step_idx = -1
+        self._log_trade(direction, saved_entry_price, price, trade_pnl, reason)
 
     def _log_trade(self, direction, entry_price, exit_price, pnl, reason):
         now = datetime.now(ET)
@@ -712,7 +833,7 @@ class RenkoBot:
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="TopstepX Renko 20 SMA Ghost Candle Cross Bot")
+    parser = argparse.ArgumentParser(description="TopstepX Renko 20 SMA + Ichimoku Cloud Bot")
     parser.add_argument("--symbol", default="NQ", help="Contract symbol")
     parser.add_argument("--qty", type=int, default=1, help="Order quantity")
     parser.add_argument("--brick-size", type=float, default=3.0,
