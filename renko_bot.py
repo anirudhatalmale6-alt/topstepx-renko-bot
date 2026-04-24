@@ -1,10 +1,10 @@
 """
-TopstepX Renko EMA Ghost Candle Cross Strategy Bot (LIVE) - FLIPPED SIGNALS
+TopstepX Renko EMA Ghost Candle Cross Strategy Bot (LIVE) - NORMAL SIGNALS
 Multi-symbol support: runs multiple instruments on one connection.
 
 Strategy: 1sec Renko (bricks from candle CLOSE) + 20 EMA + Ghost Candle Cross
-- ENTRY: Ghost candle crosses EMA (FLIPPED: above = SHORT, below = LONG)
-- EXIT: Ghost candle crosses EMA same direction as position
+- ENTRY: Ghost candle crosses EMA (NORMAL: above = LONG, below = SHORT)
+- EXIT: Ghost candle crosses EMA opposite direction to position
 - No trailing profit, no stop loss
 
 Usage (single symbol - backward compatible):
@@ -351,26 +351,28 @@ class SymbolState:
         return True
 
     async def _live_logic(self, price: float, cross_direction: int):
+        # Exit: cross opposite to position direction (NORMAL)
         if self.position != 0:
-            if (self.position == 1 and cross_direction == 1) or \
-               (self.position == -1 and cross_direction == -1):
+            if (self.position == 1 and cross_direction == -1) or \
+               (self.position == -1 and cross_direction == 1):
                 await self._flatten(price, reason="GHOST_CROSS_EXIT")
                 send_signals(self.tg_token, self.tg_chat, self.tg_keys,
                              "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
 
-        if cross_direction == 1 and self.position >= 0:
-            if self.position == 1:
-                await self._flatten(price, reason="FLIP_SHORT")
-                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
-                             "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
-            await self._enter_short(price)
-
-        elif cross_direction == -1 and self.position <= 0:
+        # NORMAL: cross above EMA = LONG, cross below EMA = SHORT
+        if cross_direction == 1 and self.position <= 0:
             if self.position == -1:
                 await self._flatten(price, reason="FLIP_LONG")
                 send_signals(self.tg_token, self.tg_chat, self.tg_keys,
                              "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
             await self._enter_long(price)
+
+        elif cross_direction == -1 and self.position >= 0:
+            if self.position == 1:
+                await self._flatten(price, reason="FLIP_SHORT")
+                send_signals(self.tg_token, self.tg_chat, self.tg_keys,
+                             "FLAT", self.symbol, price, 0, ntfy_topic=self.ntfy_topic)
+            await self._enter_short(price)
 
     async def _enter_long(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
@@ -558,13 +560,13 @@ class RenkoBot:
         from project_x_py import TradingSuite
 
         symbols = self._symbols_list()
-        print(f"[BOT] Renko {EMA_PERIOD} EMA Ghost Candle Cross - FLIPPED SIGNALS - LIVE MODE")
+        print(f"[BOT] Renko {EMA_PERIOD} EMA Ghost Candle Cross - NORMAL SIGNALS - LIVE MODE")
         print(f"[BOT] Symbols: {', '.join(symbols)}")
         for sym, st in self.states.items():
             print(f"[BOT]   {sym}: brick={st.brick_size}, qty={st.qty}, pv=${st.point_value}/pt" +
                   (f", ntfy={st.ntfy_topic}" if st.ntfy_topic else ""))
         print(f"[BOT] Strategy: Renko + {EMA_PERIOD} EMA + Ghost Candle Cross (FLIPPED)")
-        print(f"[BOT] ENTRY: Cross above EMA = SHORT, Cross below EMA = LONG")
+        print(f"[BOT] ENTRY: Cross above EMA = LONG, Cross below EMA = SHORT")
         day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
         trading_day_str = ", ".join(day_names[d] for d in TRADING_DAYS)
         print(f"[BOT] Session: {SESSION_START.strftime('%H:%M')} - {SESSION_END.strftime('%H:%M')} ET ({trading_day_str})")
@@ -626,7 +628,7 @@ class RenkoBot:
             st.print_status()
 
         print(f"\n[BOT] Session active: {self.was_in_session}")
-        print(f"[BOT] Trading LIVE - {EMA_PERIOD} EMA FLIPPED ({', '.join(symbols)})")
+        print(f"[BOT] Trading LIVE - {EMA_PERIOD} EMA NORMAL ({', '.join(symbols)})")
         print(f"[BOT] Press Ctrl+C to stop\n")
 
         try:
