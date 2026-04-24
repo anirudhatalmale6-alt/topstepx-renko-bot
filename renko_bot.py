@@ -565,7 +565,7 @@ class RenkoBot:
         for sym, st in self.states.items():
             print(f"[BOT]   {sym}: brick={st.brick_size}, qty={st.qty}, pv=${st.point_value}/pt" +
                   (f", ntfy={st.ntfy_topic}" if st.ntfy_topic else ""))
-        print(f"[BOT] Strategy: Renko + {EMA_PERIOD} EMA + Ghost Candle Cross (FLIPPED)")
+        print(f"[BOT] Strategy: Renko + {EMA_PERIOD} EMA + Ghost Candle Cross (NORMAL)")
         print(f"[BOT] ENTRY: Cross above EMA = LONG, Cross below EMA = SHORT")
         day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
         trading_day_str = ", ".join(day_names[d] for d in TRADING_DAYS)
@@ -927,7 +927,6 @@ def main():
             current_bot.running = False
             current_bot.save_all_state()
         print("\n[BOT] Shutting down...")
-        threading.Timer(10.0, lambda: os._exit(0)).start()
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
@@ -960,9 +959,9 @@ def main():
             if current_bot:
                 current_bot.save_all_state()
             break
-        except Exception as e:
+        except BaseException as e:
             now = datetime.now(ET).strftime("%H:%M:%S")
-            print(f"\n[{now}] [CRASH] Bot crashed: {e}")
+            print(f"\n[{now}] [CRASH] Bot crashed: {type(e).__name__}: {e}")
             print(f"[{now}] [CRASH] Restarting in {retry_delay}s...")
             if time.time() - last_crash_notify > CRASH_NOTIFY_COOLDOWN:
                 send_telegram(args.tg_token, args.tg_chat, f"STATUS|Bot crashed, restarting in {retry_delay}s ({now} ET)")
