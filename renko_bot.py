@@ -2,13 +2,12 @@
 TopstepX Renko MACD Cross Strategy Bot (LIVE) - NORMAL SIGNALS
 Multi-symbol support: runs multiple instruments on one connection.
 
-Strategy: Renko (sampled every N seconds) + MACD (12,26,9) Cross
-- ENTRY: MACD crosses above Signal = LONG, MACD crosses below Signal = SHORT
-- EXIT: MACD crosses opposite direction to position
-- No trailing profit, no stop loss
+Strategy: Renko (sampled every N seconds) + MACD (12,26,9) Cross + Staircase Entry + Trailing Brick Exit
+- ENTRY: MACD crosses signal (staircase: 1st brick sets pending, 2nd same-direction confirms)
+- EXIT: Immediate reversal detection (price drops below last brick close for LONG, rises above for SHORT)
 
 Usage (multi-symbol):
-    python renko_bot.py --symbols "NQ:0.25:1:ntfy-topic,ES:0.25:1" --tick-interval 5
+    python renko_bot.py --symbols "NQ:3:1:ntfy-topic" --tick-interval 15
 """
 
 import asyncio
@@ -188,6 +187,8 @@ class SymbolState:
         self.prev_signal = None
 
         self.last_price = 0.0
+        self.pending_entry_dir = 0  # 1=pending LONG, -1=pending SHORT
+        self.last_brick_close = None  # track last brick close for immediate reversal detection
 
         self.position = 0
         self.entry_price = 0.0
@@ -321,69 +322,78 @@ class SymbolState:
 
         self.last_price = price
 
-        # Only process strategy every tick_interval seconds
+        now = datetime.now(ET).strftime("%H:%M:%S")
+
+        # Trail by brick: exit immediately if price starts forming opposite color
+        if self.position != 0 and self.last_brick_close is not None:
+            if (self.position == 1 and price < self.last_brick_close) or \
+               (self.position == -1 and price > self.last_brick_close):
+                unrealized = (price - self.entry_price) * self.position * self.point_value * self.qty
+                dir_str = "dropped below" if self.position == 1 else "rose above"
+                print(f"[{now}] [{self.symbol} REVERSAL START] Price {price:.2f} {dir_str} last brick {self.last_brick_close:.2f} | P&L: ${unrealized:+.2f} - exiting")
+                await self._flatten(price, reason="REVERSAL_START")
+                self.pending_entry_dir = 0
+                threading.Thread(target=send_signals, args=(
+                    self.tg_token, self.tg_chat, self.tg_keys,
+                    "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+                return True
+
+        # Feed Renko bricks every tick_interval
         now_ts = time.time()
         if now_ts - self.last_tick_time < self.tick_interval:
             return True
         self.last_tick_time = now_ts
         self.last_new_bar_time = now_ts
 
-        now = datetime.now(ET).strftime("%H:%M:%S")
-
-        # Feed current price into Renko at each interval
         bricks = self.renko.feed_close(price)
         if not bricks:
             return True
 
         for b in bricks:
-            color = "BULLISH" if b[2] == 1 else "BEARISH"
+            brick_dir = b[2]  # 1 = BULLISH, -1 = BEARISH
+            color = "BULLISH" if brick_dir == 1 else "BEARISH"
             self.brick_closes.append(b[1])
             self._calc_macd()
             macd_str = f" | MACD: {self.macd_line:.4f} Sig: {self.signal_line:.4f}" if self.macd_line is not None else ""
             print(f"[{now}] [{self.symbol} RENKO] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f}{macd_str}")
 
+            # While in position: update trailing brick close on same-direction bricks
+            if self.position != 0:
+                self.last_brick_close = b[1]
+                continue
+
             if self.macd_line is None or self.prev_macd is None:
                 continue
 
-            # Detect MACD cross after each brick
-            crossed = False
-            cross_direction = 0
-            if self.prev_macd <= self.prev_signal and self.macd_line > self.signal_line:
-                crossed = True
-                cross_direction = 1
-            elif self.prev_macd >= self.prev_signal and self.macd_line < self.signal_line:
-                crossed = True
-                cross_direction = -1
+            # STEP 2: Pending entry - second brick confirms, we jump in
+            if self.pending_entry_dir != 0:
+                if brick_dir == self.pending_entry_dir:
+                    dir_str = "LONG" if brick_dir == 1 else "SHORT"
+                    print(f"[{now}] [{self.symbol} CONFIRMED] 2nd {color} brick - entering {dir_str}")
+                    self.last_brick_close = b[1]
+                    if brick_dir == 1:
+                        await self._enter_long(price)
+                    else:
+                        await self._enter_short(price)
+                else:
+                    print(f"[{now}] [{self.symbol} CANCELLED] Reversal brick - entry cancelled")
+                self.pending_entry_dir = 0
+                continue
 
-            if crossed:
-                cross_str = "BULLISH" if cross_direction == 1 else "BEARISH"
-                print(f"[{now}] [{self.symbol} MACD CROSS] {cross_str} | MACD: {self.macd_line:.4f} Signal: {self.signal_line:.4f}")
-                await self._live_logic(price, cross_direction)
+            # STEP 1: MACD cross - set pending entry
+            if self.prev_macd <= self.prev_signal and self.macd_line > self.signal_line:
+                print(f"[{now}] [{self.symbol} MACD CROSS] BULLISH | MACD: {self.macd_line:.4f} Signal: {self.signal_line:.4f} - pending LONG")
+                self.pending_entry_dir = 1
+            elif self.prev_macd >= self.prev_signal and self.macd_line < self.signal_line:
+                print(f"[{now}] [{self.symbol} MACD CROSS] BEARISH | MACD: {self.macd_line:.4f} Signal: {self.signal_line:.4f} - pending SHORT")
+                self.pending_entry_dir = -1
 
         return True
 
-    async def _live_logic(self, price: float, cross_direction: int):
-        # Exit: cross opposite to position direction (NORMAL)
-        if self.position != 0:
-            if (self.position == 1 and cross_direction == -1) or \
-               (self.position == -1 and cross_direction == 1):
-                await self._flatten(price, reason="GHOST_CROSS_EXIT")
-
-        # NORMAL: cross above = LONG, cross below = SHORT
-        # Place orders FIRST, send signals AFTER to minimize delay
-        if cross_direction == 1 and self.position <= 0:
-            if self.position == -1:
-                await self._flatten(price, reason="FLIP_LONG")
-            await self._enter_long(price)
-
-        elif cross_direction == -1 and self.position >= 0:
-            if self.position == 1:
-                await self._flatten(price, reason="FLIP_SHORT")
-            await self._enter_short(price)
-
     async def _enter_long(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG @ {price:.2f} | MACD: {self.macd_line:.4f} | P&L: ${self.live_pnl:.2f}")
+        macd_str = f"MACD: {self.macd_line:.4f} Sig: {self.signal_line:.4f}" if self.macd_line is not None else "MACD: N/A"
+        print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG @ {price:.2f} | {macd_str} | P&L: ${self.live_pnl:.2f}")
         try:
             response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
@@ -408,7 +418,8 @@ class SymbolState:
 
     async def _enter_short(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT @ {price:.2f} | MACD: {self.macd_line:.4f} | P&L: ${self.live_pnl:.2f}")
+        macd_str = f"MACD: {self.macd_line:.4f} Sig: {self.signal_line:.4f}" if self.macd_line is not None else "MACD: N/A"
+        print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT @ {price:.2f} | {macd_str} | P&L: ${self.live_pnl:.2f}")
         try:
             response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
@@ -440,26 +451,35 @@ class SymbolState:
         print(f"\n[{now}] [{self.symbol}] <<< EXITING {direction} @ {price:.2f} | Trade: ${trade_pnl:+.2f} | P&L: ${self.live_pnl:.2f} | {reason}")
 
         saved_entry_price = self.entry_price
-        old_position = self.position
         self.position = 0
         self.entry_price = 0.0
         self.entry_time = None
 
         try:
-            close_side = 1 if old_position == 1 else 0
-            response = await self.ctx.orders.place_market_order(
-                contract_id=self.ctx.instrument_info.id,
-                side=close_side,
-                size=self.qty,
+            result = await asyncio.wait_for(
+                self.ctx.positions.close_position_direct(
+                    contract_id=self.ctx.instrument_info.id,
+                ),
+                timeout=5.0,
             )
-            if response.success:
-                print(f"[{self.symbol}] Position closed. ID: {response.orderId}")
-            else:
-                print(f"[{self.symbol}] CLOSE FAILED: {response.errorMessage}")
-                return False
+            print(f"[{self.symbol}] Position closed via close_position_direct")
         except Exception as e:
-            print(f"[{self.symbol}] Close ERROR: {e}")
-            return False
+            print(f"[{self.symbol}] close_position_direct failed ({e}), using market order fallback")
+            try:
+                close_side = 1 if direction == "LONG" else 0
+                response = await self.ctx.orders.place_market_order(
+                    contract_id=self.ctx.instrument_info.id,
+                    side=close_side,
+                    size=self.qty,
+                )
+                if response.success:
+                    print(f"[{self.symbol}] Position closed (fallback). ID: {response.orderId}")
+                else:
+                    print(f"[{self.symbol}] CLOSE FAILED: {response.errorMessage}")
+                    return False
+            except Exception as e2:
+                print(f"[{self.symbol}] Close ERROR: {e2}")
+                return False
 
         self._log_trade(direction, saved_entry_price, price, trade_pnl, reason)
         return True
@@ -575,13 +595,14 @@ class RenkoBot:
         symbols = self._symbols_list()
         print(f"[BOT] Renko MACD Cross - NORMAL SIGNALS - LIVE MODE")
         print(f"[BOT] Tick interval: {self.tick_interval}s (samples price every {self.tick_interval} seconds)")
-        print(f"[BOT] MACD: ({MACD_FAST}, {MACD_SLOW}, {MACD_SIGNAL})")
+        print(f"[BOT] MACD: ({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})")
         print(f"[BOT] Symbols: {', '.join(symbols)}")
         for sym, st in self.states.items():
             print(f"[BOT]   {sym}: brick={st.brick_size}, qty={st.qty}, pv=${st.point_value}/pt" +
                   (f", ntfy={st.ntfy_topic}" if st.ntfy_topic else ""))
-        print(f"[BOT] Strategy: Renko + MACD ({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) Cross")
-        print(f"[BOT] ENTRY: MACD cross above Signal = LONG, MACD cross below Signal = SHORT")
+        print(f"[BOT] Strategy: Renko + MACD ({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) Cross + Staircase + Trailing Brick")
+        print(f"[BOT] ENTRY: MACD cross (staircase: 2nd brick confirms)")
+        print(f"[BOT] EXIT: Immediate reversal (price reverses past last brick close)")
         day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
         trading_day_str = ", ".join(day_names[d] for d in TRADING_DAYS)
         print(f"[BOT] Session: {SESSION_START.strftime('%H:%M')} - {SESSION_END.strftime('%H:%M')} ET ({trading_day_str})")
@@ -643,7 +664,7 @@ class RenkoBot:
             st.print_status()
 
         print(f"\n[BOT] Session active: {self.was_in_session}")
-        print(f"[BOT] Trading LIVE - MACD ({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) NORMAL ({', '.join(symbols)})")
+        print(f"[BOT] Trading LIVE - MACD ({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) Cross NORMAL ({', '.join(symbols)})")
         print(f"[BOT] Press Ctrl+C to stop\n")
 
         try:
@@ -688,7 +709,7 @@ class RenkoBot:
         self.last_reconnect_time = time.time()
         now = datetime.now(ET).strftime("%H:%M:%S")
         symbols = self._symbols_list()
-        print(f"[{now}] [RECONNECT] Auto-reconnecting (Renko + EMA preserved)...")
+        print(f"[{now}] [RECONNECT] Auto-reconnecting (Renko + MACD preserved)...")
         self._notify_status(f"STATUS|Auto-reconnecting ({now} ET)")
 
         if self.suite:
@@ -710,7 +731,7 @@ class RenkoBot:
             self.connection_alive = True
             self.disconnect_alert_sent = False
             now = datetime.now(ET).strftime("%H:%M:%S")
-            print(f"[{now}] [RECONNECT] WebSocket restored, Renko+EMA intact")
+            print(f"[{now}] [RECONNECT] WebSocket restored, Renko+MACD intact")
             send_telegram(self.tg_token, self.tg_chat, f"STATUS|RECONNECTED ({now} ET)")
 
             for sym, st in self.states.items():
@@ -904,7 +925,7 @@ def parse_symbol_configs(symbols_str: str) -> list:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TopstepX Renko EMA Flipped Signal Bot (Multi-Symbol)")
+    parser = argparse.ArgumentParser(description="TopstepX Renko MACD Cross Bot (Multi-Symbol)")
     parser.add_argument("--symbol", default="", help="Single symbol (backward compat)")
     parser.add_argument("--symbols", default="", help="Multi-symbol config: 'NQ:3.0:1:ntfy,ES:2.0:1'")
     parser.add_argument("--qty", type=int, default=1, help="Qty for single --symbol mode")
