@@ -2,16 +2,16 @@
 TopstepX Renko EMA Ghost Candle Cross Strategy Bot (LIVE) - NORMAL SIGNALS
 Multi-symbol support: runs multiple instruments on one connection.
 
-Strategy: 1sec Renko (bricks from candle CLOSE) + 20 EMA + Ghost Candle Cross
+Strategy: Renko (sampled every N seconds) + 20 EMA + Ghost Candle Cross
 - ENTRY: Ghost candle crosses EMA (NORMAL: above = LONG, below = SHORT)
 - EXIT: Ghost candle crosses EMA opposite direction to position
 - No trailing profit, no stop loss
 
 Usage (single symbol - backward compatible):
-    python renko_bot.py --symbol NQ --qty 1 --brick-size 3.0
+    python renko_bot.py --symbol NQ --qty 1 --brick-size 0.5
 
 Usage (multi-symbol):
-    python renko_bot.py --symbols "NQ:3.0:1:ntfy-topic,ES:2.0:1"
+    python renko_bot.py --symbols "NQ:0.5:1:ntfy-topic,ES:0.25:1" --tick-interval 10
 """
 
 import asyncio
@@ -166,7 +166,8 @@ def in_session() -> bool:
 
 class SymbolState:
     def __init__(self, symbol: str, brick_size: float, qty: int,
-                 ntfy_topic: str, tg_token: str, tg_chat: str, tg_keys: list):
+                 ntfy_topic: str, tg_token: str, tg_chat: str, tg_keys: list,
+                 tick_interval: int = 10):
         self.symbol = symbol
         self.qty = qty
         self.brick_size = brick_size
@@ -174,10 +175,11 @@ class SymbolState:
         self.tg_token = tg_token
         self.tg_chat = tg_chat
         self.tg_keys = tg_keys
+        self.tick_interval = tick_interval
+        self.last_tick_time = 0
         self.point_value = POINT_VALUES.get(symbol, 20.0)
 
         self.renko = RenkoEngine(brick_size, symbol)
-        self.last_bar_time = None
 
         self.ema_closes = []
         self.ema_9 = None
@@ -305,27 +307,25 @@ class SymbolState:
             return
 
         self.last_price = price
+
+        # Only process strategy every tick_interval seconds
+        now_ts = time.time()
+        if now_ts - self.last_tick_time < self.tick_interval:
+            return True
+        self.last_tick_time = now_ts
+        self.last_new_bar_time = now_ts
+
         now = datetime.now(ET).strftime("%H:%M:%S")
 
-        data_1s = await self.ctx.data.get_data("1sec", bars=1)
-        if data_1s is not None and len(data_1s) > 0:
-            rows = list(data_1s.iter_rows(named=True))
-            last_row = rows[-1]
-            bar_time = last_row.get("timestamp") or last_row.get("time")
-
-            if bar_time != self.last_bar_time:
-                self.last_bar_time = bar_time
-                self.last_new_bar_time = time.time()
-                close_1s = float(last_row["close"])
-
-                bricks = self.renko.feed_close(close_1s)
-                if bricks:
-                    for b in bricks:
-                        color = "BULLISH" if b[2] == 1 else "BEARISH"
-                        self.ema_closes.append(b[1])
-                        self._calc_ema()
-                        ema_str = f" | EMA-{EMA_PERIOD}: {self.ema_9:.2f}" if self.ema_9 else ""
-                        print(f"[{now}] [{self.symbol} RENKO] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f}{ema_str}")
+        # Feed current price into Renko at each interval
+        bricks = self.renko.feed_close(price)
+        if bricks:
+            for b in bricks:
+                color = "BULLISH" if b[2] == 1 else "BEARISH"
+                self.ema_closes.append(b[1])
+                self._calc_ema()
+                ema_str = f" | EMA-{EMA_PERIOD}: {self.ema_9:.2f}" if self.ema_9 else ""
+                print(f"[{now}] [{self.symbol} RENKO] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f}{ema_str}")
 
         if self.ema_9 is None:
             return
@@ -484,10 +484,11 @@ class SymbolState:
 
 class RenkoBot:
     def __init__(self, symbol_configs: list, tg_token: str = "", tg_chat: str = "",
-                 tg_keys: list = None):
+                 tg_keys: list = None, tick_interval: int = 10):
         self.tg_token = tg_token
         self.tg_chat = tg_chat
         self.tg_keys = tg_keys or []
+        self.tick_interval = tick_interval
 
         self.states = {}
         for cfg in symbol_configs:
@@ -500,6 +501,7 @@ class RenkoBot:
                 tg_token=tg_token,
                 tg_chat=tg_chat,
                 tg_keys=self.tg_keys,
+                tick_interval=tick_interval,
             )
             self.states[sym] = state
 
@@ -561,6 +563,7 @@ class RenkoBot:
 
         symbols = self._symbols_list()
         print(f"[BOT] Renko {EMA_PERIOD} EMA Ghost Candle Cross - NORMAL SIGNALS - LIVE MODE")
+        print(f"[BOT] Tick interval: {self.tick_interval}s (samples price every {self.tick_interval} seconds)")
         print(f"[BOT] Symbols: {', '.join(symbols)}")
         for sym, st in self.states.items():
             print(f"[BOT]   {sym}: brick={st.brick_size}, qty={st.qty}, pv=${st.point_value}/pt" +
@@ -898,6 +901,7 @@ def main():
     parser.add_argument("--tg-chat", default="", help="Telegram chat ID")
     parser.add_argument("--tg-keys", default="", help="Comma-separated passkeys")
     parser.add_argument("--ntfy-topic", default="", help="ntfy.sh topic (single --symbol mode)")
+    parser.add_argument("--tick-interval", type=int, default=10, help="Seconds between price samples (default: 10)")
     args = parser.parse_args()
 
     keys = [k.strip() for k in args.tg_keys.split(",") if k.strip()] if args.tg_keys else []
@@ -946,6 +950,7 @@ def main():
             tg_token=args.tg_token,
             tg_chat=args.tg_chat,
             tg_keys=keys,
+            tick_interval=args.tick_interval,
         )
         current_bot = bot
 
