@@ -1,14 +1,14 @@
 """
-TopstepX Renko AO+Stoch+RSI Strategy Bot (LIVE)
+TopstepX Renko AO Color Strategy Bot (LIVE)
 Multi-symbol support: runs multiple instruments on one connection.
 
-Strategy: Renko + Awesome Oscillator + Stochastic + RSI (Buy&Sell Strategy)
-- LONG: Stoch K < 20 AND RSI < 30 AND AO rising
-- SHORT: Stoch K > 80 AND RSI > 70 AND AO falling
-- EXIT: ATR-based TP/SL (ATR = brick_size)
+Strategy: Renko + Awesome Oscillator Histogram Color
+- LONG when AO histogram turns GREEN (AO rising)
+- SHORT when AO histogram turns RED (AO falling)
+- EXIT: Flip on AO color change (no TP/SL)
 
 Usage:
-    python renko_bot.py --symbols "NQ:3:1:ntfy-topic" --tick-interval 1
+    python renko_bot.py --symbols "NQ:1:1:ntfy-topic" --tick-interval 1
 """
 
 import asyncio
@@ -136,10 +136,6 @@ TRADING_DAYS = [0, 1, 2, 3, 4, 6]
 
 AO_FAST = 5
 AO_SLOW = 34
-STOCH_K = 14
-STOCH_D = 3
-STOCH_SMOOTH = 3
-RSI_PERIOD = 10
 
 POINT_VALUES = {
     "NQ": 20.0,
@@ -189,13 +185,8 @@ class SymbolState:
 
         self.ao = None
         self.prev_ao = None
-        self.stoch_k = None
-        self.rsi = None
-        self.avg_gain = None
-        self.avg_loss = None
-
-        self.stop_loss = None
-        self.take_profit = None
+        self.ao_color = None  # "GREEN" or "RED"
+        self.prev_ao_color = None
 
         self.last_price = 0.0
 
@@ -219,16 +210,15 @@ class SymbolState:
             "brick_highs": self.brick_highs[-100:],
             "brick_lows": self.brick_lows[-100:],
             "brick_hl2s": self.brick_hl2s[-100:],
-            "avg_gain": self.avg_gain,
-            "avg_loss": self.avg_loss,
+            "ao": self.ao,
+            "prev_ao": self.prev_ao,
+            "ao_color": self.ao_color,
             "last_price": self.last_price,
             "renko_last_close": self.renko.last_close,
             "renko_direction": self.renko.direction,
             "renko_brick_count": self.renko.brick_count,
             "position": self.position,
             "entry_price": self.entry_price,
-            "stop_loss": self.stop_loss,
-            "take_profit": self.take_profit,
             "live_pnl": self.live_pnl,
             "saved_at": time.time(),
         }
@@ -240,16 +230,15 @@ class SymbolState:
         self.brick_highs = state.get("brick_highs", [])
         self.brick_lows = state.get("brick_lows", [])
         self.brick_hl2s = state.get("brick_hl2s", [])
-        self.avg_gain = state.get("avg_gain")
-        self.avg_loss = state.get("avg_loss")
+        self.ao = state.get("ao")
+        self.prev_ao = state.get("prev_ao")
+        self.ao_color = state.get("ao_color")
         self.last_price = state.get("last_price", 0.0)
         self.renko.last_close = state.get("renko_last_close")
         self.renko.direction = state.get("renko_direction", 0)
         self.renko.brick_count = state.get("renko_brick_count", 0)
         self.position = state.get("position", 0)
         self.entry_price = state.get("entry_price", 0.0)
-        self.stop_loss = state.get("stop_loss")
-        self.take_profit = state.get("take_profit")
         self.live_pnl = state.get("live_pnl", 0.0)
         return True
 
@@ -266,50 +255,13 @@ class SymbolState:
         if n != len(self.brick_highs):
             return
         self.prev_ao = self.ao
+        self.prev_ao_color = self.ao_color
         if n >= AO_SLOW:
             fast_sma = sum(self.brick_hl2s[-AO_FAST:]) / AO_FAST
             slow_sma = sum(self.brick_hl2s[-AO_SLOW:]) / AO_SLOW
             self.ao = (fast_sma - slow_sma) * 1000
-        if n >= STOCH_K and len(self.brick_highs) >= STOCH_K:
-            raw_stochs = []
-            need = STOCH_K + STOCH_D - 1
-            hn = len(self.brick_highs)
-            start = max(0, hn - need)
-            for i in range(start, hn):
-                lo = min(self.brick_lows[max(0, i - STOCH_K + 1):i + 1])
-                hi = max(self.brick_highs[max(0, i - STOCH_K + 1):i + 1])
-                if hi == lo:
-                    raw_stochs.append(50.0)
-                else:
-                    raw_stochs.append((self.brick_closes[i] - lo) / (hi - lo) * 100.0)
-            if len(raw_stochs) >= STOCH_D:
-                k_values = []
-                for i in range(STOCH_D - 1, len(raw_stochs)):
-                    k_values.append(sum(raw_stochs[i - STOCH_D + 1:i + 1]) / STOCH_D)
-                self.stoch_k = k_values[-1] if k_values else None
-        if n >= RSI_PERIOD + 1:
-            if self.avg_gain is None:
-                gains = []
-                losses = []
-                for i in range(1, RSI_PERIOD + 1):
-                    change = self.brick_closes[i] - self.brick_closes[i - 1]
-                    gains.append(max(change, 0))
-                    losses.append(max(-change, 0))
-                self.avg_gain = sum(gains) / RSI_PERIOD
-                self.avg_loss = sum(losses) / RSI_PERIOD
-                for i in range(RSI_PERIOD + 1, n):
-                    change = self.brick_closes[i] - self.brick_closes[i - 1]
-                    self.avg_gain = (self.avg_gain * (RSI_PERIOD - 1) + max(change, 0)) / RSI_PERIOD
-                    self.avg_loss = (self.avg_loss * (RSI_PERIOD - 1) + max(-change, 0)) / RSI_PERIOD
-            else:
-                change = self.brick_closes[-1] - self.brick_closes[-2]
-                self.avg_gain = (self.avg_gain * (RSI_PERIOD - 1) + max(change, 0)) / RSI_PERIOD
-                self.avg_loss = (self.avg_loss * (RSI_PERIOD - 1) + max(-change, 0)) / RSI_PERIOD
-            if self.avg_loss == 0:
-                self.rsi = 100.0
-            else:
-                rs = self.avg_gain / self.avg_loss
-                self.rsi = 100.0 - (100.0 / (1.0 + rs))
+            if self.prev_ao is not None:
+                self.ao_color = "GREEN" if self.ao > self.prev_ao else "RED"
 
     async def seed_history(self):
         data = await self.ctx.data.get_data("1sec", bars=800)
@@ -324,28 +276,24 @@ class SymbolState:
         self.brick_highs = []
         self.brick_lows = []
         self.brick_hl2s = []
-        self.avg_gain = None
-        self.avg_loss = None
         self.ao = None
         self.prev_ao = None
-        self.stoch_k = None
-        self.rsi = None
+        self.ao_color = None
+        self.prev_ao_color = None
 
         for row in rows:
             close = float(row["close"])
             bricks = self.renko.feed_close(close)
             for brick in bricks:
                 self._add_brick_data(brick[0], brick[1])
-
-        self._calc_indicators()
+                self._calc_indicators()
 
         dir_str = "BULLISH" if self.renko.direction == 1 else "BEARISH" if self.renko.direction == -1 else "NONE"
         print(f"  [{self.symbol}] Renko: {self.renko.brick_count} bricks, {dir_str}, ref={self.renko.last_close:.2f}")
         print(f"  [{self.symbol}] Data: {len(self.brick_closes)} brick closes")
         ao_str = f"{self.ao:.2f}" if self.ao is not None else "N/A"
-        k_str = f"{self.stoch_k:.2f}" if self.stoch_k is not None else "N/A"
-        rsi_str = f"{self.rsi:.2f}" if self.rsi is not None else "N/A"
-        print(f"  [{self.symbol}] AO: {ao_str} | Stoch K: {k_str} | RSI: {rsi_str}")
+        color_str = self.ao_color or "N/A"
+        print(f"  [{self.symbol}] AO: {ao_str} | Color: {color_str}")
 
     def print_status(self):
         now = datetime.now(ET).strftime("%H:%M:%S")
@@ -355,9 +303,8 @@ class SymbolState:
         print(f"  [{self.symbol} @ {now}]")
         print(f"    Renko: {dir_str} | last_close={self.renko.last_close:.2f} | bricks={self.renko.brick_count}")
         ao_str = f"{self.ao:.2f}" if self.ao is not None else "N/A"
-        k_str = f"{self.stoch_k:.2f}" if self.stoch_k is not None else "N/A"
-        rsi_str = f"{self.rsi:.2f}" if self.rsi is not None else "N/A"
-        print(f"    AO: {ao_str} | Stoch K: {k_str} | RSI: {rsi_str}")
+        color_str = self.ao_color or "N/A"
+        print(f"    AO: {ao_str} | Color: {color_str}")
         print(f"    Position: {pos_str} | P&L: ${self.live_pnl:.2f} | PV: ${self.point_value}/pt")
 
     def is_data_stale(self, threshold=120):
@@ -375,44 +322,6 @@ class SymbolState:
             return
 
         self.last_price = price
-        now = datetime.now(ET).strftime("%H:%M:%S")
-
-        # Check TP/SL every tick (0.5s)
-        if self.position != 0 and self.stop_loss is not None and self.take_profit is not None:
-            if self.position == 1:
-                if price <= self.stop_loss:
-                    pnl = (price - self.entry_price) * self.point_value * self.qty
-                    print(f"[{now}] [{self.symbol} STOP LOSS] Price {price:.2f} hit SL {self.stop_loss:.2f} | P&L: ${pnl:+.2f}")
-                    await self._flatten(price, reason="STOP_LOSS")
-                    threading.Thread(target=send_signals, args=(
-                        self.tg_token, self.tg_chat, self.tg_keys,
-                        "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-                    return True
-                elif price >= self.take_profit:
-                    pnl = (price - self.entry_price) * self.point_value * self.qty
-                    print(f"[{now}] [{self.symbol} TAKE PROFIT] Price {price:.2f} hit TP {self.take_profit:.2f} | P&L: ${pnl:+.2f}")
-                    await self._flatten(price, reason="TAKE_PROFIT")
-                    threading.Thread(target=send_signals, args=(
-                        self.tg_token, self.tg_chat, self.tg_keys,
-                        "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-                    return True
-            elif self.position == -1:
-                if price >= self.stop_loss:
-                    pnl = (self.entry_price - price) * self.point_value * self.qty
-                    print(f"[{now}] [{self.symbol} STOP LOSS] Price {price:.2f} hit SL {self.stop_loss:.2f} | P&L: ${pnl:+.2f}")
-                    await self._flatten(price, reason="STOP_LOSS")
-                    threading.Thread(target=send_signals, args=(
-                        self.tg_token, self.tg_chat, self.tg_keys,
-                        "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-                    return True
-                elif price <= self.take_profit:
-                    pnl = (self.entry_price - price) * self.point_value * self.qty
-                    print(f"[{now}] [{self.symbol} TAKE PROFIT] Price {price:.2f} hit TP {self.take_profit:.2f} | P&L: ${pnl:+.2f}")
-                    await self._flatten(price, reason="TAKE_PROFIT")
-                    threading.Thread(target=send_signals, args=(
-                        self.tg_token, self.tg_chat, self.tg_keys,
-                        "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-                    return True
 
         # Feed Renko bricks every tick_interval
         now_ts = time.time()
@@ -425,52 +334,47 @@ class SymbolState:
         if not bricks:
             return True
 
+        now = datetime.now(ET).strftime("%H:%M:%S")
+
         for b in bricks:
             brick_dir = b[2]
-            color = "BULLISH" if brick_dir == 1 else "BEARISH"
+            brick_color = "BULLISH" if brick_dir == 1 else "BEARISH"
             self._add_brick_data(b[0], b[1])
             self._calc_indicators()
 
-            ind_str = ""
-            if self.ao is not None:
-                ind_str += f" | AO: {self.ao:.1f}"
-            if self.stoch_k is not None:
-                ind_str += f" K: {self.stoch_k:.1f}"
-            if self.rsi is not None:
-                ind_str += f" RSI: {self.rsi:.1f}"
-            print(f"[{now}] [{self.symbol} RENKO] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f}{ind_str}")
+            ao_str = f"AO: {self.ao:.1f}" if self.ao is not None else "AO: N/A"
+            color_str = f"[{self.ao_color}]" if self.ao_color else ""
+            print(f"[{now}] [{self.symbol} RENKO] {brick_color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | {ao_str} {color_str}")
 
-            if self.position != 0:
+            if self.ao_color is None:
                 continue
 
-            if self.ao is None or self.prev_ao is None or self.stoch_k is None or self.rsi is None:
-                continue
-
-            # LONG: Stoch K < 20 AND RSI < 30 AND AO rising
-            if self.stoch_k < 20 and self.rsi < 30 and self.ao > self.prev_ao:
-                atr = self.brick_size
-                sl = price - atr
-                tp = price + atr
-                print(f"[{now}] [{self.symbol} SIGNAL] LONG | K={self.stoch_k:.1f}<20 RSI={self.rsi:.1f}<30 AO rising | SL={sl:.2f} TP={tp:.2f}")
-                self.stop_loss = sl
-                self.take_profit = tp
+            # Follow AO color: GREEN = LONG, RED = SHORT
+            if self.ao_color == "GREEN" and self.position != 1:
+                if self.position == -1:
+                    print(f"[{now}] [{self.symbol} FLIP] AO -> GREEN | Closing SHORT")
+                    await self._flatten(price, reason="AO_FLIP_GREEN")
+                    threading.Thread(target=send_signals, args=(
+                        self.tg_token, self.tg_chat, self.tg_keys,
+                        "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+                print(f"[{now}] [{self.symbol} SIGNAL] LONG | AO GREEN (rising)")
                 await self._enter_long(price)
 
-            # SHORT: Stoch K > 80 AND RSI > 70 AND AO falling
-            elif self.stoch_k > 80 and self.rsi > 70 and self.ao < self.prev_ao:
-                atr = self.brick_size
-                sl = price + atr
-                tp = price - atr
-                print(f"[{now}] [{self.symbol} SIGNAL] SHORT | K={self.stoch_k:.1f}>80 RSI={self.rsi:.1f}>70 AO falling | SL={sl:.2f} TP={tp:.2f}")
-                self.stop_loss = sl
-                self.take_profit = tp
+            elif self.ao_color == "RED" and self.position != -1:
+                if self.position == 1:
+                    print(f"[{now}] [{self.symbol} FLIP] AO -> RED | Closing LONG")
+                    await self._flatten(price, reason="AO_FLIP_RED")
+                    threading.Thread(target=send_signals, args=(
+                        self.tg_token, self.tg_chat, self.tg_keys,
+                        "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+                print(f"[{now}] [{self.symbol} SIGNAL] SHORT | AO RED (falling)")
                 await self._enter_short(price)
 
         return True
 
     async def _enter_long(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG @ {price:.2f} | SL={self.stop_loss:.2f} TP={self.take_profit:.2f} | P&L: ${self.live_pnl:.2f}")
+        print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG @ {price:.2f} | P&L: ${self.live_pnl:.2f}")
         try:
             response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
@@ -495,7 +399,7 @@ class SymbolState:
 
     async def _enter_short(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT @ {price:.2f} | SL={self.stop_loss:.2f} TP={self.take_profit:.2f} | P&L: ${self.live_pnl:.2f}")
+        print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT @ {price:.2f} | P&L: ${self.live_pnl:.2f}")
         try:
             response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
@@ -530,8 +434,6 @@ class SymbolState:
         self.position = 0
         self.entry_price = 0.0
         self.entry_time = None
-        self.stop_loss = None
-        self.take_profit = None
 
         try:
             result = await asyncio.wait_for(
@@ -575,8 +477,7 @@ class SymbolState:
             "pnl": pnl,
             "reason": reason,
             "ao": self.ao,
-            "stoch_k": self.stoch_k,
-            "rsi": self.rsi,
+            "ao_color": self.ao_color,
             "account": os.environ.get("PROJECT_X_ACCOUNT_NAME", "unknown"),
             "session_pnl": self.live_pnl,
         }
@@ -671,15 +572,15 @@ class RenkoBot:
         from project_x_py import TradingSuite
 
         symbols = self._symbols_list()
-        print(f"[BOT] Renko AO+Stoch+RSI Strategy - LIVE MODE")
+        print(f"[BOT] Renko AO Color Strategy - LIVE MODE")
         print(f"[BOT] Tick interval: {self.tick_interval}s (samples price every {self.tick_interval} seconds)")
-        print(f"[BOT] AO({AO_FAST},{AO_SLOW}) | Stoch({STOCH_K},{STOCH_D},{STOCH_SMOOTH}) | RSI({RSI_PERIOD})")
+        print(f"[BOT] AO({AO_FAST},{AO_SLOW})")
         print(f"[BOT] Symbols: {', '.join(symbols)}")
         for sym, st in self.states.items():
             print(f"[BOT]   {sym}: brick={st.brick_size}, qty={st.qty}, pv=${st.point_value}/pt" +
                   (f", ntfy={st.ntfy_topic}" if st.ntfy_topic else ""))
-        print(f"[BOT] LONG: K<20 + RSI<30 + AO rising | SHORT: K>80 + RSI>70 + AO falling")
-        print(f"[BOT] EXIT: ATR-based TP/SL (ATR = brick_size)")
+        print(f"[BOT] LONG: AO histogram GREEN (rising) | SHORT: AO histogram RED (falling)")
+        print(f"[BOT] EXIT: Flip on AO color change (no TP/SL)")
         day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
         trading_day_str = ", ".join(day_names[d] for d in TRADING_DAYS)
         print(f"[BOT] Session: {SESSION_START.strftime('%H:%M')} - {SESSION_END.strftime('%H:%M')} ET ({trading_day_str})")
@@ -741,7 +642,7 @@ class RenkoBot:
             st.print_status()
 
         print(f"\n[BOT] Session active: {self.was_in_session}")
-        print(f"[BOT] Trading LIVE - AO+Stoch+RSI ({', '.join(symbols)})")
+        print(f"[BOT] Trading LIVE - AO Color ({', '.join(symbols)})")
         print(f"[BOT] Press Ctrl+C to stop\n")
 
         try:
@@ -1002,11 +903,11 @@ def parse_symbol_configs(symbols_str: str) -> list:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TopstepX Renko AO+Stoch+RSI Bot (Multi-Symbol)")
+    parser = argparse.ArgumentParser(description="TopstepX Renko AO Color Bot (Multi-Symbol)")
     parser.add_argument("--symbol", default="", help="Single symbol (backward compat)")
     parser.add_argument("--symbols", default="", help="Multi-symbol config: 'NQ:3.0:1:ntfy,ES:2.0:1'")
     parser.add_argument("--qty", type=int, default=1, help="Qty for single --symbol mode")
-    parser.add_argument("--brick-size", type=float, default=3.0, help="Brick size for single --symbol mode")
+    parser.add_argument("--brick-size", type=float, default=1.0, help="Brick size for single --symbol mode")
     parser.add_argument("--tg-token", default="", help="Telegram bot token")
     parser.add_argument("--tg-chat", default="", help="Telegram chat ID")
     parser.add_argument("--tg-keys", default="", help="Comma-separated passkeys")
@@ -1026,7 +927,7 @@ def main():
             "ntfy_topic": args.ntfy_topic,
         }]
     else:
-        symbol_configs = [{"symbol": "NQ", "brick_size": 3.0, "qty": 1, "ntfy_topic": ""}]
+        symbol_configs = [{"symbol": "NQ", "brick_size": 1.0, "qty": 1, "ntfy_topic": ""}]
 
     stopped = False
     retry_delay = 30
