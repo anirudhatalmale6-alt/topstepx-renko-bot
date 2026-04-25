@@ -1,13 +1,14 @@
 """
-TopstepX Renko MACD Cross Strategy Bot (LIVE) - NORMAL SIGNALS
+TopstepX Renko AO+Stoch+RSI Strategy Bot (LIVE)
 Multi-symbol support: runs multiple instruments on one connection.
 
-Strategy: Renko (sampled every N seconds) + MACD (12,26,9) Cross + Staircase Entry + Trailing Brick Exit
-- ENTRY: MACD crosses signal (staircase: 1st brick sets pending, 2nd same-direction confirms)
-- EXIT: Immediate reversal detection (price drops below last brick close for LONG, rises above for SHORT)
+Strategy: Renko + Awesome Oscillator + Stochastic + RSI (Buy&Sell Strategy)
+- LONG: Stoch K < 20 AND RSI < 30 AND AO rising
+- SHORT: Stoch K > 80 AND RSI > 70 AND AO falling
+- EXIT: ATR-based TP/SL (ATR = brick_size)
 
-Usage (multi-symbol):
-    python renko_bot.py --symbols "NQ:3:1:ntfy-topic" --tick-interval 15
+Usage:
+    python renko_bot.py --symbols "NQ:3:1:ntfy-topic" --tick-interval 1
 """
 
 import asyncio
@@ -133,9 +134,12 @@ SESSION_END = dtime(16, 0)
 
 TRADING_DAYS = [0, 1, 2, 3, 4, 6]
 
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
+AO_FAST = 5
+AO_SLOW = 34
+STOCH_K = 14
+STOCH_D = 3
+STOCH_SMOOTH = 3
+RSI_PERIOD = 10
 
 POINT_VALUES = {
     "NQ": 20.0,
@@ -179,16 +183,21 @@ class SymbolState:
         self.renko = RenkoEngine(brick_size, symbol)
 
         self.brick_closes = []
-        self.ema_fast = None
-        self.ema_slow = None
-        self.macd_line = None
-        self.signal_line = None
-        self.prev_macd = None
-        self.prev_signal = None
+        self.brick_highs = []
+        self.brick_lows = []
+        self.brick_hl2s = []
+
+        self.ao = None
+        self.prev_ao = None
+        self.stoch_k = None
+        self.rsi = None
+        self.avg_gain = None
+        self.avg_loss = None
+
+        self.stop_loss = None
+        self.take_profit = None
 
         self.last_price = 0.0
-        self.pending_entry_dir = 0  # 1=pending LONG, -1=pending SHORT
-        self.last_brick_close = None  # track last brick close for immediate reversal detection
 
         self.position = 0
         self.entry_price = 0.0
@@ -207,18 +216,19 @@ class SymbolState:
         return {
             "symbol": self.symbol,
             "brick_closes": self.brick_closes[-100:],
-            "ema_fast": self.ema_fast,
-            "ema_slow": self.ema_slow,
-            "macd_line": self.macd_line,
-            "signal_line": self.signal_line,
-            "prev_macd": self.prev_macd,
-            "prev_signal": self.prev_signal,
+            "brick_highs": self.brick_highs[-100:],
+            "brick_lows": self.brick_lows[-100:],
+            "brick_hl2s": self.brick_hl2s[-100:],
+            "avg_gain": self.avg_gain,
+            "avg_loss": self.avg_loss,
             "last_price": self.last_price,
             "renko_last_close": self.renko.last_close,
             "renko_direction": self.renko.direction,
             "renko_brick_count": self.renko.brick_count,
             "position": self.position,
             "entry_price": self.entry_price,
+            "stop_loss": self.stop_loss,
+            "take_profit": self.take_profit,
             "live_pnl": self.live_pnl,
             "saved_at": time.time(),
         }
@@ -227,45 +237,79 @@ class SymbolState:
         if time.time() - state.get("saved_at", 0) > 600:
             return False
         self.brick_closes = state.get("brick_closes", [])
-        self.ema_fast = state.get("ema_fast")
-        self.ema_slow = state.get("ema_slow")
-        self.macd_line = state.get("macd_line")
-        self.signal_line = state.get("signal_line")
-        self.prev_macd = state.get("prev_macd")
-        self.prev_signal = state.get("prev_signal")
+        self.brick_highs = state.get("brick_highs", [])
+        self.brick_lows = state.get("brick_lows", [])
+        self.brick_hl2s = state.get("brick_hl2s", [])
+        self.avg_gain = state.get("avg_gain")
+        self.avg_loss = state.get("avg_loss")
         self.last_price = state.get("last_price", 0.0)
         self.renko.last_close = state.get("renko_last_close")
         self.renko.direction = state.get("renko_direction", 0)
         self.renko.brick_count = state.get("renko_brick_count", 0)
         self.position = state.get("position", 0)
         self.entry_price = state.get("entry_price", 0.0)
+        self.stop_loss = state.get("stop_loss")
+        self.take_profit = state.get("take_profit")
         self.live_pnl = state.get("live_pnl", 0.0)
         return True
 
-    def _calc_macd(self):
-        if len(self.brick_closes) < MACD_SLOW:
-            return
-        fast_mult = 2.0 / (MACD_FAST + 1)
-        slow_mult = 2.0 / (MACD_SLOW + 1)
-        sig_mult = 2.0 / (MACD_SIGNAL + 1)
+    def _add_brick_data(self, brick_open, brick_close):
+        h = max(brick_open, brick_close)
+        l = min(brick_open, brick_close)
+        self.brick_closes.append(brick_close)
+        self.brick_highs.append(h)
+        self.brick_lows.append(l)
+        self.brick_hl2s.append((h + l) / 2.0)
 
-        if self.ema_fast is None:
-            self.ema_fast = sum(self.brick_closes[:MACD_FAST]) / MACD_FAST
-            for c in self.brick_closes[MACD_FAST:]:
-                self.ema_fast = c * fast_mult + self.ema_fast * (1 - fast_mult)
-            self.ema_slow = sum(self.brick_closes[:MACD_SLOW]) / MACD_SLOW
-            for c in self.brick_closes[MACD_SLOW:]:
-                self.ema_slow = c * slow_mult + self.ema_slow * (1 - slow_mult)
-            self.macd_line = self.ema_fast - self.ema_slow
-            self.signal_line = self.macd_line
-        else:
-            self.prev_macd = self.macd_line
-            self.prev_signal = self.signal_line
-            latest = self.brick_closes[-1]
-            self.ema_fast = latest * fast_mult + self.ema_fast * (1 - fast_mult)
-            self.ema_slow = latest * slow_mult + self.ema_slow * (1 - slow_mult)
-            self.macd_line = self.ema_fast - self.ema_slow
-            self.signal_line = self.macd_line * sig_mult + self.signal_line * (1 - sig_mult)
+    def _calc_indicators(self):
+        n = len(self.brick_closes)
+        if n != len(self.brick_highs):
+            return
+        self.prev_ao = self.ao
+        if n >= AO_SLOW:
+            fast_sma = sum(self.brick_hl2s[-AO_FAST:]) / AO_FAST
+            slow_sma = sum(self.brick_hl2s[-AO_SLOW:]) / AO_SLOW
+            self.ao = (fast_sma - slow_sma) * 1000
+        if n >= STOCH_K and len(self.brick_highs) >= STOCH_K:
+            raw_stochs = []
+            need = STOCH_K + STOCH_D - 1
+            hn = len(self.brick_highs)
+            start = max(0, hn - need)
+            for i in range(start, hn):
+                lo = min(self.brick_lows[max(0, i - STOCH_K + 1):i + 1])
+                hi = max(self.brick_highs[max(0, i - STOCH_K + 1):i + 1])
+                if hi == lo:
+                    raw_stochs.append(50.0)
+                else:
+                    raw_stochs.append((self.brick_closes[i] - lo) / (hi - lo) * 100.0)
+            if len(raw_stochs) >= STOCH_D:
+                k_values = []
+                for i in range(STOCH_D - 1, len(raw_stochs)):
+                    k_values.append(sum(raw_stochs[i - STOCH_D + 1:i + 1]) / STOCH_D)
+                self.stoch_k = k_values[-1] if k_values else None
+        if n >= RSI_PERIOD + 1:
+            if self.avg_gain is None:
+                gains = []
+                losses = []
+                for i in range(1, RSI_PERIOD + 1):
+                    change = self.brick_closes[i] - self.brick_closes[i - 1]
+                    gains.append(max(change, 0))
+                    losses.append(max(-change, 0))
+                self.avg_gain = sum(gains) / RSI_PERIOD
+                self.avg_loss = sum(losses) / RSI_PERIOD
+                for i in range(RSI_PERIOD + 1, n):
+                    change = self.brick_closes[i] - self.brick_closes[i - 1]
+                    self.avg_gain = (self.avg_gain * (RSI_PERIOD - 1) + max(change, 0)) / RSI_PERIOD
+                    self.avg_loss = (self.avg_loss * (RSI_PERIOD - 1) + max(-change, 0)) / RSI_PERIOD
+            else:
+                change = self.brick_closes[-1] - self.brick_closes[-2]
+                self.avg_gain = (self.avg_gain * (RSI_PERIOD - 1) + max(change, 0)) / RSI_PERIOD
+                self.avg_loss = (self.avg_loss * (RSI_PERIOD - 1) + max(-change, 0)) / RSI_PERIOD
+            if self.avg_loss == 0:
+                self.rsi = 100.0
+            else:
+                rs = self.avg_gain / self.avg_loss
+                self.rsi = 100.0 - (100.0 / (1.0 + rs))
 
     async def seed_history(self):
         data = await self.ctx.data.get_data("1sec", bars=800)
@@ -276,22 +320,32 @@ class SymbolState:
         rows = list(data.iter_rows(named=True))
         print(f"[{self.symbol}] Seeding from {len(rows)} historical 1sec bars...")
 
+        self.brick_closes = []
+        self.brick_highs = []
+        self.brick_lows = []
+        self.brick_hl2s = []
+        self.avg_gain = None
+        self.avg_loss = None
+        self.ao = None
+        self.prev_ao = None
+        self.stoch_k = None
+        self.rsi = None
+
         for row in rows:
             close = float(row["close"])
             bricks = self.renko.feed_close(close)
             for brick in bricks:
-                self.brick_closes.append(brick[1])
+                self._add_brick_data(brick[0], brick[1])
 
-        if len(self.brick_closes) >= MACD_SLOW:
-            self._calc_macd()
+        self._calc_indicators()
 
         dir_str = "BULLISH" if self.renko.direction == 1 else "BEARISH" if self.renko.direction == -1 else "NONE"
         print(f"  [{self.symbol}] Renko: {self.renko.brick_count} bricks, {dir_str}, ref={self.renko.last_close:.2f}")
-        print(f"  [{self.symbol}] MACD data: {len(self.brick_closes)} brick closes")
-        if self.macd_line is not None:
-            print(f"  [{self.symbol}] MACD: {self.macd_line:.4f} | Signal: {self.signal_line:.4f}")
-        else:
-            print(f"  [{self.symbol}] MACD: not enough data yet (need {MACD_SLOW} bricks)")
+        print(f"  [{self.symbol}] Data: {len(self.brick_closes)} brick closes")
+        ao_str = f"{self.ao:.2f}" if self.ao is not None else "N/A"
+        k_str = f"{self.stoch_k:.2f}" if self.stoch_k is not None else "N/A"
+        rsi_str = f"{self.rsi:.2f}" if self.rsi is not None else "N/A"
+        print(f"  [{self.symbol}] AO: {ao_str} | Stoch K: {k_str} | RSI: {rsi_str}")
 
     def print_status(self):
         now = datetime.now(ET).strftime("%H:%M:%S")
@@ -300,10 +354,10 @@ class SymbolState:
 
         print(f"  [{self.symbol} @ {now}]")
         print(f"    Renko: {dir_str} | last_close={self.renko.last_close:.2f} | bricks={self.renko.brick_count}")
-        if self.macd_line is not None:
-            print(f"    MACD: {self.macd_line:.4f} | Signal: {self.signal_line:.4f}")
-        else:
-            print(f"    MACD: waiting ({len(self.brick_closes)}/{MACD_SLOW} bricks)")
+        ao_str = f"{self.ao:.2f}" if self.ao is not None else "N/A"
+        k_str = f"{self.stoch_k:.2f}" if self.stoch_k is not None else "N/A"
+        rsi_str = f"{self.rsi:.2f}" if self.rsi is not None else "N/A"
+        print(f"    AO: {ao_str} | Stoch K: {k_str} | RSI: {rsi_str}")
         print(f"    Position: {pos_str} | P&L: ${self.live_pnl:.2f} | PV: ${self.point_value}/pt")
 
     def is_data_stale(self, threshold=120):
@@ -321,22 +375,44 @@ class SymbolState:
             return
 
         self.last_price = price
-
         now = datetime.now(ET).strftime("%H:%M:%S")
 
-        # Trail by brick: exit immediately if price starts forming opposite color
-        if self.position != 0 and self.last_brick_close is not None:
-            if (self.position == 1 and price < self.last_brick_close) or \
-               (self.position == -1 and price > self.last_brick_close):
-                unrealized = (price - self.entry_price) * self.position * self.point_value * self.qty
-                dir_str = "dropped below" if self.position == 1 else "rose above"
-                print(f"[{now}] [{self.symbol} REVERSAL START] Price {price:.2f} {dir_str} last brick {self.last_brick_close:.2f} | P&L: ${unrealized:+.2f} - exiting")
-                await self._flatten(price, reason="REVERSAL_START")
-                self.pending_entry_dir = 0
-                threading.Thread(target=send_signals, args=(
-                    self.tg_token, self.tg_chat, self.tg_keys,
-                    "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-                return True
+        # Check TP/SL every tick (0.5s)
+        if self.position != 0 and self.stop_loss is not None and self.take_profit is not None:
+            if self.position == 1:
+                if price <= self.stop_loss:
+                    pnl = (price - self.entry_price) * self.point_value * self.qty
+                    print(f"[{now}] [{self.symbol} STOP LOSS] Price {price:.2f} hit SL {self.stop_loss:.2f} | P&L: ${pnl:+.2f}")
+                    await self._flatten(price, reason="STOP_LOSS")
+                    threading.Thread(target=send_signals, args=(
+                        self.tg_token, self.tg_chat, self.tg_keys,
+                        "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+                    return True
+                elif price >= self.take_profit:
+                    pnl = (price - self.entry_price) * self.point_value * self.qty
+                    print(f"[{now}] [{self.symbol} TAKE PROFIT] Price {price:.2f} hit TP {self.take_profit:.2f} | P&L: ${pnl:+.2f}")
+                    await self._flatten(price, reason="TAKE_PROFIT")
+                    threading.Thread(target=send_signals, args=(
+                        self.tg_token, self.tg_chat, self.tg_keys,
+                        "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+                    return True
+            elif self.position == -1:
+                if price >= self.stop_loss:
+                    pnl = (self.entry_price - price) * self.point_value * self.qty
+                    print(f"[{now}] [{self.symbol} STOP LOSS] Price {price:.2f} hit SL {self.stop_loss:.2f} | P&L: ${pnl:+.2f}")
+                    await self._flatten(price, reason="STOP_LOSS")
+                    threading.Thread(target=send_signals, args=(
+                        self.tg_token, self.tg_chat, self.tg_keys,
+                        "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+                    return True
+                elif price <= self.take_profit:
+                    pnl = (self.entry_price - price) * self.point_value * self.qty
+                    print(f"[{now}] [{self.symbol} TAKE PROFIT] Price {price:.2f} hit TP {self.take_profit:.2f} | P&L: ${pnl:+.2f}")
+                    await self._flatten(price, reason="TAKE_PROFIT")
+                    threading.Thread(target=send_signals, args=(
+                        self.tg_token, self.tg_chat, self.tg_keys,
+                        "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+                    return True
 
         # Feed Renko bricks every tick_interval
         now_ts = time.time()
@@ -350,50 +426,51 @@ class SymbolState:
             return True
 
         for b in bricks:
-            brick_dir = b[2]  # 1 = BULLISH, -1 = BEARISH
+            brick_dir = b[2]
             color = "BULLISH" if brick_dir == 1 else "BEARISH"
-            self.brick_closes.append(b[1])
-            self._calc_macd()
-            macd_str = f" | MACD: {self.macd_line:.4f} Sig: {self.signal_line:.4f}" if self.macd_line is not None else ""
-            print(f"[{now}] [{self.symbol} RENKO] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f}{macd_str}")
+            self._add_brick_data(b[0], b[1])
+            self._calc_indicators()
 
-            # While in position: update trailing brick close on same-direction bricks
+            ind_str = ""
+            if self.ao is not None:
+                ind_str += f" | AO: {self.ao:.1f}"
+            if self.stoch_k is not None:
+                ind_str += f" K: {self.stoch_k:.1f}"
+            if self.rsi is not None:
+                ind_str += f" RSI: {self.rsi:.1f}"
+            print(f"[{now}] [{self.symbol} RENKO] {color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f}{ind_str}")
+
             if self.position != 0:
-                self.last_brick_close = b[1]
                 continue
 
-            if self.macd_line is None or self.prev_macd is None:
+            if self.ao is None or self.prev_ao is None or self.stoch_k is None or self.rsi is None:
                 continue
 
-            # STEP 2: Pending entry - second brick confirms, we jump in
-            if self.pending_entry_dir != 0:
-                if brick_dir == self.pending_entry_dir:
-                    dir_str = "LONG" if brick_dir == 1 else "SHORT"
-                    print(f"[{now}] [{self.symbol} CONFIRMED] 2nd {color} brick - entering {dir_str}")
-                    self.last_brick_close = b[1]
-                    if brick_dir == 1:
-                        await self._enter_long(price)
-                    else:
-                        await self._enter_short(price)
-                else:
-                    print(f"[{now}] [{self.symbol} CANCELLED] Reversal brick - entry cancelled")
-                self.pending_entry_dir = 0
-                continue
+            # LONG: Stoch K < 20 AND RSI < 30 AND AO rising
+            if self.stoch_k < 20 and self.rsi < 30 and self.ao > self.prev_ao:
+                atr = self.brick_size
+                sl = price - atr
+                tp = price + atr
+                print(f"[{now}] [{self.symbol} SIGNAL] LONG | K={self.stoch_k:.1f}<20 RSI={self.rsi:.1f}<30 AO rising | SL={sl:.2f} TP={tp:.2f}")
+                self.stop_loss = sl
+                self.take_profit = tp
+                await self._enter_long(price)
 
-            # STEP 1: MACD cross - set pending entry
-            if self.prev_macd <= self.prev_signal and self.macd_line > self.signal_line:
-                print(f"[{now}] [{self.symbol} MACD CROSS] BULLISH | MACD: {self.macd_line:.4f} Signal: {self.signal_line:.4f} - pending LONG")
-                self.pending_entry_dir = 1
-            elif self.prev_macd >= self.prev_signal and self.macd_line < self.signal_line:
-                print(f"[{now}] [{self.symbol} MACD CROSS] BEARISH | MACD: {self.macd_line:.4f} Signal: {self.signal_line:.4f} - pending SHORT")
-                self.pending_entry_dir = -1
+            # SHORT: Stoch K > 80 AND RSI > 70 AND AO falling
+            elif self.stoch_k > 80 and self.rsi > 70 and self.ao < self.prev_ao:
+                atr = self.brick_size
+                sl = price + atr
+                tp = price - atr
+                print(f"[{now}] [{self.symbol} SIGNAL] SHORT | K={self.stoch_k:.1f}>80 RSI={self.rsi:.1f}>70 AO falling | SL={sl:.2f} TP={tp:.2f}")
+                self.stop_loss = sl
+                self.take_profit = tp
+                await self._enter_short(price)
 
         return True
 
     async def _enter_long(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
-        macd_str = f"MACD: {self.macd_line:.4f} Sig: {self.signal_line:.4f}" if self.macd_line is not None else "MACD: N/A"
-        print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG @ {price:.2f} | {macd_str} | P&L: ${self.live_pnl:.2f}")
+        print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG @ {price:.2f} | SL={self.stop_loss:.2f} TP={self.take_profit:.2f} | P&L: ${self.live_pnl:.2f}")
         try:
             response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
@@ -418,8 +495,7 @@ class SymbolState:
 
     async def _enter_short(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
-        macd_str = f"MACD: {self.macd_line:.4f} Sig: {self.signal_line:.4f}" if self.macd_line is not None else "MACD: N/A"
-        print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT @ {price:.2f} | {macd_str} | P&L: ${self.live_pnl:.2f}")
+        print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT @ {price:.2f} | SL={self.stop_loss:.2f} TP={self.take_profit:.2f} | P&L: ${self.live_pnl:.2f}")
         try:
             response = await self.ctx.orders.place_market_order(
                 contract_id=self.ctx.instrument_info.id,
@@ -454,6 +530,8 @@ class SymbolState:
         self.position = 0
         self.entry_price = 0.0
         self.entry_time = None
+        self.stop_loss = None
+        self.take_profit = None
 
         try:
             result = await asyncio.wait_for(
@@ -496,8 +574,9 @@ class SymbolState:
             "exit": exit_price,
             "pnl": pnl,
             "reason": reason,
-            "macd": self.macd_line,
-            "signal": self.signal_line,
+            "ao": self.ao,
+            "stoch_k": self.stoch_k,
+            "rsi": self.rsi,
             "account": os.environ.get("PROJECT_X_ACCOUNT_NAME", "unknown"),
             "session_pnl": self.live_pnl,
         }
@@ -573,9 +652,8 @@ class RenkoBot:
             for sym, st in self.states.items():
                 if sym in saved:
                     if st.restore_state(saved[sym]):
-                        macd_str = f"{st.macd_line:.4f}" if st.macd_line is not None else "N/A"
-                        sig_str = f"{st.signal_line:.4f}" if st.signal_line is not None else "N/A"
-                        print(f"  [{sym}] Restored: MACD={macd_str}, Signal={sig_str}, Bricks={st.renko.brick_count}")
+                        ao_s = f"{st.ao:.2f}" if st.ao is not None else "N/A"
+                        print(f"  [{sym}] Restored: AO={ao_s}, Bricks={st.renko.brick_count}")
                         restored = True
                     else:
                         print(f"  [{sym}] Saved state too old, seeding fresh")
@@ -593,16 +671,15 @@ class RenkoBot:
         from project_x_py import TradingSuite
 
         symbols = self._symbols_list()
-        print(f"[BOT] Renko MACD Cross - NORMAL SIGNALS - LIVE MODE")
+        print(f"[BOT] Renko AO+Stoch+RSI Strategy - LIVE MODE")
         print(f"[BOT] Tick interval: {self.tick_interval}s (samples price every {self.tick_interval} seconds)")
-        print(f"[BOT] MACD: ({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})")
+        print(f"[BOT] AO({AO_FAST},{AO_SLOW}) | Stoch({STOCH_K},{STOCH_D},{STOCH_SMOOTH}) | RSI({RSI_PERIOD})")
         print(f"[BOT] Symbols: {', '.join(symbols)}")
         for sym, st in self.states.items():
             print(f"[BOT]   {sym}: brick={st.brick_size}, qty={st.qty}, pv=${st.point_value}/pt" +
                   (f", ntfy={st.ntfy_topic}" if st.ntfy_topic else ""))
-        print(f"[BOT] Strategy: Renko + MACD ({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) Cross + Staircase + Trailing Brick")
-        print(f"[BOT] ENTRY: MACD cross (staircase: 2nd brick confirms)")
-        print(f"[BOT] EXIT: Immediate reversal (price reverses past last brick close)")
+        print(f"[BOT] LONG: K<20 + RSI<30 + AO rising | SHORT: K>80 + RSI>70 + AO falling")
+        print(f"[BOT] EXIT: ATR-based TP/SL (ATR = brick_size)")
         day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
         trading_day_str = ", ".join(day_names[d] for d in TRADING_DAYS)
         print(f"[BOT] Session: {SESSION_START.strftime('%H:%M')} - {SESSION_END.strftime('%H:%M')} ET ({trading_day_str})")
@@ -632,7 +709,7 @@ class RenkoBot:
                 st.last_price = price
                 print(f"[BOT] {sym} price: {price:.2f}")
 
-            if not restored or st.macd_line is None:
+            if not restored or st.ao is None:
                 await st.seed_history()
             else:
                 print(f"  [{sym}] Using restored state (skipping seed)")
@@ -664,7 +741,7 @@ class RenkoBot:
             st.print_status()
 
         print(f"\n[BOT] Session active: {self.was_in_session}")
-        print(f"[BOT] Trading LIVE - MACD ({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) Cross NORMAL ({', '.join(symbols)})")
+        print(f"[BOT] Trading LIVE - AO+Stoch+RSI ({', '.join(symbols)})")
         print(f"[BOT] Press Ctrl+C to stop\n")
 
         try:
@@ -709,7 +786,7 @@ class RenkoBot:
         self.last_reconnect_time = time.time()
         now = datetime.now(ET).strftime("%H:%M:%S")
         symbols = self._symbols_list()
-        print(f"[{now}] [RECONNECT] Auto-reconnecting (Renko + MACD preserved)...")
+        print(f"[{now}] [RECONNECT] Auto-reconnecting (indicators preserved)...")
         self._notify_status(f"STATUS|Auto-reconnecting ({now} ET)")
 
         if self.suite:
@@ -731,7 +808,7 @@ class RenkoBot:
             self.connection_alive = True
             self.disconnect_alert_sent = False
             now = datetime.now(ET).strftime("%H:%M:%S")
-            print(f"[{now}] [RECONNECT] WebSocket restored, Renko+MACD intact")
+            print(f"[{now}] [RECONNECT] WebSocket restored, indicators intact")
             send_telegram(self.tg_token, self.tg_chat, f"STATUS|RECONNECTED ({now} ET)")
 
             for sym, st in self.states.items():
@@ -925,7 +1002,7 @@ def parse_symbol_configs(symbols_str: str) -> list:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TopstepX Renko MACD Cross Bot (Multi-Symbol)")
+    parser = argparse.ArgumentParser(description="TopstepX Renko AO+Stoch+RSI Bot (Multi-Symbol)")
     parser.add_argument("--symbol", default="", help="Single symbol (backward compat)")
     parser.add_argument("--symbols", default="", help="Multi-symbol config: 'NQ:3.0:1:ntfy,ES:2.0:1'")
     parser.add_argument("--qty", type=int, default=1, help="Qty for single --symbol mode")

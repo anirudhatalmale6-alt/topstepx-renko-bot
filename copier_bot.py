@@ -161,7 +161,7 @@ class SignalCopier:
         sig_price = parts[4]   # reference price from sender
 
         if sig_key != self.tg_key:
-            print(f"[{now}] [COPIER] Invalid key - signal rejected")
+            # Signal for a different user - silently ignore
             return
 
         print(f"[{now}] [COPIER] Received signal: {direction} {sig_symbol} @ {sig_price}")
