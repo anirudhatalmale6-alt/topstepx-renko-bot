@@ -1,14 +1,14 @@
 """
-TopstepX Renko AO Color Strategy Bot (LIVE)
+TopstepX Renko EMA + MACD Strategy Bot (LIVE)
 Multi-symbol support: runs multiple instruments on one connection.
 
-Strategy: Renko + Awesome Oscillator Histogram Color
-- LONG when AO histogram turns GREEN (AO rising)
-- SHORT when AO histogram turns RED (AO falling)
-- EXIT: Flip on AO color change (no TP/SL)
+Strategy: Renko Close + EMA 9 Cross + MACD Confirmation
+- LONG when brick close crosses above EMA 9 AND MACD histogram > 0
+- SHORT when brick close crosses below EMA 9 AND MACD histogram < 0
+- EXIT on EMA 9 flip (regardless of MACD)
 
 Usage:
-    python renko_bot.py --symbols "NQ:1:1:ntfy-topic" --tick-interval 1
+    python renko_bot.py --symbols "NQ:3:1:ntfy-topic" --tick-interval 60
 """
 
 import asyncio
@@ -122,6 +122,21 @@ class RenkoEngine:
                 break
         return new_bricks
 
+    def feed_ohlc(self, high: float, low: float, close: float) -> list:
+        if self.last_close is None:
+            self.initialize(close)
+            return []
+
+        new_bricks = []
+        if self.direction >= 0:
+            new_bricks.extend(self.feed_close(high))
+            new_bricks.extend(self.feed_close(low))
+        else:
+            new_bricks.extend(self.feed_close(low))
+            new_bricks.extend(self.feed_close(high))
+        new_bricks.extend(self.feed_close(close))
+        return new_bricks
+
 
 # ============================================================
 # Configuration
@@ -134,8 +149,10 @@ SESSION_END = dtime(16, 0)
 
 TRADING_DAYS = [0, 1, 2, 3, 4, 6]
 
-AO_FAST = 5
-AO_SLOW = 34
+EMA_PERIOD = 9
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
 
 POINT_VALUES = {
     "NQ": 20.0,
@@ -179,14 +196,19 @@ class SymbolState:
         self.renko = RenkoEngine(brick_size, symbol)
 
         self.brick_closes = []
-        self.brick_highs = []
-        self.brick_lows = []
-        self.brick_hl2s = []
 
-        self.ao = None
-        self.prev_ao = None
-        self.ao_color = None  # "GREEN" or "RED"
-        self.prev_ao_color = None
+        self.ema = None
+        self.prev_price_side = None  # "ABOVE" or "BELOW" based on live price vs EMA
+
+        self.macd_fast_ema = None
+        self.macd_slow_ema = None
+        self.macd_line = None
+        self.macd_signal_ema = None
+        self.macd_hist = None
+        self.prev_macd_hist = None
+
+        self.pending_range_high = None
+        self.pending_range_low = None
 
         self.last_price = 0.0
 
@@ -207,12 +229,14 @@ class SymbolState:
         return {
             "symbol": self.symbol,
             "brick_closes": self.brick_closes[-100:],
-            "brick_highs": self.brick_highs[-100:],
-            "brick_lows": self.brick_lows[-100:],
-            "brick_hl2s": self.brick_hl2s[-100:],
-            "ao": self.ao,
-            "prev_ao": self.prev_ao,
-            "ao_color": self.ao_color,
+            "ema": self.ema,
+            "prev_price_side": self.prev_price_side,
+            "macd_fast_ema": self.macd_fast_ema,
+            "macd_slow_ema": self.macd_slow_ema,
+            "macd_line": self.macd_line,
+            "macd_signal_ema": self.macd_signal_ema,
+            "macd_hist": self.macd_hist,
+            "prev_macd_hist": self.prev_macd_hist,
             "last_price": self.last_price,
             "renko_last_close": self.renko.last_close,
             "renko_direction": self.renko.direction,
@@ -227,12 +251,14 @@ class SymbolState:
         if time.time() - state.get("saved_at", 0) > 600:
             return False
         self.brick_closes = state.get("brick_closes", [])
-        self.brick_highs = state.get("brick_highs", [])
-        self.brick_lows = state.get("brick_lows", [])
-        self.brick_hl2s = state.get("brick_hl2s", [])
-        self.ao = state.get("ao")
-        self.prev_ao = state.get("prev_ao")
-        self.ao_color = state.get("ao_color")
+        self.ema = state.get("ema")
+        self.prev_price_side = state.get("prev_price_side")
+        self.macd_fast_ema = state.get("macd_fast_ema")
+        self.macd_slow_ema = state.get("macd_slow_ema")
+        self.macd_line = state.get("macd_line")
+        self.macd_signal_ema = state.get("macd_signal_ema")
+        self.macd_hist = state.get("macd_hist")
+        self.prev_macd_hist = state.get("prev_macd_hist")
         self.last_price = state.get("last_price", 0.0)
         self.renko.last_close = state.get("renko_last_close")
         self.renko.direction = state.get("renko_direction", 0)
@@ -243,25 +269,41 @@ class SymbolState:
         return True
 
     def _add_brick_data(self, brick_open, brick_close):
-        h = max(brick_open, brick_close)
-        l = min(brick_open, brick_close)
         self.brick_closes.append(brick_close)
-        self.brick_highs.append(h)
-        self.brick_lows.append(l)
-        self.brick_hl2s.append((h + l) / 2.0)
 
     def _calc_indicators(self):
         n = len(self.brick_closes)
-        if n != len(self.brick_highs):
-            return
-        self.prev_ao = self.ao
-        self.prev_ao_color = self.ao_color
-        if n >= AO_SLOW:
-            fast_sma = sum(self.brick_hl2s[-AO_FAST:]) / AO_FAST
-            slow_sma = sum(self.brick_hl2s[-AO_SLOW:]) / AO_SLOW
-            self.ao = (fast_sma - slow_sma) * 1000
-            if self.prev_ao is not None:
-                self.ao_color = "GREEN" if self.ao > self.prev_ao else "RED"
+        c = self.brick_closes[-1]
+
+        if n >= EMA_PERIOD:
+            if self.ema is None:
+                self.ema = sum(self.brick_closes[-EMA_PERIOD:]) / EMA_PERIOD
+            else:
+                k = 2.0 / (EMA_PERIOD + 1)
+                self.ema = c * k + self.ema * (1 - k)
+
+        k_fast = 2.0 / (MACD_FAST + 1)
+        k_slow = 2.0 / (MACD_SLOW + 1)
+        k_sig = 2.0 / (MACD_SIGNAL + 1)
+
+        if n >= MACD_FAST and self.macd_fast_ema is None:
+            self.macd_fast_ema = sum(self.brick_closes[-MACD_FAST:]) / MACD_FAST
+        elif self.macd_fast_ema is not None:
+            self.macd_fast_ema = c * k_fast + self.macd_fast_ema * (1 - k_fast)
+
+        if n >= MACD_SLOW and self.macd_slow_ema is None:
+            self.macd_slow_ema = sum(self.brick_closes[-MACD_SLOW:]) / MACD_SLOW
+        elif self.macd_slow_ema is not None:
+            self.macd_slow_ema = c * k_slow + self.macd_slow_ema * (1 - k_slow)
+
+        if self.macd_fast_ema is not None and self.macd_slow_ema is not None:
+            self.macd_line = self.macd_fast_ema - self.macd_slow_ema
+            if self.macd_signal_ema is None:
+                self.macd_signal_ema = self.macd_line
+            else:
+                self.macd_signal_ema = self.macd_line * k_sig + self.macd_signal_ema * (1 - k_sig)
+            self.prev_macd_hist = self.macd_hist
+            self.macd_hist = self.macd_line - self.macd_signal_ema
 
     async def seed_history(self):
         data = await self.ctx.data.get_data("1sec", bars=800)
@@ -273,13 +315,14 @@ class SymbolState:
         print(f"[{self.symbol}] Seeding from {len(rows)} historical 1sec bars...")
 
         self.brick_closes = []
-        self.brick_highs = []
-        self.brick_lows = []
-        self.brick_hl2s = []
-        self.ao = None
-        self.prev_ao = None
-        self.ao_color = None
-        self.prev_ao_color = None
+        self.ema = None
+        self.prev_price_side = None
+        self.macd_fast_ema = None
+        self.macd_slow_ema = None
+        self.macd_line = None
+        self.macd_signal_ema = None
+        self.macd_hist = None
+        self.prev_macd_hist = None
 
         for row in rows:
             close = float(row["close"])
@@ -288,12 +331,16 @@ class SymbolState:
                 self._add_brick_data(brick[0], brick[1])
                 self._calc_indicators()
 
+        if self.ema is not None and self.brick_closes:
+            self.prev_price_side = "ABOVE" if self.brick_closes[-1] > self.ema else "BELOW"
+
         dir_str = "BULLISH" if self.renko.direction == 1 else "BEARISH" if self.renko.direction == -1 else "NONE"
         print(f"  [{self.symbol}] Renko: {self.renko.brick_count} bricks, {dir_str}, ref={self.renko.last_close:.2f}")
         print(f"  [{self.symbol}] Data: {len(self.brick_closes)} brick closes")
-        ao_str = f"{self.ao:.2f}" if self.ao is not None else "N/A"
-        color_str = self.ao_color or "N/A"
-        print(f"  [{self.symbol}] AO: {ao_str} | Color: {color_str}")
+        ema_str = f"{self.ema:.2f}" if self.ema is not None else "N/A"
+        side_str = self.prev_price_side or "N/A"
+        macd_str = f"{self.macd_hist:.2f}" if self.macd_hist is not None else "N/A"
+        print(f"  [{self.symbol}] EMA9: {ema_str} | Price vs EMA: {side_str} | MACD Hist: {macd_str}")
 
     def print_status(self):
         now = datetime.now(ET).strftime("%H:%M:%S")
@@ -302,9 +349,10 @@ class SymbolState:
 
         print(f"  [{self.symbol} @ {now}]")
         print(f"    Renko: {dir_str} | last_close={self.renko.last_close:.2f} | bricks={self.renko.brick_count}")
-        ao_str = f"{self.ao:.2f}" if self.ao is not None else "N/A"
-        color_str = self.ao_color or "N/A"
-        print(f"    AO: {ao_str} | Color: {color_str}")
+        ema_str = f"{self.ema:.2f}" if self.ema is not None else "N/A"
+        side_str = self.prev_price_side or "N/A"
+        macd_str = f"{self.macd_hist:.2f}" if self.macd_hist is not None else "N/A"
+        print(f"    EMA9: {ema_str} | Price vs EMA: {side_str} | MACD Hist: {macd_str}")
         print(f"    Position: {pos_str} | P&L: ${self.live_pnl:.2f} | PV: ${self.point_value}/pt")
 
     def is_data_stale(self, threshold=120):
@@ -323,51 +371,95 @@ class SymbolState:
 
         self.last_price = price
 
-        # Feed Renko bricks every tick_interval
         now_ts = time.time()
         if now_ts - self.last_tick_time < self.tick_interval:
             return True
         self.last_tick_time = now_ts
         self.last_new_bar_time = now_ts
 
+        # Feed Renko and update indicators on new bricks
         bricks = self.renko.feed_close(price)
-        if not bricks:
-            return True
-
         now = datetime.now(ET).strftime("%H:%M:%S")
 
-        for b in bricks:
-            brick_dir = b[2]
-            brick_color = "BULLISH" if brick_dir == 1 else "BEARISH"
-            self._add_brick_data(b[0], b[1])
-            self._calc_indicators()
+        if bricks:
+            for b in bricks:
+                brick_dir = b[2]
+                brick_color = "BULLISH" if brick_dir == 1 else "BEARISH"
+                self._add_brick_data(b[0], b[1])
+                self._calc_indicators()
 
-            ao_str = f"AO: {self.ao:.1f}" if self.ao is not None else "AO: N/A"
-            color_str = f"[{self.ao_color}]" if self.ao_color else ""
-            print(f"[{now}] [{self.symbol} RENKO] {brick_color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | {ao_str} {color_str}")
+                ema_str = f"EMA: {self.ema:.2f}" if self.ema is not None else "EMA: N/A"
+                macd_h = f"MACD: {self.macd_hist:.2f}" if self.macd_hist is not None else "MACD: N/A"
+                prev_h = f"prev: {self.prev_macd_hist:.2f}" if self.prev_macd_hist is not None else ""
+                print(f"[{now}] [{self.symbol} RENKO] {brick_color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | {ema_str} | {macd_h} {prev_h}")
 
-            if self.ao_color is None:
-                continue
+        if self.ema is None:
+            return True
 
-            # Follow AO color: GREEN = LONG, RED = SHORT
-            if self.ao_color == "GREEN" and self.position != 1:
-                if self.position == -1:
-                    print(f"[{now}] [{self.symbol} FLIP] AO -> GREEN | Closing SHORT")
-                    await self._flatten(price, reason="AO_FLIP_GREEN")
-                    threading.Thread(target=send_signals, args=(
-                        self.tg_token, self.tg_chat, self.tg_keys,
-                        "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-                print(f"[{now}] [{self.symbol} SIGNAL] LONG | AO GREEN (rising)")
+        above_ema = price > self.ema
+        below_ema = price < self.ema
+        curr_side = "ABOVE" if above_ema else "BELOW"
+
+        flipped = self.prev_price_side is not None and curr_side != self.prev_price_side
+        self.prev_price_side = curr_side
+
+        macd_rising = (self.macd_hist is not None and self.prev_macd_hist is not None
+                       and self.macd_hist > self.prev_macd_hist)
+        macd_falling = (self.macd_hist is not None and self.prev_macd_hist is not None
+                        and self.macd_hist < self.prev_macd_hist)
+
+        # Exit on price crossing EMA
+        if flipped:
+            if above_ema and self.position == -1:
+                print(f"[{now}] [{self.symbol} EXIT] Price {price:.2f} crossed above EMA {self.ema:.2f} | Closing SHORT")
+                await self._flatten(price, reason="EMA_CROSS")
+                threading.Thread(target=send_signals, args=(
+                    self.tg_token, self.tg_chat, self.tg_keys,
+                    "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+
+            elif below_ema and self.position == 1:
+                print(f"[{now}] [{self.symbol} EXIT] Price {price:.2f} crossed below EMA {self.ema:.2f} | Closing LONG")
+                await self._flatten(price, reason="EMA_CROSS")
+                threading.Thread(target=send_signals, args=(
+                    self.tg_token, self.tg_chat, self.tg_keys,
+                    "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+
+        # Cancel existing pending range if EMA crosses back before breakout
+        if flipped and self.pending_range_high is not None:
+            print(f"[{now}] [{self.symbol} RANGE] Cancelled - EMA crossed back")
+            self.pending_range_high = None
+            self.pending_range_low = None
+
+        # On EMA cross while flat + MACD confirms: set up breakout range from the crossing brick
+        if flipped and self.position == 0 and bricks:
+            last_brick = bricks[-1]
+            range_high = max(last_brick[0], last_brick[1])
+            range_low = min(last_brick[0], last_brick[1])
+
+            if above_ema and macd_rising:
+                self.pending_range_high = range_high
+                self.pending_range_low = range_low
+                print(f"[{now}] [{self.symbol} RANGE] EMA cross + MACD rising | Waiting for breakout of {range_low:.2f} - {range_high:.2f}")
+            elif below_ema and macd_falling:
+                self.pending_range_high = range_high
+                self.pending_range_low = range_low
+                print(f"[{now}] [{self.symbol} RANGE] EMA cross + MACD falling | Waiting for breakout of {range_low:.2f} - {range_high:.2f}")
+            elif above_ema:
+                print(f"[{now}] [{self.symbol} SKIP] Cross above EMA but MACD not confirming ({self.macd_hist:.2f}) - no range set")
+            elif below_ema:
+                print(f"[{now}] [{self.symbol} SKIP] Cross below EMA but MACD not confirming ({self.macd_hist:.2f}) - no range set")
+
+        # Check for breakout of pending range
+        if self.position == 0 and self.pending_range_high is not None:
+            if price > self.pending_range_high:
+                print(f"[{now}] [{self.symbol} SIGNAL] LONG | price {price:.2f} broke above range {self.pending_range_high:.2f}")
+                self.pending_range_high = None
+                self.pending_range_low = None
                 await self._enter_long(price)
-
-            elif self.ao_color == "RED" and self.position != -1:
-                if self.position == 1:
-                    print(f"[{now}] [{self.symbol} FLIP] AO -> RED | Closing LONG")
-                    await self._flatten(price, reason="AO_FLIP_RED")
-                    threading.Thread(target=send_signals, args=(
-                        self.tg_token, self.tg_chat, self.tg_keys,
-                        "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-                print(f"[{now}] [{self.symbol} SIGNAL] SHORT | AO RED (falling)")
+            elif price < self.pending_range_low:
+                print(f"[{now}] [{self.symbol} SIGNAL] SHORT | price {price:.2f} broke below range {self.pending_range_low:.2f}")
+                self.pending_range_high = None
+                self.pending_range_low = None
                 await self._enter_short(price)
 
         return True
@@ -476,8 +568,8 @@ class SymbolState:
             "exit": exit_price,
             "pnl": pnl,
             "reason": reason,
-            "ao": self.ao,
-            "ao_color": self.ao_color,
+            "ema": self.ema,
+            "macd_hist": self.macd_hist,
             "account": os.environ.get("PROJECT_X_ACCOUNT_NAME", "unknown"),
             "session_pnl": self.live_pnl,
         }
@@ -553,8 +645,8 @@ class RenkoBot:
             for sym, st in self.states.items():
                 if sym in saved:
                     if st.restore_state(saved[sym]):
-                        ao_s = f"{st.ao:.2f}" if st.ao is not None else "N/A"
-                        print(f"  [{sym}] Restored: AO={ao_s}, Bricks={st.renko.brick_count}")
+                        ema_s = f"{st.ema:.2f}" if st.ema is not None else "N/A"
+                        print(f"  [{sym}] Restored: EMA={ema_s}, Bricks={st.renko.brick_count}")
                         restored = True
                     else:
                         print(f"  [{sym}] Saved state too old, seeding fresh")
@@ -572,15 +664,16 @@ class RenkoBot:
         from project_x_py import TradingSuite
 
         symbols = self._symbols_list()
-        print(f"[BOT] Renko AO Color Strategy - LIVE MODE")
+        print(f"[BOT] Renko EMA + MACD Strategy - LIVE MODE")
         print(f"[BOT] Tick interval: {self.tick_interval}s (samples price every {self.tick_interval} seconds)")
-        print(f"[BOT] AO({AO_FAST},{AO_SLOW})")
+        print(f"[BOT] EMA({EMA_PERIOD}) + MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) on Close-based Renko")
         print(f"[BOT] Symbols: {', '.join(symbols)}")
         for sym, st in self.states.items():
             print(f"[BOT]   {sym}: brick={st.brick_size}, qty={st.qty}, pv=${st.point_value}/pt" +
                   (f", ntfy={st.ntfy_topic}" if st.ntfy_topic else ""))
-        print(f"[BOT] LONG: AO histogram GREEN (rising) | SHORT: AO histogram RED (falling)")
-        print(f"[BOT] EXIT: Flip on AO color change (no TP/SL)")
+        print(f"[BOT] SETUP: price crosses EMA + MACD confirms -> set breakout range from crossing brick")
+        print(f"[BOT] ENTRY: price breaks above/below the range")
+        print(f"[BOT] EXIT: price crosses back through EMA")
         day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
         trading_day_str = ", ".join(day_names[d] for d in TRADING_DAYS)
         print(f"[BOT] Session: {SESSION_START.strftime('%H:%M')} - {SESSION_END.strftime('%H:%M')} ET ({trading_day_str})")
@@ -610,7 +703,7 @@ class RenkoBot:
                 st.last_price = price
                 print(f"[BOT] {sym} price: {price:.2f}")
 
-            if not restored or st.ao is None:
+            if not restored or st.ema is None:
                 await st.seed_history()
             else:
                 print(f"  [{sym}] Using restored state (skipping seed)")
@@ -642,7 +735,7 @@ class RenkoBot:
             st.print_status()
 
         print(f"\n[BOT] Session active: {self.was_in_session}")
-        print(f"[BOT] Trading LIVE - AO Color ({', '.join(symbols)})")
+        print(f"[BOT] Trading LIVE - EMA + MACD ({', '.join(symbols)})")
         print(f"[BOT] Press Ctrl+C to stop\n")
 
         try:
@@ -836,7 +929,7 @@ class RenkoBot:
         # Stale data detection: if any symbol hasn't received new bar data in 2 min, reconnect
         if not self.reconnecting:
             for sym, st in self.states.items():
-                if st.is_data_stale(120):
+                if st.is_data_stale(max(120, st.tick_interval * 3)):
                     now = datetime.now(ET).strftime("%H:%M:%S")
                     print(f"[{now}] [STALE] {sym} no new data for 2+ min - reconnecting")
                     self._notify_status(f"STATUS|{sym} data stale, reconnecting ({now} ET)")
