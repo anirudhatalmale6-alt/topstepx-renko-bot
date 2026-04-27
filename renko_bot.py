@@ -911,8 +911,7 @@ class RenkoBot:
         self.last_state_save = 0
         self.last_heartbeat = 0
         self.HEARTBEAT_INTERVAL = 1800  # 30 min
-        self.last_proactive_reconnect = time.time()
-        self.PROACTIVE_RECONNECT_INTERVAL = 1200  # 20 min
+        self.last_gateway_logout_time = 0
 
         self.suite = None
         self.running = False
@@ -985,6 +984,8 @@ class RenkoBot:
             timeframes=["1sec", "15min"],
             initial_days=1,
         )
+
+        self._register_gateway_logout()
 
         print(f"[BOT] Connected to TopstepX")
         print(f"[BOT] Account: {self.suite.client.account_info.name}")
@@ -1073,6 +1074,17 @@ class RenkoBot:
         finally:
             await self._shutdown()
 
+    def _register_gateway_logout(self):
+        try:
+            conn = self.suite.realtime.user_connection
+            def on_logout(*args):
+                now = datetime.now(ET).strftime("%H:%M:%S")
+                print(f"[{now}] [LOGOUT] GatewayLogout received from TopstepX")
+                self.last_gateway_logout_time = time.time()
+            conn.on("GatewayLogout", on_logout)
+        except Exception as e:
+            print(f"[WARN] Could not register GatewayLogout handler: {e}")
+
     async def _auto_reconnect(self):
         from project_x_py import TradingSuite
         self.reconnecting = True
@@ -1097,6 +1109,7 @@ class RenkoBot:
             for sym, st in self.states.items():
                 st.ctx = self.suite[sym]
 
+            self._register_gateway_logout()
             self.last_price_time = time.time()
             self.connection_alive = True
             self.disconnect_alert_sent = False
@@ -1240,14 +1253,14 @@ class RenkoBot:
             self.save_all_state()
             self.last_state_save = time.time()
 
-        # Proactive reconnect every 20 min (only when flat) to keep token fresh
-        if self.suite and time.time() - self.last_proactive_reconnect > self.PROACTIVE_RECONNECT_INTERVAL:
-            all_flat = all(st.position == 0 for st in self.states.values())
-            if all_flat and time.time() - self.last_reconnect_time > 120:
-                now = datetime.now(ET).strftime("%H:%M:%S")
-                print(f"[{now}] [TOKEN] Proactive reconnect (all flat, 20 min elapsed)")
+        # Handle GatewayLogout: TopstepX killed our session, need to reconnect
+        if self.last_gateway_logout_time > 0 and time.time() - self.last_gateway_logout_time > 5:
+            self.last_gateway_logout_time = 0
+            now = datetime.now(ET).strftime("%H:%M:%S")
+            print(f"[{now}] [LOGOUT] GatewayLogout detected - reconnecting")
+            self._notify_status(f"STATUS|GatewayLogout - reconnecting ({now} ET)")
+            if time.time() - self.last_reconnect_time > 120:
                 await self._auto_reconnect()
-            self.last_proactive_reconnect = time.time()
 
         # Heartbeat: send Telegram status every 30 min so client knows bot is alive
         if time.time() - self.last_heartbeat > self.HEARTBEAT_INTERVAL:
