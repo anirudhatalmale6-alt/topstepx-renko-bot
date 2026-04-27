@@ -148,7 +148,7 @@ class RenkoEngine:
 ET = pytz.timezone("America/New_York")
 
 SESSION_START = dtime(19, 0, 0)
-SESSION_END = dtime(15, 30)
+SESSION_END = dtime(16, 0)
 BLACKOUT_START = dtime(9, 30)
 BLACKOUT_END = dtime(10, 0)
 
