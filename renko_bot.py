@@ -911,6 +911,8 @@ class RenkoBot:
         self.last_state_save = 0
         self.last_heartbeat = 0
         self.HEARTBEAT_INTERVAL = 1800  # 30 min
+        self.last_token_refresh = time.time()
+        self.TOKEN_REFRESH_INTERVAL = 1200  # 20 min (tokens expire ~30 min)
 
         self.suite = None
         self.running = False
@@ -1237,6 +1239,24 @@ class RenkoBot:
         if time.time() - self.last_state_save > 30:
             self.save_all_state()
             self.last_state_save = time.time()
+
+        # JWT Token refresh: re-authenticate and update WebSocket token before it expires
+        if self.suite and time.time() - self.last_token_refresh > self.TOKEN_REFRESH_INTERVAL:
+            try:
+                await self.suite.client._refresh_authentication()
+                new_token = self.suite.client.session_token
+                if new_token and hasattr(self.suite.realtime, 'update_jwt_token'):
+                    success = await self.suite.realtime.update_jwt_token(new_token)
+                    now = datetime.now(ET).strftime("%H:%M:%S")
+                    if success:
+                        print(f"[{now}] [TOKEN] JWT refreshed successfully")
+                    else:
+                        print(f"[{now}] [TOKEN] JWT refresh failed - will retry next cycle")
+                self.last_token_refresh = time.time()
+            except Exception as e:
+                now = datetime.now(ET).strftime("%H:%M:%S")
+                print(f"[{now}] [TOKEN] Refresh error: {e}")
+                self.last_token_refresh = time.time()
 
         # Heartbeat: send Telegram status every 30 min so client knows bot is alive
         if time.time() - self.last_heartbeat > self.HEARTBEAT_INTERVAL:
