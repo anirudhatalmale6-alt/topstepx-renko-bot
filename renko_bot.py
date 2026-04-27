@@ -147,7 +147,7 @@ class RenkoEngine:
 
 ET = pytz.timezone("America/New_York")
 
-SESSION_START = dtime(19, 0, 0)
+SESSION_START = dtime(18, 0, 0)
 SESSION_END = dtime(15, 30)
 BLACKOUT_START = dtime(9, 30)
 BLACKOUT_END = dtime(10, 0)
@@ -399,6 +399,7 @@ class SymbolState:
         self.entry_price = 0.0
         self.entry_time = None
         self.entry_features = None
+        self.sync_no_pos_count = 0
 
         self.live_pnl = 0.0
 
@@ -563,6 +564,8 @@ class SymbolState:
         self.last_new_bar_time = now_ts
 
         # Position sync: detect if TopstepX closed our position externally (TP/SL)
+        # Require 2 consecutive checks showing no position to avoid false FLAT
+        # from SDK contractDisplayName bug returning empty on error
         if self.position != 0 and self.ctx:
             try:
                 positions = await asyncio.wait_for(
@@ -575,22 +578,30 @@ class SymbolState:
                                 has_platform_pos = True
                         except Exception:
                             pass
-                if not has_platform_pos:
-                    direction = "LONG" if self.position == 1 else "SHORT"
-                    trade_pnl = (price - self.entry_price) * self.position * self.point_value * self.qty
-                    now = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now}] [{self.symbol} SYNC] Platform closed {direction} (TP/SL) | Entry: {self.entry_price:.2f} | Exit~: {price:.2f} | PnL~: ${trade_pnl:+.2f}")
-                    if self.ml and self.entry_features:
-                        self.ml.record_trade(self.entry_features, trade_pnl, source="platform_close")
-                    self._log_trade(direction, self.entry_price, price, trade_pnl, "PLATFORM_TP_SL")
-                    self.live_pnl += trade_pnl
-                    self.position = 0
-                    self.entry_price = 0.0
-                    self.entry_time = None
-                    self.entry_features = None
-                    threading.Thread(target=send_signals, args=(
-                        self.tg_token, self.tg_chat, self.tg_keys,
-                        "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+                if has_platform_pos:
+                    self.sync_no_pos_count = 0
+                else:
+                    self.sync_no_pos_count += 1
+                    if self.sync_no_pos_count >= 2:
+                        direction = "LONG" if self.position == 1 else "SHORT"
+                        trade_pnl = (price - self.entry_price) * self.position * self.point_value * self.qty
+                        now = datetime.now(ET).strftime("%H:%M:%S")
+                        print(f"[{now}] [{self.symbol} SYNC] Platform closed {direction} (TP/SL) | Entry: {self.entry_price:.2f} | Exit~: {price:.2f} | PnL~: ${trade_pnl:+.2f}")
+                        if self.ml and self.entry_features:
+                            self.ml.record_trade(self.entry_features, trade_pnl, source="platform_close")
+                        self._log_trade(direction, self.entry_price, price, trade_pnl, "PLATFORM_TP_SL")
+                        self.live_pnl += trade_pnl
+                        self.position = 0
+                        self.entry_price = 0.0
+                        self.entry_time = None
+                        self.entry_features = None
+                        self.sync_no_pos_count = 0
+                        threading.Thread(target=send_signals, args=(
+                            self.tg_token, self.tg_chat, self.tg_keys,
+                            "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+                    else:
+                        now = datetime.now(ET).strftime("%H:%M:%S")
+                        print(f"[{now}] [{self.symbol} SYNC] No position found (check {self.sync_no_pos_count}/2) - confirming next tick")
             except Exception as e:
                 pass
 
