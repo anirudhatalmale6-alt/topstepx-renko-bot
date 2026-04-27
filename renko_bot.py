@@ -18,10 +18,13 @@ import json
 import os
 import time
 import threading
+import math
+import csv
 import urllib.request
 import urllib.error
 from datetime import datetime, time as dtime
 
+import numpy as np
 import pytz
 
 
@@ -144,8 +147,10 @@ class RenkoEngine:
 
 ET = pytz.timezone("America/New_York")
 
-SESSION_START = dtime(18, 0, 0)
-SESSION_END = dtime(16, 0)
+SESSION_START = dtime(19, 0, 0)
+SESSION_END = dtime(15, 30)
+BLACKOUT_START = dtime(9, 30)
+BLACKOUT_END = dtime(10, 0)
 
 TRADING_DAYS = [0, 1, 2, 3, 4, 6]
 
@@ -170,8 +175,186 @@ def in_session() -> bool:
         return False
     t = now.time()
     if SESSION_START > SESSION_END:
-        return t >= SESSION_START or t < SESSION_END
-    return SESSION_START <= t < SESSION_END
+        in_main = t >= SESSION_START or t < SESSION_END
+    else:
+        in_main = SESSION_START <= t < SESSION_END
+    if not in_main:
+        return False
+    if BLACKOUT_START <= t < BLACKOUT_END:
+        return False
+    return True
+
+
+# ============================================================
+# ML Trade Filter (KNN-based pattern matching)
+# ============================================================
+
+ML_WARMUP_TRADES = 30
+ML_K_NEIGHBORS = 7
+ML_SKIP_THRESHOLD = 0.65
+
+class TradeML:
+    FEATURE_NAMES = [
+        "direction",        # 1=long, -1=short
+        "macd_hist",        # MACD histogram at entry
+        "macd_momentum",    # histogram change (current - previous)
+        "ema_distance",     # (price - EMA) / brick_size (normalized)
+        "hour",             # hour of day ET (0-23)
+        "volatility",       # std dev of last 10 brick closes / brick_size
+        "breakout_strength", # how far price broke past range / brick_size
+    ]
+
+    def __init__(self, data_file: str):
+        self.data_file = data_file
+        self.trades = []
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.data_file):
+            try:
+                with open(self.data_file, "r") as f:
+                    self.trades = json.load(f)
+                print(f"[ML] Loaded {len(self.trades)} historical trades")
+            except Exception as e:
+                print(f"[ML] Load error: {e}")
+                self.trades = []
+
+    def _save(self):
+        try:
+            with open(self.data_file, "w") as f:
+                json.dump(self.trades, f, indent=1)
+        except Exception as e:
+            print(f"[ML] Save error: {e}")
+
+    def record_trade(self, features: dict, pnl: float, source: str = "live"):
+        trade = {
+            "features": features,
+            "pnl": pnl,
+            "win": 1 if pnl > 0 else 0,
+            "source": source,
+            "timestamp": datetime.now(ET).isoformat(),
+        }
+        self.trades.append(trade)
+        self._save()
+        wins = sum(1 for t in self.trades if t["win"] == 1)
+        total = len(self.trades)
+        print(f"[ML] Trade recorded: PnL=${pnl:.2f} | Total: {total} trades, {wins} wins ({100*wins/total:.0f}%)")
+
+    def extract_features(self, direction: int, macd_hist: float, prev_macd_hist: float,
+                         price: float, ema: float, brick_size: float,
+                         brick_closes: list, range_high: float = 0, range_low: float = 0) -> dict:
+        macd_momentum = (macd_hist - prev_macd_hist) if prev_macd_hist is not None else 0.0
+        ema_distance = (price - ema) / brick_size if brick_size > 0 else 0.0
+        hour = datetime.now(ET).hour
+
+        vol = 0.0
+        if len(brick_closes) >= 10:
+            recent = brick_closes[-10:]
+            vol = float(np.std(recent)) / brick_size if brick_size > 0 else 0.0
+
+        breakout = 0.0
+        if direction == 1 and range_high > 0:
+            breakout = (price - range_high) / brick_size
+        elif direction == -1 and range_low > 0:
+            breakout = (range_low - price) / brick_size
+
+        return {
+            "direction": direction,
+            "macd_hist": round(macd_hist, 4),
+            "macd_momentum": round(macd_momentum, 4),
+            "ema_distance": round(ema_distance, 4),
+            "hour": hour,
+            "volatility": round(vol, 4),
+            "breakout_strength": round(breakout, 4),
+        }
+
+    def should_skip(self, features: dict) -> tuple:
+        total = len(self.trades)
+        if total < ML_WARMUP_TRADES:
+            return False, 0.0, f"warmup ({total}/{ML_WARMUP_TRADES})"
+
+        feat_vec = self._to_vector(features)
+        all_vecs = np.array([self._to_vector(t["features"]) for t in self.trades])
+        all_wins = np.array([t["win"] for t in self.trades])
+
+        means = all_vecs.mean(axis=0)
+        stds = all_vecs.std(axis=0)
+        stds[stds < 1e-8] = 1.0
+
+        norm_feat = (feat_vec - means) / stds
+        norm_all = (all_vecs - means) / stds
+
+        distances = np.sqrt(np.sum((norm_all - norm_feat) ** 2, axis=1))
+        k = min(ML_K_NEIGHBORS, total)
+        nearest_idx = np.argpartition(distances, k)[:k]
+        nearest_wins = all_wins[nearest_idx]
+
+        loss_ratio = 1.0 - nearest_wins.mean()
+
+        skip = loss_ratio >= ML_SKIP_THRESHOLD
+        reason = f"KNN({k}): {int(nearest_wins.sum())}/{k} wins, loss_ratio={loss_ratio:.2f}"
+        return skip, loss_ratio, reason
+
+    def _to_vector(self, features: dict) -> np.ndarray:
+        return np.array([features.get(name, 0.0) for name in self.FEATURE_NAMES], dtype=float)
+
+    def import_csv(self, csv_path: str, brick_size: float = 3.0):
+        imported = 0
+        try:
+            with open(csv_path, "r") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    pnl = float(row["PnL"])
+                    entry_price = float(row["EntryPrice"])
+                    exit_price = float(row["ExitPrice"])
+                    direction = 1 if row["Type"] == "Long" else -1
+                    entered_at = row["EnteredAt"]
+
+                    hour = 12
+                    try:
+                        dt = datetime.fromisoformat(entered_at.replace(" -04:00", "-04:00").replace(" -05:00", "-05:00"))
+                        hour = dt.hour
+                    except Exception:
+                        pass
+
+                    features = {
+                        "direction": direction,
+                        "macd_hist": 0.0,
+                        "macd_momentum": 0.0,
+                        "ema_distance": direction * 1.0,
+                        "hour": hour,
+                        "volatility": 1.0,
+                        "breakout_strength": abs(exit_price - entry_price) / brick_size if pnl > 0 else 0.1,
+                    }
+                    trade = {
+                        "features": features,
+                        "pnl": pnl,
+                        "win": 1 if pnl > 0 else 0,
+                        "source": "csv_import",
+                        "timestamp": entered_at,
+                    }
+                    self.trades.append(trade)
+                    imported += 1
+        except Exception as e:
+            print(f"[ML] CSV import error: {e}")
+
+        if imported > 0:
+            self._save()
+            print(f"[ML] Imported {imported} trades from CSV")
+        return imported
+
+    def stats(self) -> str:
+        if not self.trades:
+            return "No trades recorded"
+        total = len(self.trades)
+        wins = sum(1 for t in self.trades if t["win"] == 1)
+        losses = total - wins
+        total_pnl = sum(t["pnl"] for t in self.trades)
+        live = sum(1 for t in self.trades if t["source"] == "live")
+        csv_count = sum(1 for t in self.trades if t["source"] == "csv_import")
+        return (f"Total: {total} | Wins: {wins} | Losses: {losses} | "
+                f"Win%: {100*wins/total:.0f}% | PnL: ${total_pnl:.2f} | "
+                f"Live: {live} | CSV: {csv_count}")
 
 
 # ============================================================
@@ -215,6 +398,7 @@ class SymbolState:
         self.position = 0
         self.entry_price = 0.0
         self.entry_time = None
+        self.entry_features = None
 
         self.live_pnl = 0.0
 
@@ -222,6 +406,7 @@ class SymbolState:
             os.path.dirname(os.path.abspath(__file__)), f"trade_log_{symbol}.jsonl"
         )
 
+        self.ml = None
         self.ctx = None
         self.last_new_bar_time = None
 
@@ -377,6 +562,38 @@ class SymbolState:
         self.last_tick_time = now_ts
         self.last_new_bar_time = now_ts
 
+        # Position sync: detect if TopstepX closed our position externally (TP/SL)
+        if self.position != 0 and self.ctx:
+            try:
+                positions = await asyncio.wait_for(
+                    self.ctx.positions.get_all_positions(), timeout=5.0)
+                has_platform_pos = False
+                if positions:
+                    for p in positions:
+                        try:
+                            if hasattr(p, 'contractId') and p.contractId == self.ctx.instrument_info.id:
+                                has_platform_pos = True
+                        except Exception:
+                            pass
+                if not has_platform_pos:
+                    direction = "LONG" if self.position == 1 else "SHORT"
+                    trade_pnl = (price - self.entry_price) * self.position * self.point_value * self.qty
+                    now = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now}] [{self.symbol} SYNC] Platform closed {direction} (TP/SL) | Entry: {self.entry_price:.2f} | Exit~: {price:.2f} | PnL~: ${trade_pnl:+.2f}")
+                    if self.ml and self.entry_features:
+                        self.ml.record_trade(self.entry_features, trade_pnl, source="platform_close")
+                    self._log_trade(direction, self.entry_price, price, trade_pnl, "PLATFORM_TP_SL")
+                    self.live_pnl += trade_pnl
+                    self.position = 0
+                    self.entry_price = 0.0
+                    self.entry_time = None
+                    self.entry_features = None
+                    threading.Thread(target=send_signals, args=(
+                        self.tg_token, self.tg_chat, self.tg_keys,
+                        "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+            except Exception as e:
+                pass
+
         # Feed Renko and update indicators on new bricks
         bricks = self.renko.feed_close(price)
         now = datetime.now(ET).strftime("%H:%M:%S")
@@ -411,14 +628,22 @@ class SymbolState:
         # Exit on price crossing EMA
         if flipped:
             if above_ema and self.position == -1:
+                trade_pnl = (self.entry_price - price) * self.point_value * self.qty
                 print(f"[{now}] [{self.symbol} EXIT] Price {price:.2f} crossed above EMA {self.ema:.2f} | Closing SHORT")
+                if self.ml and self.entry_features:
+                    self.ml.record_trade(self.entry_features, trade_pnl, source="bot_ema_exit")
+                    self.entry_features = None
                 await self._flatten(price, reason="EMA_CROSS")
                 threading.Thread(target=send_signals, args=(
                     self.tg_token, self.tg_chat, self.tg_keys,
                     "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
 
             elif below_ema and self.position == 1:
+                trade_pnl = (price - self.entry_price) * self.point_value * self.qty
                 print(f"[{now}] [{self.symbol} EXIT] Price {price:.2f} crossed below EMA {self.ema:.2f} | Closing LONG")
+                if self.ml and self.entry_features:
+                    self.ml.record_trade(self.entry_features, trade_pnl, source="bot_ema_exit")
+                    self.entry_features = None
                 await self._flatten(price, reason="EMA_CROSS")
                 threading.Thread(target=send_signals, args=(
                     self.tg_token, self.tg_chat, self.tg_keys,
@@ -452,12 +677,52 @@ class SymbolState:
         # Check for breakout of pending range
         if self.position == 0 and self.pending_range_high is not None:
             if price > self.pending_range_high:
-                print(f"[{now}] [{self.symbol} SIGNAL] LONG | price {price:.2f} broke above range {self.pending_range_high:.2f}")
+                rng_h = self.pending_range_high
+                rng_l = self.pending_range_low
+                # ML check before entry
+                if self.ml:
+                    features = self.ml.extract_features(
+                        direction=1, macd_hist=self.macd_hist or 0,
+                        prev_macd_hist=self.prev_macd_hist,
+                        price=price, ema=self.ema, brick_size=self.brick_size,
+                        brick_closes=self.brick_closes,
+                        range_high=rng_h, range_low=rng_l)
+                    skip, loss_ratio, reason = self.ml.should_skip(features)
+                    if skip:
+                        print(f"[{now}] [{self.symbol} ML-SKIP] LONG skipped | {reason}")
+                        self.pending_range_high = None
+                        self.pending_range_low = None
+                        threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
+                            f"ML-SKIP|{self.symbol} LONG @ {price:.2f} | {reason}"), daemon=True).start()
+                        return True
+                    self.entry_features = features
+                    print(f"[{now}] [{self.symbol} ML-OK] LONG approved | {reason}")
+                print(f"[{now}] [{self.symbol} SIGNAL] LONG | price {price:.2f} broke above range {rng_h:.2f}")
                 self.pending_range_high = None
                 self.pending_range_low = None
                 await self._enter_long(price)
             elif price < self.pending_range_low:
-                print(f"[{now}] [{self.symbol} SIGNAL] SHORT | price {price:.2f} broke below range {self.pending_range_low:.2f}")
+                rng_h = self.pending_range_high
+                rng_l = self.pending_range_low
+                # ML check before entry
+                if self.ml:
+                    features = self.ml.extract_features(
+                        direction=-1, macd_hist=self.macd_hist or 0,
+                        prev_macd_hist=self.prev_macd_hist,
+                        price=price, ema=self.ema, brick_size=self.brick_size,
+                        brick_closes=self.brick_closes,
+                        range_high=rng_h, range_low=rng_l)
+                    skip, loss_ratio, reason = self.ml.should_skip(features)
+                    if skip:
+                        print(f"[{now}] [{self.symbol} ML-SKIP] SHORT skipped | {reason}")
+                        self.pending_range_high = None
+                        self.pending_range_low = None
+                        threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
+                            f"ML-SKIP|{self.symbol} SHORT @ {price:.2f} | {reason}"), daemon=True).start()
+                        return True
+                    self.entry_features = features
+                    print(f"[{now}] [{self.symbol} ML-OK] SHORT approved | {reason}")
+                print(f"[{now}] [{self.symbol} SIGNAL] SHORT | price {price:.2f} broke below range {rng_l:.2f}")
                 self.pending_range_high = None
                 self.pending_range_low = None
                 await self._enter_short(price)
@@ -468,10 +733,13 @@ class SymbolState:
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG @ {price:.2f} | P&L: ${self.live_pnl:.2f}")
         try:
-            response = await self.ctx.orders.place_market_order(
-                contract_id=self.ctx.instrument_info.id,
-                side=0,
-                size=self.qty,
+            response = await asyncio.wait_for(
+                self.ctx.orders.place_market_order(
+                    contract_id=self.ctx.instrument_info.id,
+                    side=0,
+                    size=self.qty,
+                ),
+                timeout=15.0,
             )
             if response.success:
                 self.position = 1
@@ -483,9 +751,13 @@ class SymbolState:
                     "LONG", self.symbol, price, self.qty), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
             else:
                 print(f"[{self.symbol}] Order FAILED: {response.errorMessage}")
+                threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
+                    f"ALERT|{self.symbol} LONG order FAILED @ {price:.2f}"), daemon=True).start()
                 return False
         except Exception as e:
             print(f"[{self.symbol}] Order ERROR: {e}")
+            threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
+                f"ALERT|{self.symbol} LONG order ERROR @ {price:.2f} - reconnecting"), daemon=True).start()
             return False
         return True
 
@@ -493,10 +765,13 @@ class SymbolState:
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT @ {price:.2f} | P&L: ${self.live_pnl:.2f}")
         try:
-            response = await self.ctx.orders.place_market_order(
-                contract_id=self.ctx.instrument_info.id,
-                side=1,
-                size=self.qty,
+            response = await asyncio.wait_for(
+                self.ctx.orders.place_market_order(
+                    contract_id=self.ctx.instrument_info.id,
+                    side=1,
+                    size=self.qty,
+                ),
+                timeout=15.0,
             )
             if response.success:
                 self.position = -1
@@ -508,9 +783,13 @@ class SymbolState:
                     "SHORT", self.symbol, price, self.qty), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
             else:
                 print(f"[{self.symbol}] Order FAILED: {response.errorMessage}")
+                threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
+                    f"ALERT|{self.symbol} SHORT order FAILED @ {price:.2f}"), daemon=True).start()
                 return False
         except Exception as e:
             print(f"[{self.symbol}] Order ERROR: {e}")
+            threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
+                f"ALERT|{self.symbol} SHORT order ERROR @ {price:.2f} - reconnecting"), daemon=True).start()
             return False
         return True
 
@@ -539,18 +818,25 @@ class SymbolState:
             print(f"[{self.symbol}] close_position_direct failed ({e}), using market order fallback")
             try:
                 close_side = 1 if direction == "LONG" else 0
-                response = await self.ctx.orders.place_market_order(
-                    contract_id=self.ctx.instrument_info.id,
-                    side=close_side,
-                    size=self.qty,
+                response = await asyncio.wait_for(
+                    self.ctx.orders.place_market_order(
+                        contract_id=self.ctx.instrument_info.id,
+                        side=close_side,
+                        size=self.qty,
+                    ),
+                    timeout=15.0,
                 )
                 if response.success:
                     print(f"[{self.symbol}] Position closed (fallback). ID: {response.orderId}")
                 else:
                     print(f"[{self.symbol}] CLOSE FAILED: {response.errorMessage}")
+                    threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
+                        f"ALERT|{self.symbol} CLOSE FAILED - check manually!"), daemon=True).start()
                     return False
             except Exception as e2:
                 print(f"[{self.symbol}] Close ERROR: {e2}")
+                threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
+                    f"ALERT|{self.symbol} CLOSE ERROR - reconnecting"), daemon=True).start()
                 return False
 
         self._log_trade(direction, saved_entry_price, price, trade_pnl, reason)
@@ -592,6 +878,11 @@ class RenkoBot:
         self.tg_keys = tg_keys or []
         self.tick_interval = tick_interval
 
+        ml_data_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "ml_trades.json"
+        )
+        self.ml = TradeML(ml_data_file)
+
         self.states = {}
         for cfg in symbol_configs:
             sym = cfg["symbol"]
@@ -605,6 +896,7 @@ class RenkoBot:
                 tg_keys=self.tg_keys,
                 tick_interval=tick_interval,
             )
+            state.ml = self.ml
             self.states[sym] = state
 
         self.was_in_session = False
@@ -617,6 +909,8 @@ class RenkoBot:
         self.last_reconnect_time = 0
         self.last_status_notify = 0
         self.last_state_save = 0
+        self.last_heartbeat = 0
+        self.HEARTBEAT_INTERVAL = 1800  # 30 min
 
         self.suite = None
         self.running = False
@@ -677,8 +971,11 @@ class RenkoBot:
         day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
         trading_day_str = ", ".join(day_names[d] for d in TRADING_DAYS)
         print(f"[BOT] Session: {SESSION_START.strftime('%H:%M')} - {SESSION_END.strftime('%H:%M')} ET ({trading_day_str})")
+        print(f"[BOT] Blackout: {BLACKOUT_START.strftime('%H:%M')} - {BLACKOUT_END.strftime('%H:%M')} ET (no trading)")
         if self.tg_token and self.tg_chat and self.tg_keys:
             print(f"[BOT] Telegram signals: ENABLED ({len(self.tg_keys)} keys)")
+        print(f"[BOT] ML Filter: {self.ml.stats()}")
+        print(f"[BOT] ML Settings: warmup={ML_WARMUP_TRADES}, K={ML_K_NEIGHBORS}, skip_threshold={ML_SKIP_THRESHOLD}")
         print()
 
         self.suite = await TradingSuite.create(
@@ -941,6 +1238,19 @@ class RenkoBot:
             self.save_all_state()
             self.last_state_save = time.time()
 
+        # Heartbeat: send Telegram status every 30 min so client knows bot is alive
+        if time.time() - self.last_heartbeat > self.HEARTBEAT_INTERVAL:
+            self.last_heartbeat = time.time()
+            now = datetime.now(ET).strftime("%H:%M:%S")
+            for sym, st in self.states.items():
+                pos_str = "FLAT" if st.position == 0 else ("LONG" if st.position == 1 else "SHORT")
+                range_str = ""
+                if st.pending_range_high is not None:
+                    range_str = f" | Range: {st.pending_range_low:.2f}-{st.pending_range_high:.2f}"
+                ema_str = f"{st.ema:.2f}" if st.ema else "N/A"
+                msg = f"HEARTBEAT|{sym} alive ({now} ET) | {pos_str} | P&L: ${st.live_pnl:.2f} | EMA: {ema_str}{range_str}"
+                threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat, msg), daemon=True).start()
+
     async def _shutdown(self):
         self.save_all_state()
         print("\n[BOT] Shutdown (state saved)...")
@@ -1006,6 +1316,7 @@ def main():
     parser.add_argument("--tg-keys", default="", help="Comma-separated passkeys")
     parser.add_argument("--ntfy-topic", default="", help="ntfy.sh topic (single --symbol mode)")
     parser.add_argument("--tick-interval", type=int, default=10, help="Seconds between price samples (default: 10)")
+    parser.add_argument("--import-csv", default="", help="Import trades CSV for ML training")
     args = parser.parse_args()
 
     keys = [k.strip() for k in args.tg_keys.split(",") if k.strip()] if args.tg_keys else []
@@ -1048,6 +1359,7 @@ def main():
     except Exception:
         pass
 
+    csv_imported = False
     while not stopped:
         bot = RenkoBot(
             symbol_configs=symbol_configs,
@@ -1056,6 +1368,10 @@ def main():
             tg_keys=keys,
             tick_interval=args.tick_interval,
         )
+        if args.import_csv and not csv_imported and len(bot.ml.trades) == 0:
+            brick_size = symbol_configs[0].get("brick_size", 3.0) if symbol_configs else 3.0
+            bot.ml.import_csv(args.import_csv, brick_size=brick_size)
+            csv_imported = True
         current_bot = bot
 
         loop = asyncio.new_event_loop()
