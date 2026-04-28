@@ -701,6 +701,17 @@ class SymbolState:
 
         return True
 
+    async def _cleanup_ghost_position(self):
+        try:
+            await asyncio.wait_for(
+                self.ctx.positions.close_position_direct(
+                    contract_id=self.ctx.instrument_info.id),
+                timeout=5.0)
+            now = datetime.now(ET).strftime("%H:%M:%S")
+            print(f"[{now}] [{self.symbol}] Cleaned up ghost position (order filled despite timeout)")
+        except Exception:
+            pass
+
     async def _enter_long(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG @ {price:.2f} | P&L: ${self.live_pnl:.2f}")
@@ -728,6 +739,7 @@ class SymbolState:
                 return False
         except Exception as e:
             print(f"[{self.symbol}] Order ERROR: {e}")
+            await self._cleanup_ghost_position()
             threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
                 f"ALERT|{self.symbol} LONG order ERROR @ {price:.2f} - reconnecting"), daemon=True).start()
             return False
@@ -760,6 +772,7 @@ class SymbolState:
                 return False
         except Exception as e:
             print(f"[{self.symbol}] Order ERROR: {e}")
+            await self._cleanup_ghost_position()
             threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
                 f"ALERT|{self.symbol} SHORT order ERROR @ {price:.2f} - reconnecting"), daemon=True).start()
             return False
