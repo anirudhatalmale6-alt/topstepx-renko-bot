@@ -1,11 +1,14 @@
 """
-TopstepX Renko Bridge Gap Reversal Bot (LIVE)
+TopstepX Renko Crossover + Bollinger Band Bot (LIVE)
 Multi-symbol support: runs multiple instruments on one connection.
 
-Strategy: Bridge Gap Reversal (Mean Reversion)
-- When bricks are fully on one side of EMA (visible gap) and an opposite-color brick forms → enter
-- Bricks below EMA + bullish flip → LONG | Bricks above EMA + bearish flip → SHORT
-- EXIT: price reaches EMA (take profit) or 1-brick stop loss
+Strategy: Renko Stop-and-Go Crossover with BB Filter
+- SMA(12) of renko brick opens = renko MA line
+- SMA(2) of brick closes = smoothed price
+- When smoothed price crosses renko MA → signal
+- BB(20,2) filter: only enter if >= 5pts room to target band
+  - LONG: need room to upper BB | SHORT: need room to lower BB
+- EXIT: price reaches target BB band (TP) or 2-brick stop loss ($200)
 
 Usage:
     python renko_bot.py --symbols "NQ:5:1:ntfy-topic" --tick-interval 1
@@ -169,6 +172,12 @@ EMA_PERIOD = 9
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
+
+RENKO_SMA_PERIOD = 12
+PRICE_SMOOTH_PERIOD = 2
+BB_PERIOD = 20
+BB_STDDEV = 2.0
+MIN_BB_ROOM = 5.0
 
 POINT_VALUES = {
     "NQ": 20.0,
@@ -386,9 +395,17 @@ class SymbolState:
         self.renko = RenkoEngine(brick_size, symbol)
 
         self.brick_closes = []
+        self.brick_opens = []
 
         self.ema = None
-        self.prev_price_side = None  # "ABOVE" or "BELOW" based on last brick close vs EMA
+        self.prev_price_side = None
+
+        self.renko_sma = None
+        self.bb_middle = None
+        self.bb_upper = None
+        self.bb_lower = None
+        self.prev_smooth_vs_rma = None
+        self.tp_target = None
 
         self.macd_fast_ema = None
         self.macd_slow_ema = None
@@ -415,11 +432,6 @@ class SymbolState:
         self.ENTRY_COOLDOWN = 60
 
         self.prev_brick_direction = None
-        self.bridge_gap = None
-
-        self.pending_bridge_signal = None
-        self.pending_bridge_confirm_after = 0
-        self.pending_bridge_threshold = 0.0
 
         # Connection / freshness tracking
         self.last_new_bar_time = None
@@ -442,6 +454,7 @@ class SymbolState:
         return {
             "symbol": self.symbol,
             "brick_closes": self.brick_closes[-100:],
+            "brick_opens": self.brick_opens[-100:],
             "ema": self.ema,
             "prev_price_side": self.prev_price_side,
             "macd_fast_ema": self.macd_fast_ema,
@@ -457,10 +470,9 @@ class SymbolState:
             "position": self.position,
             "entry_price": self.entry_price,
             "live_pnl": self.live_pnl,
-            "pending_range_high": self.pending_range_high,
-            "pending_range_low": self.pending_range_low,
             "prev_brick_direction": self.prev_brick_direction,
-            "bridge_gap": self.bridge_gap,
+            "prev_smooth_vs_rma": self.prev_smooth_vs_rma,
+            "tp_target": self.tp_target,
             "saved_at": time.time(),
         }
 
@@ -468,6 +480,7 @@ class SymbolState:
         if time.time() - state.get("saved_at", 0) > 600:
             return False
         self.brick_closes = state.get("brick_closes", [])
+        self.brick_opens = state.get("brick_opens", [])
         self.ema = state.get("ema")
         self.prev_price_side = state.get("prev_price_side")
         self.macd_fast_ema = state.get("macd_fast_ema")
@@ -483,14 +496,25 @@ class SymbolState:
         self.position = state.get("position", 0)
         self.entry_price = state.get("entry_price", 0.0)
         self.live_pnl = state.get("live_pnl", 0.0)
-        self.pending_range_high = state.get("pending_range_high")
-        self.pending_range_low = state.get("pending_range_low")
         self.prev_brick_direction = state.get("prev_brick_direction")
-        self.bridge_gap = state.get("bridge_gap")
+        self.prev_smooth_vs_rma = state.get("prev_smooth_vs_rma")
+        self.tp_target = state.get("tp_target")
+        if len(self.brick_opens) < len(self.brick_closes):
+            self.brick_opens = [self.brick_closes[0]] + self.brick_closes[:-1]
+        if self.brick_opens and len(self.brick_opens) >= RENKO_SMA_PERIOD:
+            self.renko_sma = sum(self.brick_opens[-RENKO_SMA_PERIOD:]) / RENKO_SMA_PERIOD
+        if self.brick_closes and len(self.brick_closes) >= BB_PERIOD:
+            bb_data = self.brick_closes[-BB_PERIOD:]
+            self.bb_middle = sum(bb_data) / BB_PERIOD
+            variance = sum((x - self.bb_middle) ** 2 for x in bb_data) / BB_PERIOD
+            std_dev = math.sqrt(variance)
+            self.bb_upper = self.bb_middle + BB_STDDEV * std_dev
+            self.bb_lower = self.bb_middle - BB_STDDEV * std_dev
         return True
 
     def _add_brick_data(self, brick_open, brick_close):
         self.brick_closes.append(brick_close)
+        self.brick_opens.append(brick_open)
 
     def _calc_indicators(self):
         n = len(self.brick_closes)
@@ -526,6 +550,17 @@ class SymbolState:
             self.prev_macd_hist = self.macd_hist
             self.macd_hist = self.macd_line - self.macd_signal_ema
 
+        if len(self.brick_opens) >= RENKO_SMA_PERIOD:
+            self.renko_sma = sum(self.brick_opens[-RENKO_SMA_PERIOD:]) / RENKO_SMA_PERIOD
+
+        if n >= BB_PERIOD:
+            bb_data = self.brick_closes[-BB_PERIOD:]
+            self.bb_middle = sum(bb_data) / BB_PERIOD
+            variance = sum((x - self.bb_middle) ** 2 for x in bb_data) / BB_PERIOD
+            std_dev = math.sqrt(variance)
+            self.bb_upper = self.bb_middle + BB_STDDEV * std_dev
+            self.bb_lower = self.bb_middle - BB_STDDEV * std_dev
+
     async def seed_history(self):
         data = await self.ctx.data.get_data("1sec", bars=800)
         if data is None or len(data) == 0:
@@ -536,6 +571,7 @@ class SymbolState:
         print(f"[{self.symbol}] Seeding from {len(rows)} historical 1sec bars...")
 
         self.brick_closes = []
+        self.brick_opens = []
         self.ema = None
         self.prev_price_side = None
         self.macd_fast_ema = None
@@ -544,6 +580,11 @@ class SymbolState:
         self.macd_signal_ema = None
         self.macd_hist = None
         self.prev_macd_hist = None
+        self.renko_sma = None
+        self.bb_middle = None
+        self.bb_upper = None
+        self.bb_lower = None
+        self.prev_smooth_vs_rma = None
 
         for row in rows:
             close = float(row["close"])
@@ -552,16 +593,16 @@ class SymbolState:
                 self._add_brick_data(brick[0], brick[1])
                 self._calc_indicators()
 
-        if self.ema is not None and self.brick_closes:
-            self.prev_price_side = "ABOVE" if self.brick_closes[-1] > self.ema else "BELOW"
+        if self.renko_sma is not None and len(self.brick_closes) >= PRICE_SMOOTH_PERIOD:
+            smooth_price = sum(self.brick_closes[-PRICE_SMOOTH_PERIOD:]) / PRICE_SMOOTH_PERIOD
+            self.prev_smooth_vs_rma = "ABOVE" if smooth_price > self.renko_sma else "BELOW"
 
         dir_str = "BULLISH" if self.renko.direction == 1 else "BEARISH" if self.renko.direction == -1 else "NONE"
         print(f"  [{self.symbol}] Renko: {self.renko.brick_count} bricks, {dir_str}, ref={self.renko.last_close:.2f}")
-        print(f"  [{self.symbol}] Data: {len(self.brick_closes)} brick closes")
-        ema_str = f"{self.ema:.2f}" if self.ema is not None else "N/A"
-        side_str = self.prev_price_side or "N/A"
-        macd_str = f"{self.macd_hist:.2f}" if self.macd_hist is not None else "N/A"
-        print(f"  [{self.symbol}] EMA9: {ema_str} | Price vs EMA: {side_str} | MACD Hist: {macd_str}")
+        print(f"  [{self.symbol}] Data: {len(self.brick_closes)} brick closes, {len(self.brick_opens)} brick opens")
+        rma_str = f"{self.renko_sma:.2f}" if self.renko_sma is not None else "N/A"
+        bb_str = f"Upper={self.bb_upper:.2f} Mid={self.bb_middle:.2f} Lower={self.bb_lower:.2f}" if self.bb_upper is not None else "N/A"
+        print(f"  [{self.symbol}] RMA(12): {rma_str} | BB(20,2): {bb_str}")
 
     def print_status(self):
         now = datetime.now(ET).strftime("%H:%M:%S")
@@ -570,14 +611,15 @@ class SymbolState:
 
         print(f"  [{self.symbol} @ {now}]")
         print(f"    Renko: {dir_str} | last_close={self.renko.last_close:.2f} | bricks={self.renko.brick_count}")
-        ema_str = f"{self.ema:.2f}" if self.ema is not None else "N/A"
-        side_str = self.prev_price_side or "N/A"
-        macd_str = f"{self.macd_hist:.2f}" if self.macd_hist is not None else "N/A"
-        print(f"    EMA9: {ema_str} | Price vs EMA: {side_str} | MACD Hist: {macd_str}")
-        gap_str = self.bridge_gap or "NONE"
-        prev_dir = "BULL" if self.prev_brick_direction == 1 else "BEAR" if self.prev_brick_direction == -1 else "N/A"
-        print(f"    Bridge Gap: {gap_str} | Last Brick: {prev_dir}")
-        print(f"    Position: {pos_str} | P&L: ${self.live_pnl:.2f} | PV: ${self.point_value}/pt")
+        rma_str = f"{self.renko_sma:.2f}" if self.renko_sma is not None else "N/A"
+        cross_str = self.prev_smooth_vs_rma or "N/A"
+        print(f"    Renko SMA(12): {rma_str} | Smooth vs RMA: {cross_str}")
+        bb_u = f"{self.bb_upper:.2f}" if self.bb_upper is not None else "N/A"
+        bb_m = f"{self.bb_middle:.2f}" if self.bb_middle is not None else "N/A"
+        bb_l = f"{self.bb_lower:.2f}" if self.bb_lower is not None else "N/A"
+        print(f"    BB(20,2): Upper={bb_u} | Mid={bb_m} | Lower={bb_l}")
+        tp_str = f"{self.tp_target:.2f}" if self.tp_target is not None else "N/A"
+        print(f"    Position: {pos_str} | TP: {tp_str} | P&L: ${self.live_pnl:.2f} | PV: ${self.point_value}/pt")
 
     def is_data_stale(self, threshold=120):
         if self.last_new_bar_time is None:
@@ -721,95 +763,61 @@ class SymbolState:
                 brick_dir = b[2]
                 brick_color = "BULLISH" if brick_dir == 1 else "BEARISH"
 
-                # Check for bridge gap reversal BEFORE updating indicators
-                if (self.prev_brick_direction is not None
-                        and brick_dir != self.prev_brick_direction
-                        and self.bridge_gap is not None
-                        and self.ema is not None
-                        and self.position == 0):
-                    gap_dist = abs(max(b[0], b[1]) - self.ema) if self.bridge_gap == "BELOW" else abs(min(b[0], b[1]) - self.ema)
-                    if self.bridge_gap == "BELOW" and brick_dir == 1:
-                        entry_signal = "LONG"
-                        print(f"[{now}] [{self.symbol} BRIDGE] Color flip BULLISH while gap BELOW EMA {self.ema:.2f} (gap ~{gap_dist:.1f}pts)")
-                    elif self.bridge_gap == "ABOVE" and brick_dir == -1:
-                        entry_signal = "SHORT"
-                        print(f"[{now}] [{self.symbol} BRIDGE] Color flip BEARISH while gap ABOVE EMA {self.ema:.2f} (gap ~{gap_dist:.1f}pts)")
-
                 self._add_brick_data(b[0], b[1])
                 self._calc_indicators()
 
-                ema_str = f"EMA: {self.ema:.2f}" if self.ema is not None else "EMA: N/A"
-                print(f"[{now}] [{self.symbol} RENKO] {brick_color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | {ema_str}")
+                rma_str = f"RMA: {self.renko_sma:.2f}" if self.renko_sma is not None else "RMA: N/A"
+                bb_str = ""
+                if self.bb_upper is not None:
+                    bb_str = f" | BB: {self.bb_lower:.2f}/{self.bb_middle:.2f}/{self.bb_upper:.2f}"
+                print(f"[{now}] [{self.symbol} RENKO] {brick_color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | {rma_str}{bb_str}")
 
-                if self.ema is not None and self.brick_closes:
-                    bc = self.brick_closes[-1]
-                    if bc > self.ema:
-                        new_side = "ABOVE"
-                    elif bc < self.ema:
-                        new_side = "BELOW"
+                if self.renko_sma is not None and len(self.brick_closes) >= PRICE_SMOOTH_PERIOD:
+                    smooth_price = sum(self.brick_closes[-PRICE_SMOOTH_PERIOD:]) / PRICE_SMOOTH_PERIOD
+                    if smooth_price > self.renko_sma:
+                        cur_side = "ABOVE"
+                    elif smooth_price < self.renko_sma:
+                        cur_side = "BELOW"
                     else:
-                        new_side = self.prev_price_side
-                    if new_side is not None:
-                        self.prev_price_side = new_side
+                        cur_side = self.prev_smooth_vs_rma
 
-                # Update bridge gap: is this brick fully on one side of EMA?
-                if self.ema is not None:
-                    brick_high = max(b[0], b[1])
-                    brick_low = min(b[0], b[1])
-                    if brick_high < self.ema:
-                        self.bridge_gap = "BELOW"
-                    elif brick_low > self.ema:
-                        self.bridge_gap = "ABOVE"
-                    else:
-                        self.bridge_gap = None
+                    if self.prev_smooth_vs_rma is not None and cur_side != self.prev_smooth_vs_rma and self.position == 0:
+                        if cur_side == "ABOVE":
+                            entry_signal = "LONG"
+                            print(f"[{now}] [{self.symbol} CROSS] Bullish crossover | Smooth {smooth_price:.2f} crossed ABOVE RMA {self.renko_sma:.2f}")
+                        elif cur_side == "BELOW":
+                            entry_signal = "SHORT"
+                            print(f"[{now}] [{self.symbol} CROSS] Bearish crossover | Smooth {smooth_price:.2f} crossed BELOW RMA {self.renko_sma:.2f}")
+
+                    self.prev_smooth_vs_rma = cur_side
 
                 self.prev_brick_direction = brick_dir
 
-            # Set pending entry signal (wait for confirmation, don't enter immediately)
-            if entry_signal is not None and self.position == 0:
-                last_b = bricks[-1]
-                threshold = last_b[1]
-                self.pending_bridge_signal = entry_signal
-                self.pending_bridge_confirm_after = now_ts + 3.0
-                self.pending_bridge_threshold = threshold
-                print(f"[{now}] [{self.symbol} PENDING] {entry_signal} signal set | Confirming in 3s if price holds {'below' if entry_signal == 'SHORT' else 'above'} {threshold:.2f}")
-
-            # New brick during pending signal = cancel (price reversed)
-            if self.pending_bridge_signal and bricks:
-                last_dir = bricks[-1][2]
-                if self.pending_bridge_signal == "SHORT" and last_dir == 1:
-                    print(f"[{now}] [{self.symbol} CANCEL] Pending SHORT cancelled - bullish brick formed (price recovered)")
-                    self.pending_bridge_signal = None
-                elif self.pending_bridge_signal == "LONG" and last_dir == -1:
-                    print(f"[{now}] [{self.symbol} CANCEL] Pending LONG cancelled - bearish brick formed (price recovered)")
-                    self.pending_bridge_signal = None
-
-        if self.ema is None:
-            return True
-
-        # Confirm pending bridge gap entry after delay
-        if self.pending_bridge_signal and self.position == 0 and now_ts >= self.pending_bridge_confirm_after:
-            confirmed = False
-            if self.pending_bridge_signal == "SHORT" and price <= self.pending_bridge_threshold:
-                confirmed = True
-            elif self.pending_bridge_signal == "LONG" and price >= self.pending_bridge_threshold:
-                confirmed = True
-
-            if confirmed:
+            if entry_signal is not None and self.position == 0 and self.bb_upper is not None:
                 if now_ts - self.last_exit_time < self.ENTRY_COOLDOWN:
                     remaining = int(self.ENTRY_COOLDOWN - (now_ts - self.last_exit_time))
-                    print(f"[{now}] [{self.symbol} COOLDOWN] {self.pending_bridge_signal} confirmed but cooldown - {remaining}s remaining")
-                elif self.pending_bridge_signal == "SHORT":
-                    print(f"[{now}] [{self.symbol} SIGNAL] SHORT CONFIRMED | Price {price:.2f} still below {self.pending_bridge_threshold:.2f} after 3s")
-                    self.pending_bridge_signal = None
-                    await self._enter_short(price)
-                elif self.pending_bridge_signal == "LONG":
-                    print(f"[{now}] [{self.symbol} SIGNAL] LONG CONFIRMED | Price {price:.2f} still above {self.pending_bridge_threshold:.2f} after 3s")
-                    self.pending_bridge_signal = None
-                    await self._enter_long(price)
-            else:
-                print(f"[{now}] [{self.symbol} CANCEL] Pending {self.pending_bridge_signal} cancelled - price {price:.2f} recovered past {self.pending_bridge_threshold:.2f}")
-                self.pending_bridge_signal = None
+                    print(f"[{now}] [{self.symbol} COOLDOWN] {entry_signal} signal but cooldown - {remaining}s remaining")
+                elif entry_signal == "LONG":
+                    room = self.bb_upper - price
+                    if room >= MIN_BB_ROOM:
+                        print(f"[{now}] [{self.symbol} ENTRY] LONG | Room to upper BB: {room:.1f}pts (>= {MIN_BB_ROOM})")
+                        self.tp_target = self.bb_upper
+                        await self._enter_long(price)
+                    else:
+                        print(f"[{now}] [{self.symbol} BB FILTER] LONG skipped - only {room:.1f}pts room to upper BB {self.bb_upper:.2f} (need {MIN_BB_ROOM})")
+                elif entry_signal == "SHORT":
+                    room = price - self.bb_lower
+                    if room >= MIN_BB_ROOM:
+                        print(f"[{now}] [{self.symbol} ENTRY] SHORT | Room to lower BB: {room:.1f}pts (>= {MIN_BB_ROOM})")
+                        self.tp_target = self.bb_lower
+                        await self._enter_short(price)
+                    else:
+                        print(f"[{now}] [{self.symbol} BB FILTER] SHORT skipped - only {room:.1f}pts room to lower BB {self.bb_lower:.2f} (need {MIN_BB_ROOM})")
+            elif entry_signal is not None and self.bb_upper is None:
+                print(f"[{now}] [{self.symbol} WAIT] {entry_signal} signal but BB not ready (need {BB_PERIOD} bricks)")
+
+        if self.renko_sma is None:
+            return True
 
         # Stop loss: 2 bricks (10 pts = $200) from entry
         stop_dist = self.brick_size * 2
@@ -820,6 +828,7 @@ class SymbolState:
                 self.ml.record_trade(self.entry_features, trade_pnl, source="stop_loss")
                 self.entry_features = None
             await self._flatten(price, reason="STOP_LOSS")
+            self.tp_target = None
             self.last_exit_time = now_ts
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
@@ -833,38 +842,47 @@ class SymbolState:
                 self.ml.record_trade(self.entry_features, trade_pnl, source="stop_loss")
                 self.entry_features = None
             await self._flatten(price, reason="STOP_LOSS")
+            self.tp_target = None
             self.last_exit_time = now_ts
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
                 "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
             return True
 
-        # Take profit: price reaches EMA (mean reversion target)
-        if self.position == 1 and price >= self.ema:
+        # Take profit: price reaches target BB band
+        if self.position == 1 and self.tp_target is not None and price >= self.tp_target:
             trade_pnl = (price - self.entry_price) * self.point_value * self.qty
-            print(f"[{now}] [{self.symbol} TP] LONG reached EMA {self.ema:.2f} @ {price:.2f} | +${trade_pnl:.2f}")
+            print(f"[{now}] [{self.symbol} TP] LONG reached upper BB {self.tp_target:.2f} @ {price:.2f} | +${trade_pnl:.2f}")
             if self.ml and self.entry_features:
                 self.ml.record_trade(self.entry_features, trade_pnl, source="take_profit")
                 self.entry_features = None
-            await self._flatten(price, reason="EMA_TP")
+            await self._flatten(price, reason="BB_TP")
+            self.tp_target = None
             self.last_exit_time = now_ts
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
                 "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
             return True
 
-        if self.position == -1 and price <= self.ema:
+        if self.position == -1 and self.tp_target is not None and price <= self.tp_target:
             trade_pnl = (self.entry_price - price) * self.point_value * self.qty
-            print(f"[{now}] [{self.symbol} TP] SHORT reached EMA {self.ema:.2f} @ {price:.2f} | +${trade_pnl:.2f}")
+            print(f"[{now}] [{self.symbol} TP] SHORT reached lower BB {self.tp_target:.2f} @ {price:.2f} | +${trade_pnl:.2f}")
             if self.ml and self.entry_features:
                 self.ml.record_trade(self.entry_features, trade_pnl, source="take_profit")
                 self.entry_features = None
-            await self._flatten(price, reason="EMA_TP")
+            await self._flatten(price, reason="BB_TP")
+            self.tp_target = None
             self.last_exit_time = now_ts
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
                 "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
             return True
+
+        # Update TP target dynamically with current BB bands
+        if self.position == 1 and self.bb_upper is not None:
+            self.tp_target = self.bb_upper
+        elif self.position == -1 and self.bb_lower is not None:
+            self.tp_target = self.bb_lower
 
         # Position sync (30s interval)
         if now_ts - self.last_position_sync_time >= self.POSITION_SYNC_INTERVAL:
