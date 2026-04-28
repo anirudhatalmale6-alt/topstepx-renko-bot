@@ -857,19 +857,13 @@ class SymbolState:
             pass
 
     async def _ensure_flat_before_entry(self):
-        real_pos = await self._try_get_real_position()
-        if real_pos is not None and real_pos == 0:
-            return
         try:
             await asyncio.wait_for(
                 self.ctx.positions.close_position_direct(
                     contract_id=self.ctx.instrument_info.id),
                 timeout=5.0)
             now = datetime.now(ET).strftime("%H:%M:%S")
-            if real_pos is None:
-                print(f"[{now}] [{self.symbol}] Pre-entry safety: sent close (position check unavailable)")
-            else:
-                print(f"[{now}] [{self.symbol}] Pre-entry safety: cleared unknown position (was {real_pos})")
+            print(f"[{now}] [{self.symbol}] Pre-entry safety: cleared any unknown position")
         except Exception:
             pass
 
@@ -988,14 +982,6 @@ class SymbolState:
         print(f"\n[{now}] [{self.symbol}] <<< EXITING {direction} @ {price:.2f} | Trade: ${trade_pnl:+.2f} | P&L (est): ${self.live_pnl + trade_pnl:.2f} | {reason}")
 
         async def _do_close():
-            real_pos = await self._try_get_real_position()
-            if real_pos == 0:
-                print(
-                    f"[{self.symbol}] _flatten pre-flight: platform already FLAT "
-                    f"(TP/SL / manual / auto-liq) - skipping close_position_direct "
-                    f"to avoid opening an accidental reverse position."
-                )
-                return True
             try:
                 await asyncio.wait_for(
                     self.ctx.positions.close_position_direct(
