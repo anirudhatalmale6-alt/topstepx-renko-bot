@@ -98,6 +98,9 @@ class RenkoEngine:
         self.brick_count = 0
 
     def initialize(self, price: float):
+        if self.brick_size <= 0:
+            self.last_close = price
+            return
         self.last_close = round(price / self.brick_size) * self.brick_size
 
     def feed_close(self, close_price: float) -> list:
@@ -105,8 +108,14 @@ class RenkoEngine:
             self.initialize(close_price)
             return []
 
+        if self.brick_size <= 0:
+            return []
+
         new_bricks = []
-        while True:
+        MAX_BRICKS_PER_FEED = 10000
+        iterations = 0
+        while iterations < MAX_BRICKS_PER_FEED:
+            iterations += 1
             if close_price >= self.last_close + self.brick_size:
                 new_open = self.last_close
                 new_close = self.last_close + self.brick_size
@@ -123,6 +132,8 @@ class RenkoEngine:
                 self.brick_count += 1
             else:
                 break
+        if iterations >= MAX_BRICKS_PER_FEED:
+            print(f"[RENKO {self.label}] WARNING: hit safety cap of {MAX_BRICKS_PER_FEED} bricks - input price={close_price}, brick_size={self.brick_size}")
         return new_bricks
 
     def feed_ohlc(self, high: float, low: float, close: float) -> list:
@@ -381,7 +392,7 @@ class SymbolState:
         self.brick_closes = []
 
         self.ema = None
-        self.prev_price_side = None  # "ABOVE" or "BELOW" based on live price vs EMA
+        self.prev_price_side = None  # "ABOVE" or "BELOW" based on last brick close vs EMA
 
         self.macd_fast_ema = None
         self.macd_slow_ema = None
@@ -403,13 +414,19 @@ class SymbolState:
 
         self.live_pnl = 0.0
 
+        # Connection / freshness tracking
+        self.last_new_bar_time = None
+        self.last_price_change_time = None
+        self.last_known_price = None
+        # Order error state: "ok" | "rejected" | "timeout" | "error" | None
+        self.last_order_error = None
+
         self.trade_log_file = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), f"trade_log_{symbol}.jsonl"
         )
 
         self.ml = None
         self.ctx = None
-        self.last_new_bar_time = None
 
     def save_state(self) -> dict:
         return {
@@ -430,6 +447,8 @@ class SymbolState:
             "position": self.position,
             "entry_price": self.entry_price,
             "live_pnl": self.live_pnl,
+            "pending_range_high": self.pending_range_high,
+            "pending_range_low": self.pending_range_low,
             "saved_at": time.time(),
         }
 
@@ -452,6 +471,8 @@ class SymbolState:
         self.position = state.get("position", 0)
         self.entry_price = state.get("entry_price", 0.0)
         self.live_pnl = state.get("live_pnl", 0.0)
+        self.pending_range_high = state.get("pending_range_high")
+        self.pending_range_low = state.get("pending_range_low")
         return True
 
     def _add_brick_data(self, brick_open, brick_close):
@@ -542,26 +563,33 @@ class SymbolState:
         print(f"    Position: {pos_str} | P&L: ${self.live_pnl:.2f} | PV: ${self.point_value}/pt")
 
     def is_data_stale(self, threshold=120):
-        """Check if we haven't received fresh bar data in threshold seconds."""
         if self.last_new_bar_time is None:
             return False
         return (time.time() - self.last_new_bar_time) > threshold
 
+    def is_price_frozen(self, threshold=90):
+        if self.last_price_change_time is None:
+            return False
+        return (time.time() - self.last_price_change_time) > threshold
+
     async def tick(self):
         if self.ctx is None:
-            return
+            return True
 
         price = await self.ctx.data.get_current_price()
         if price is None:
-            return
+            return True
 
+        # Track price-change for frozen-feed detection (independent of tick gating)
+        if self.last_known_price is None or price != self.last_known_price:
+            self.last_known_price = price
+            self.last_price_change_time = time.time()
         self.last_price = price
 
         now_ts = time.time()
         if now_ts - self.last_tick_time < self.tick_interval:
             return True
         self.last_tick_time = now_ts
-        self.last_new_bar_time = now_ts
 
         # Position sync disabled: SDK get_all_positions() broken (contractDisplayName bug)
         # Bot relies on EMA exit signals; platform TP/SL acts as safety net
@@ -570,7 +598,14 @@ class SymbolState:
         bricks = self.renko.feed_close(price)
         now = datetime.now(ET).strftime("%H:%M:%S")
 
+        # EMA-cross detection happens PER BRICK (not on live price ticks).
+        flipped = False
+        flip_above = False
+        flip_below = False
+        flip_brick = None
+
         if bricks:
+            self.last_new_bar_time = now_ts
             for b in bricks:
                 brick_dir = b[2]
                 brick_color = "BULLISH" if brick_dir == 1 else "BEARISH"
@@ -582,26 +617,42 @@ class SymbolState:
                 prev_h = f"prev: {self.prev_macd_hist:.2f}" if self.prev_macd_hist is not None else ""
                 print(f"[{now}] [{self.symbol} RENKO] {brick_color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | {ema_str} | {macd_h} {prev_h}")
 
+                # Check EMA cross on THIS brick close (not live price)
+                if self.ema is not None and self.brick_closes:
+                    bc = self.brick_closes[-1]
+                    if bc > self.ema:
+                        new_side = "ABOVE"
+                    elif bc < self.ema:
+                        new_side = "BELOW"
+                    else:
+                        new_side = self.prev_price_side
+                    if (self.prev_price_side is not None
+                            and new_side is not None
+                            and new_side != self.prev_price_side):
+                        flipped = True
+                        flip_above = (new_side == "ABOVE")
+                        flip_below = (new_side == "BELOW")
+                        flip_brick = b
+                    if new_side is not None:
+                        self.prev_price_side = new_side
+
         if self.ema is None:
             return True
 
-        above_ema = price > self.ema
-        below_ema = price < self.ema
-        curr_side = "ABOVE" if above_ema else "BELOW"
-
-        flipped = self.prev_price_side is not None and curr_side != self.prev_price_side
-        self.prev_price_side = curr_side
+        last_bc = self.brick_closes[-1] if self.brick_closes else price
+        above_ema = last_bc > self.ema
+        below_ema = last_bc < self.ema
 
         macd_rising = (self.macd_hist is not None and self.prev_macd_hist is not None
                        and self.macd_hist > self.prev_macd_hist)
         macd_falling = (self.macd_hist is not None and self.prev_macd_hist is not None
                         and self.macd_hist < self.prev_macd_hist)
 
-        # Exit on price crossing EMA
+        # Exit on brick-close EMA flip
         if flipped:
-            if above_ema and self.position == -1:
+            if flip_above and self.position == -1:
                 trade_pnl = (self.entry_price - price) * self.point_value * self.qty
-                print(f"[{now}] [{self.symbol} EXIT] Price {price:.2f} crossed above EMA {self.ema:.2f} | Closing SHORT")
+                print(f"[{now}] [{self.symbol} EXIT] Brick close crossed above EMA {self.ema:.2f} | Closing SHORT")
                 if self.ml and self.entry_features:
                     self.ml.record_trade(self.entry_features, trade_pnl, source="bot_ema_exit")
                     self.entry_features = None
@@ -610,9 +661,9 @@ class SymbolState:
                     self.tg_token, self.tg_chat, self.tg_keys,
                     "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
 
-            elif below_ema and self.position == 1:
+            elif flip_below and self.position == 1:
                 trade_pnl = (price - self.entry_price) * self.point_value * self.qty
-                print(f"[{now}] [{self.symbol} EXIT] Price {price:.2f} crossed below EMA {self.ema:.2f} | Closing LONG")
+                print(f"[{now}] [{self.symbol} EXIT] Brick close crossed below EMA {self.ema:.2f} | Closing LONG")
                 if self.ml and self.entry_features:
                     self.ml.record_trade(self.entry_features, trade_pnl, source="bot_ema_exit")
                     self.entry_features = None
@@ -621,30 +672,31 @@ class SymbolState:
                     self.tg_token, self.tg_chat, self.tg_keys,
                     "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
 
-        # Cancel existing pending range if EMA crosses back before breakout
+        # Cancel existing pending range if EMA flipped back before breakout
         if flipped and self.pending_range_high is not None:
-            print(f"[{now}] [{self.symbol} RANGE] Cancelled - EMA crossed back")
+            print(f"[{now}] [{self.symbol} RANGE] Cancelled - EMA flipped back")
             self.pending_range_high = None
             self.pending_range_low = None
 
-        # On EMA cross while flat + MACD confirms: set up breakout range from the crossing brick
-        if flipped and self.position == 0 and bricks:
-            last_brick = bricks[-1]
-            range_high = max(last_brick[0], last_brick[1])
-            range_low = min(last_brick[0], last_brick[1])
+        # On EMA flip while flat + MACD confirms: arm a breakout range from the flip brick
+        if flipped and self.position == 0 and flip_brick is not None:
+            range_high = max(flip_brick[0], flip_brick[1])
+            range_low = min(flip_brick[0], flip_brick[1])
 
-            if above_ema and macd_rising:
+            if flip_above and macd_rising:
                 self.pending_range_high = range_high
                 self.pending_range_low = range_low
                 print(f"[{now}] [{self.symbol} RANGE] EMA cross + MACD rising | Waiting for breakout of {range_low:.2f} - {range_high:.2f}")
-            elif below_ema and macd_falling:
+            elif flip_below and macd_falling:
                 self.pending_range_high = range_high
                 self.pending_range_low = range_low
                 print(f"[{now}] [{self.symbol} RANGE] EMA cross + MACD falling | Waiting for breakout of {range_low:.2f} - {range_high:.2f}")
-            elif above_ema:
-                print(f"[{now}] [{self.symbol} SKIP] Cross above EMA but MACD not confirming ({self.macd_hist:.2f}) - no range set")
-            elif below_ema:
-                print(f"[{now}] [{self.symbol} SKIP] Cross below EMA but MACD not confirming ({self.macd_hist:.2f}) - no range set")
+            elif flip_above:
+                macd_str = f"{self.macd_hist:.2f}" if self.macd_hist is not None else "N/A"
+                print(f"[{now}] [{self.symbol} SKIP] Cross above EMA but MACD not confirming ({macd_str}) - no range set")
+            elif flip_below:
+                macd_str = f"{self.macd_hist:.2f}" if self.macd_hist is not None else "N/A"
+                print(f"[{now}] [{self.symbol} SKIP] Cross below EMA but MACD not confirming ({macd_str}) - no range set")
 
         # Check for breakout of pending range
         if self.position == 0 and self.pending_range_high is not None:
@@ -715,102 +767,152 @@ class SymbolState:
     async def _enter_long(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG @ {price:.2f} | P&L: ${self.live_pnl:.2f}")
-        try:
-            response = await asyncio.wait_for(
-                self.ctx.orders.place_market_order(
-                    contract_id=self.ctx.instrument_info.id,
-                    side=0,
-                    size=self.qty,
-                ),
-                timeout=15.0,
-            )
-            if response.success:
-                self.position = 1
-                self.entry_price = price
-                self.entry_time = datetime.now(ET)
-                print(f"[{self.symbol}] Order filled. ID: {response.orderId}")
-                threading.Thread(target=send_signals, args=(
-                    self.tg_token, self.tg_chat, self.tg_keys,
-                    "LONG", self.symbol, price, self.qty), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-            else:
-                print(f"[{self.symbol}] Order FAILED: {response.errorMessage}")
-                threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
-                    f"ALERT|{self.symbol} LONG order FAILED @ {price:.2f}"), daemon=True).start()
-                return False
-        except Exception as e:
-            print(f"[{self.symbol}] Order ERROR: {e}")
+
+        async def _do_order():
+            try:
+                response = await asyncio.wait_for(
+                    self.ctx.orders.place_market_order(
+                        contract_id=self.ctx.instrument_info.id,
+                        side=0,
+                        size=self.qty,
+                    ),
+                    timeout=15.0,
+                )
+                if response.success:
+                    self.position = 1
+                    self.entry_price = price
+                    self.entry_time = datetime.now(ET)
+                    print(f"[{self.symbol}] Order filled. ID: {response.orderId}")
+                    return "ok"
+                else:
+                    print(f"[{self.symbol}] Order REJECTED: {response.errorMessage}")
+                    return "rejected"
+            except asyncio.TimeoutError:
+                print(f"[{self.symbol}] Order TIMEOUT (15s)")
+                return "timeout"
+            except Exception as ex:
+                print(f"[{self.symbol}] Order ERROR: {ex}")
+                return "error"
+
+        result = await asyncio.shield(_do_order())
+        self.last_order_error = result if result != "ok" else None
+
+        if result == "ok":
+            threading.Thread(target=send_signals, args=(
+                self.tg_token, self.tg_chat, self.tg_keys,
+                "LONG", self.symbol, price, self.qty), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+            return True
+        elif result == "rejected":
+            threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
+                f"ALERT|{self.symbol} LONG order REJECTED @ {price:.2f}"), daemon=True).start()
+            return False
+        else:
             await self._cleanup_ghost_position()
             threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
-                f"ALERT|{self.symbol} LONG order ERROR @ {price:.2f} - reconnecting"), daemon=True).start()
+                f"ALERT|{self.symbol} LONG order {result.upper()} @ {price:.2f} - reconnecting"), daemon=True).start()
             return False
-        return True
 
     async def _enter_short(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT @ {price:.2f} | P&L: ${self.live_pnl:.2f}")
-        try:
-            response = await asyncio.wait_for(
-                self.ctx.orders.place_market_order(
-                    contract_id=self.ctx.instrument_info.id,
-                    side=1,
-                    size=self.qty,
-                ),
-                timeout=15.0,
-            )
-            if response.success:
-                self.position = -1
-                self.entry_price = price
-                self.entry_time = datetime.now(ET)
-                print(f"[{self.symbol}] Order filled. ID: {response.orderId}")
-                threading.Thread(target=send_signals, args=(
-                    self.tg_token, self.tg_chat, self.tg_keys,
-                    "SHORT", self.symbol, price, self.qty), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-            else:
-                print(f"[{self.symbol}] Order FAILED: {response.errorMessage}")
-                threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
-                    f"ALERT|{self.symbol} SHORT order FAILED @ {price:.2f}"), daemon=True).start()
-                return False
-        except Exception as e:
-            print(f"[{self.symbol}] Order ERROR: {e}")
+
+        async def _do_order():
+            try:
+                response = await asyncio.wait_for(
+                    self.ctx.orders.place_market_order(
+                        contract_id=self.ctx.instrument_info.id,
+                        side=1,
+                        size=self.qty,
+                    ),
+                    timeout=15.0,
+                )
+                if response.success:
+                    self.position = -1
+                    self.entry_price = price
+                    self.entry_time = datetime.now(ET)
+                    print(f"[{self.symbol}] Order filled. ID: {response.orderId}")
+                    return "ok"
+                else:
+                    print(f"[{self.symbol}] Order REJECTED: {response.errorMessage}")
+                    return "rejected"
+            except asyncio.TimeoutError:
+                print(f"[{self.symbol}] Order TIMEOUT (15s)")
+                return "timeout"
+            except Exception as ex:
+                print(f"[{self.symbol}] Order ERROR: {ex}")
+                return "error"
+
+        result = await asyncio.shield(_do_order())
+        self.last_order_error = result if result != "ok" else None
+
+        if result == "ok":
+            threading.Thread(target=send_signals, args=(
+                self.tg_token, self.tg_chat, self.tg_keys,
+                "SHORT", self.symbol, price, self.qty), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+            return True
+        elif result == "rejected":
+            threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
+                f"ALERT|{self.symbol} SHORT order REJECTED @ {price:.2f}"), daemon=True).start()
+            return False
+        else:
             await self._cleanup_ghost_position()
             threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
-                f"ALERT|{self.symbol} SHORT order ERROR @ {price:.2f} - reconnecting"), daemon=True).start()
+                f"ALERT|{self.symbol} SHORT order {result.upper()} @ {price:.2f} - reconnecting"), daemon=True).start()
             return False
-        return True
 
     async def _flatten(self, price: float, reason: str = ""):
+        if self.position == 0:
+            return True
+
         direction = "LONG" if self.position == 1 else "SHORT"
-        trade_pnl = (price - self.entry_price) * self.position * self.point_value * self.qty
-        self.live_pnl += trade_pnl
+        saved_entry_price = self.entry_price
+        saved_position = self.position
+        saved_qty = self.qty
+
+        trade_pnl = (price - saved_entry_price) * saved_position * self.point_value * saved_qty
 
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [{self.symbol}] <<< EXITING {direction} @ {price:.2f} | Trade: ${trade_pnl:+.2f} | P&L: ${self.live_pnl:.2f} | {reason}")
+        print(f"\n[{now}] [{self.symbol}] <<< EXITING {direction} @ {price:.2f} | Trade: ${trade_pnl:+.2f} | P&L (est): ${self.live_pnl + trade_pnl:.2f} | {reason}")
 
-        saved_entry_price = self.entry_price
-        self.position = 0
-        self.entry_price = 0.0
-        self.entry_time = None
+        async def _do_close():
+            try:
+                await asyncio.wait_for(
+                    self.ctx.positions.close_position_direct(
+                        contract_id=self.ctx.instrument_info.id,
+                    ),
+                    timeout=5.0,
+                )
+                print(f"[{self.symbol}] Position closed via close_position_direct")
+                return True
+            except asyncio.TimeoutError:
+                print(f"[{self.symbol}] close_position_direct TIMEOUT - assuming closed (TP/SL may have hit)")
+                return True
+            except Exception as ex:
+                print(f"[{self.symbol}] close_position_direct failed ({ex}) - likely already closed by TP/SL")
+                return True
 
-        try:
-            result = await asyncio.wait_for(
-                self.ctx.positions.close_position_direct(
-                    contract_id=self.ctx.instrument_info.id,
-                ),
-                timeout=5.0,
-            )
-            print(f"[{self.symbol}] Position closed via close_position_direct")
-        except Exception as e:
-            print(f"[{self.symbol}] close_position_direct failed ({e}) - likely already closed by TP/SL")
+        close_ok = await asyncio.shield(_do_close())
 
-        self._log_trade(direction, saved_entry_price, price, trade_pnl, reason)
-        return True
+        if close_ok:
+            saved_entry_time = self.entry_time
+            self.live_pnl += trade_pnl
+            self.position = 0
+            self.entry_price = 0.0
+            self.entry_time = None
+            self._log_trade(direction, saved_entry_price, price, trade_pnl, reason, saved_entry_time)
+        return close_ok
 
-    def _log_trade(self, direction, entry_price, exit_price, pnl, reason):
+    def _log_trade(self, direction, entry_price, exit_price, pnl, reason, entry_time=None):
         now = datetime.now(ET)
+        et_str = "N/A"
+        if entry_time is not None:
+            et_str = entry_time.strftime("%H:%M:%S")
+        elif self.entry_time is not None:
+            et_str = self.entry_time.strftime("%H:%M:%S")
         trade = {
             "date": now.strftime("%Y-%m-%d"),
             "symbol": self.symbol,
-            "entry_time": self.entry_time.strftime("%H:%M:%S") if self.entry_time else "N/A",
+            "entry_time": et_str,
             "exit_time": now.strftime("%H:%M:%S"),
             "direction": direction,
             "entry": entry_price,
@@ -870,10 +972,14 @@ class RenkoBot:
         self.RECONNECT_THRESHOLD = 90
         self.reconnecting = False
         self.last_reconnect_time = 0
+        self.reconnect_failures = 0
+        self.reconnect_cooldown = 5
+        self.RECONNECT_COOLDOWN_OK = 30
+        self.RECONNECT_COOLDOWN_MAX = 120
         self.last_status_notify = 0
         self.last_state_save = 0
         self.last_heartbeat = 0
-        self.HEARTBEAT_INTERVAL = 1800  # 30 min
+        self.HEARTBEAT_INTERVAL = 1800
         self.last_gateway_logout_time = 0
 
         self.suite = None
@@ -1051,10 +1157,11 @@ class RenkoBot:
     async def _auto_reconnect(self):
         from project_x_py import TradingSuite
         self.reconnecting = True
-        self.last_reconnect_time = time.time()
+        attempt_start = time.time()
+        self.last_reconnect_time = attempt_start
         now = datetime.now(ET).strftime("%H:%M:%S")
         symbols = self._symbols_list()
-        print(f"[{now}] [RECONNECT] Auto-reconnecting (indicators preserved)...")
+        print(f"[{now}] [RECONNECT] Auto-reconnecting (attempt #{self.reconnect_failures + 1}, indicators preserved)...")
         self._notify_status(f"STATUS|Auto-reconnecting ({now} ET)")
 
         if self.suite:
@@ -1071,11 +1178,18 @@ class RenkoBot:
             )
             for sym, st in self.states.items():
                 st.ctx = self.suite[sym]
+                st.last_known_price = None
+                st.last_price_change_time = time.time()
+                st.last_new_bar_time = time.time()
 
             self._register_gateway_logout()
             self.last_price_time = time.time()
             self.connection_alive = True
             self.disconnect_alert_sent = False
+
+            self.reconnect_failures = 0
+            self.reconnect_cooldown = self.RECONNECT_COOLDOWN_OK
+
             now = datetime.now(ET).strftime("%H:%M:%S")
             print(f"[{now}] [RECONNECT] WebSocket restored, indicators intact")
             send_telegram(self.tg_token, self.tg_chat, f"STATUS|RECONNECTED ({now} ET)")
@@ -1096,8 +1210,13 @@ class RenkoBot:
                         print(f"[{now}] [SAFETY] {sym} flatten failed: {e}")
 
         except Exception as e:
+            self.reconnect_failures += 1
+            self.reconnect_cooldown = min(
+                5 * (2 ** (self.reconnect_failures - 1)),
+                self.RECONNECT_COOLDOWN_MAX,
+            )
             now = datetime.now(ET).strftime("%H:%M:%S")
-            print(f"[{now}] [RECONNECT] Failed: {e} - will retry in 2 min")
+            print(f"[{now}] [RECONNECT] Failed (#{self.reconnect_failures}): {e} - retry in {self.reconnect_cooldown}s")
             self.suite = None
             for st in self.states.values():
                 st.ctx = None
@@ -1107,28 +1226,51 @@ class RenkoBot:
     async def _tick(self):
         if self.suite is None:
             if in_session() and not self.reconnecting:
-                if time.time() - self.last_reconnect_time > 120:
+                if time.time() - self.last_reconnect_time > self.reconnect_cooldown:
                     await self._auto_reconnect()
             return
 
-        # Check price health using first symbol
-        first_state = next(iter(self.states.values()))
-        price = await first_state.ctx.data.get_current_price() if first_state.ctx else None
         now_ts = time.time()
+        any_price_ok = False
+        any_price_frozen = False
+        frozen_sym = None
+        for sym, st in self.states.items():
+            if st.ctx is None:
+                continue
+            try:
+                p = await st.ctx.data.get_current_price()
+            except Exception:
+                p = None
+            if p is not None:
+                any_price_ok = True
+                if st.last_known_price is None or p != st.last_known_price:
+                    st.last_known_price = p
+                    st.last_price_change_time = now_ts
+                if st.is_price_frozen(threshold=90):
+                    any_price_frozen = True
+                    frozen_sym = sym
 
-        if price is None:
+        if not any_price_ok:
             if self.last_price_time and in_session():
                 elapsed = now_ts - self.last_price_time
                 if elapsed > self.STALE_THRESHOLD and not self.disconnect_alert_sent:
                     self.connection_alive = False
                     self.disconnect_alert_sent = True
                     now = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now}] [ALERT] No price data for {int(elapsed)}s")
+                    print(f"[{now}] [ALERT] No price data on any symbol for {int(elapsed)}s")
                     self._notify_status(f"STATUS|DISCONNECTED ({now} ET)")
                 if elapsed > self.RECONNECT_THRESHOLD and not self.reconnecting:
-                    if now_ts - self.last_reconnect_time > 120:
+                    if now_ts - self.last_reconnect_time > self.reconnect_cooldown:
                         await self._auto_reconnect()
             return
+
+        if any_price_frozen and in_session() and not self.reconnecting:
+            now = datetime.now(ET).strftime("%H:%M:%S")
+            print(f"[{now}] [FROZEN] {frozen_sym} price unchanged for 90+ seconds - forcing reconnect")
+            self._notify_status(f"STATUS|{frozen_sym} feed frozen, reconnecting ({now} ET)")
+            if now_ts - self.last_reconnect_time > self.reconnect_cooldown:
+                await self._auto_reconnect()
+                return
 
         self.last_price_time = now_ts
         if not self.connection_alive:
@@ -1191,24 +1333,29 @@ class RenkoBot:
             return
 
         # Tick each symbol's strategy
-        order_failed = False
+        connection_error = False
         for st in self.states.values():
-            result = await st.tick()
-            if result is False:
-                order_failed = True
+            try:
+                await st.tick()
+            except Exception as e:
+                print(f"[WARN] {st.symbol} tick() raised: {e}")
+                connection_error = True
+            if st.last_order_error in ("timeout", "error"):
+                connection_error = True
+                st.last_order_error = None
 
-        if order_failed and not self.reconnecting:
-            if time.time() - self.last_reconnect_time > 120:
+        if connection_error and not self.reconnecting:
+            if time.time() - self.last_reconnect_time > self.reconnect_cooldown:
                 await self._auto_reconnect()
 
-        # Stale data detection: if any symbol hasn't received new bar data in 2 min, reconnect
         if not self.reconnecting:
             for sym, st in self.states.items():
-                if st.is_data_stale(max(120, st.tick_interval * 3)):
+                stale_threshold = max(240, st.tick_interval * 4)
+                if st.is_data_stale(stale_threshold):
                     now = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now}] [STALE] {sym} no new data for 2+ min - reconnecting")
+                    print(f"[{now}] [STALE] {sym} no new brick for {stale_threshold}s - reconnecting")
                     self._notify_status(f"STATUS|{sym} data stale, reconnecting ({now} ET)")
-                    if time.time() - self.last_reconnect_time > 120:
+                    if time.time() - self.last_reconnect_time > self.reconnect_cooldown:
                         await self._auto_reconnect()
                     break
 
@@ -1222,7 +1369,7 @@ class RenkoBot:
             now = datetime.now(ET).strftime("%H:%M:%S")
             print(f"[{now}] [LOGOUT] GatewayLogout detected - reconnecting")
             self._notify_status(f"STATUS|GatewayLogout - reconnecting ({now} ET)")
-            if time.time() - self.last_reconnect_time > 120:
+            if time.time() - self.last_reconnect_time > self.reconnect_cooldown:
                 await self._auto_reconnect()
 
         # Heartbeat: send Telegram status every 30 min so client knows bot is alive
