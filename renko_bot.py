@@ -181,18 +181,6 @@ POINT_VALUES = {
 
 
 def in_session() -> bool:
-    now = datetime.now(ET)
-    if now.weekday() not in TRADING_DAYS:
-        return False
-    t = now.time()
-    if SESSION_START > SESSION_END:
-        in_main = t >= SESSION_START or t < SESSION_END
-    else:
-        in_main = SESSION_START <= t < SESSION_END
-    if not in_main:
-        return False
-    if BLACKOUT_START <= t < BLACKOUT_END:
-        return False
     return True
 
 
@@ -764,9 +752,22 @@ class SymbolState:
         except Exception:
             pass
 
+    async def _ensure_flat_before_entry(self):
+        try:
+            await asyncio.wait_for(
+                self.ctx.positions.close_position_direct(
+                    contract_id=self.ctx.instrument_info.id),
+                timeout=5.0)
+            now = datetime.now(ET).strftime("%H:%M:%S")
+            print(f"[{now}] [{self.symbol}] Pre-entry safety: cleared any unknown position")
+        except Exception:
+            pass
+
     async def _enter_long(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG @ {price:.2f} | P&L: ${self.live_pnl:.2f}")
+
+        await self._ensure_flat_before_entry()
 
         async def _do_order():
             try:
@@ -815,6 +816,8 @@ class SymbolState:
     async def _enter_short(self, price: float):
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT @ {price:.2f} | P&L: ${self.live_pnl:.2f}")
+
+        await self._ensure_flat_before_entry()
 
         async def _do_order():
             try:
