@@ -563,47 +563,8 @@ class SymbolState:
         self.last_tick_time = now_ts
         self.last_new_bar_time = now_ts
 
-        # Position sync: detect if TopstepX closed our position externally (TP/SL)
-        # Require 2 consecutive checks showing no position to avoid false FLAT
-        # from SDK contractDisplayName bug returning empty on error
-        if self.position != 0 and self.ctx:
-            try:
-                positions = await asyncio.wait_for(
-                    self.ctx.positions.get_all_positions(), timeout=5.0)
-                has_platform_pos = False
-                if positions:
-                    for p in positions:
-                        try:
-                            if hasattr(p, 'contractId') and p.contractId == self.ctx.instrument_info.id:
-                                has_platform_pos = True
-                        except Exception:
-                            pass
-                if has_platform_pos:
-                    self.sync_no_pos_count = 0
-                else:
-                    self.sync_no_pos_count += 1
-                    if self.sync_no_pos_count >= 2:
-                        direction = "LONG" if self.position == 1 else "SHORT"
-                        trade_pnl = (price - self.entry_price) * self.position * self.point_value * self.qty
-                        now = datetime.now(ET).strftime("%H:%M:%S")
-                        print(f"[{now}] [{self.symbol} SYNC] Platform closed {direction} (TP/SL) | Entry: {self.entry_price:.2f} | Exit~: {price:.2f} | PnL~: ${trade_pnl:+.2f}")
-                        if self.ml and self.entry_features:
-                            self.ml.record_trade(self.entry_features, trade_pnl, source="platform_close")
-                        self._log_trade(direction, self.entry_price, price, trade_pnl, "PLATFORM_TP_SL")
-                        self.live_pnl += trade_pnl
-                        self.position = 0
-                        self.entry_price = 0.0
-                        self.entry_time = None
-                        self.entry_features = None
-                        self.sync_no_pos_count = 0
-                        threading.Thread(target=send_signals, args=(
-                            self.tg_token, self.tg_chat, self.tg_keys,
-                            "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-                    else:
-                        now = datetime.now(ET).strftime("%H:%M:%S")
-                        print(f"[{now}] [{self.symbol} SYNC] No position found (check {self.sync_no_pos_count}/2) - confirming next tick")
-            except Exception as e:
-                pass
+        # Position sync disabled: SDK get_all_positions() broken (contractDisplayName bug)
+        # Bot relies on EMA exit signals; platform TP/SL acts as safety net
 
         # Feed Renko and update indicators on new bricks
         bricks = self.renko.feed_close(price)
@@ -826,29 +787,7 @@ class SymbolState:
             )
             print(f"[{self.symbol}] Position closed via close_position_direct")
         except Exception as e:
-            print(f"[{self.symbol}] close_position_direct failed ({e}), using market order fallback")
-            try:
-                close_side = 1 if direction == "LONG" else 0
-                response = await asyncio.wait_for(
-                    self.ctx.orders.place_market_order(
-                        contract_id=self.ctx.instrument_info.id,
-                        side=close_side,
-                        size=self.qty,
-                    ),
-                    timeout=15.0,
-                )
-                if response.success:
-                    print(f"[{self.symbol}] Position closed (fallback). ID: {response.orderId}")
-                else:
-                    print(f"[{self.symbol}] CLOSE FAILED: {response.errorMessage}")
-                    threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
-                        f"ALERT|{self.symbol} CLOSE FAILED - check manually!"), daemon=True).start()
-                    return False
-            except Exception as e2:
-                print(f"[{self.symbol}] Close ERROR: {e2}")
-                threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
-                    f"ALERT|{self.symbol} CLOSE ERROR - reconnecting"), daemon=True).start()
-                return False
+            print(f"[{self.symbol}] close_position_direct failed ({e}) - likely already closed by TP/SL")
 
         self._log_trade(direction, saved_entry_price, price, trade_pnl, reason)
         return True
