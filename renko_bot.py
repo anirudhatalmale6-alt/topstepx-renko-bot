@@ -165,7 +165,7 @@ BLACKOUT_END = dtime(10, 0)
 
 TRADING_DAYS = [0, 1, 2, 3, 4, 6]
 
-EMA_PERIOD = 9
+EMA_PERIOD = 5
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
@@ -868,6 +868,11 @@ class SymbolState:
             pass
 
     async def _enter_long(self, price: float):
+        if self.position != 0:
+            now = datetime.now(ET).strftime("%H:%M:%S")
+            direction = "LONG" if self.position == 1 else "SHORT"
+            print(f"[{now}] [{self.symbol}] BLOCKED LONG entry - already in {direction} (max 1 position)")
+            return False
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG @ {price:.2f} | P&L: ${self.live_pnl:.2f}")
 
@@ -918,6 +923,11 @@ class SymbolState:
             return False
 
     async def _enter_short(self, price: float):
+        if self.position != 0:
+            now = datetime.now(ET).strftime("%H:%M:%S")
+            direction = "LONG" if self.position == 1 else "SHORT"
+            print(f"[{now}] [{self.symbol}] BLOCKED SHORT entry - already in {direction} (max 1 position)")
+            return False
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT @ {price:.2f} | P&L: ${self.live_pnl:.2f}")
 
