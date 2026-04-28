@@ -8,7 +8,7 @@ Strategy: Renko Stop-and-Go Crossover with BB Filter
 - When smoothed price crosses renko MA → signal
 - BB(20,2) filter: only enter if >= 5pts room to target band
   - LONG: need room to upper BB | SHORT: need room to lower BB
-- EXIT: price reaches target BB band (TP) or 2-brick stop loss ($200)
+- EXIT: opposite crossover signal flips the position (no fixed SL/TP)
 
 Usage:
     python renko_bot.py --symbols "NQ:5:1:ntfy-topic" --tick-interval 1
@@ -818,7 +818,7 @@ class SymbolState:
                     else:
                         cur_side = self.prev_smooth_vs_rma
 
-                    if self.prev_smooth_vs_rma is not None and cur_side != self.prev_smooth_vs_rma and self.position == 0:
+                    if self.prev_smooth_vs_rma is not None and cur_side != self.prev_smooth_vs_rma:
                         if cur_side == "ABOVE":
                             entry_signal = "LONG"
                             print(f"[{now}] [{self.symbol} CROSS] Bullish crossover | Smooth {smooth_price:.2f} crossed ABOVE RMA {self.renko_sma:.2f}")
@@ -830,15 +830,21 @@ class SymbolState:
 
                 self.prev_brick_direction = brick_dir
 
-            if entry_signal is not None and self.position == 0 and self.bb_upper is not None:
-                if now_ts - self.last_exit_time < self.ENTRY_COOLDOWN:
-                    remaining = int(self.ENTRY_COOLDOWN - (now_ts - self.last_exit_time))
-                    print(f"[{now}] [{self.symbol} COOLDOWN] {entry_signal} signal but cooldown - {remaining}s remaining")
-                elif entry_signal == "LONG":
+            if entry_signal is not None and self.bb_upper is not None:
+                if self.position != 0:
+                    old_dir = "LONG" if self.position == 1 else "SHORT"
+                    trade_pnl = ((price - self.entry_price) if self.position == 1 else (self.entry_price - price)) * self.point_value * self.qty
+                    print(f"[{now}] [{self.symbol} FLIP] Closing {old_dir} for {entry_signal} | Trade: ${trade_pnl:+.2f}")
+                    if self.ml and self.entry_features:
+                        self.ml.record_trade(self.entry_features, trade_pnl, source="signal_flip")
+                        self.entry_features = None
+                    await self._flatten(price, reason="SIGNAL_FLIP")
+                    self.last_exit_time = 0
+
+                if entry_signal == "LONG":
                     room = self.bb_upper - price
                     if room >= MIN_BB_ROOM:
                         print(f"[{now}] [{self.symbol} ENTRY] LONG | Room to upper BB: {room:.1f}pts (>= {MIN_BB_ROOM})")
-                        self.tp_target = self.bb_upper
                         await self._enter_long(price)
                     else:
                         print(f"[{now}] [{self.symbol} BB FILTER] LONG skipped - only {room:.1f}pts room to upper BB {self.bb_upper:.2f} (need {MIN_BB_ROOM})")
@@ -846,7 +852,6 @@ class SymbolState:
                     room = price - self.bb_lower
                     if room >= MIN_BB_ROOM:
                         print(f"[{now}] [{self.symbol} ENTRY] SHORT | Room to lower BB: {room:.1f}pts (>= {MIN_BB_ROOM})")
-                        self.tp_target = self.bb_lower
                         await self._enter_short(price)
                     else:
                         print(f"[{now}] [{self.symbol} BB FILTER] SHORT skipped - only {room:.1f}pts room to lower BB {self.bb_lower:.2f} (need {MIN_BB_ROOM})")
@@ -855,71 +860,6 @@ class SymbolState:
 
         if self.renko_sma is None:
             return True
-
-        # Stop loss: 2 bricks (10 pts = $200) from entry
-        stop_dist = self.brick_size * 2
-        if self.position == 1 and price <= self.entry_price - stop_dist:
-            print(f"[{now}] [{self.symbol} STOP] LONG stop hit @ {price:.2f} (entry {self.entry_price:.2f}, SL {self.entry_price - stop_dist:.2f})")
-            if self.ml and self.entry_features:
-                trade_pnl = (price - self.entry_price) * self.point_value * self.qty
-                self.ml.record_trade(self.entry_features, trade_pnl, source="stop_loss")
-                self.entry_features = None
-            await self._flatten(price, reason="STOP_LOSS")
-            self.tp_target = None
-            self.last_exit_time = now_ts
-            threading.Thread(target=send_signals, args=(
-                self.tg_token, self.tg_chat, self.tg_keys,
-                "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-            return True
-
-        if self.position == -1 and price >= self.entry_price + stop_dist:
-            print(f"[{now}] [{self.symbol} STOP] SHORT stop hit @ {price:.2f} (entry {self.entry_price:.2f}, SL {self.entry_price + stop_dist:.2f})")
-            if self.ml and self.entry_features:
-                trade_pnl = (self.entry_price - price) * self.point_value * self.qty
-                self.ml.record_trade(self.entry_features, trade_pnl, source="stop_loss")
-                self.entry_features = None
-            await self._flatten(price, reason="STOP_LOSS")
-            self.tp_target = None
-            self.last_exit_time = now_ts
-            threading.Thread(target=send_signals, args=(
-                self.tg_token, self.tg_chat, self.tg_keys,
-                "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-            return True
-
-        # Take profit: price reaches target BB band
-        if self.position == 1 and self.tp_target is not None and price >= self.tp_target:
-            trade_pnl = (price - self.entry_price) * self.point_value * self.qty
-            print(f"[{now}] [{self.symbol} TP] LONG reached upper BB {self.tp_target:.2f} @ {price:.2f} | +${trade_pnl:.2f}")
-            if self.ml and self.entry_features:
-                self.ml.record_trade(self.entry_features, trade_pnl, source="take_profit")
-                self.entry_features = None
-            await self._flatten(price, reason="BB_TP")
-            self.tp_target = None
-            self.last_exit_time = now_ts
-            threading.Thread(target=send_signals, args=(
-                self.tg_token, self.tg_chat, self.tg_keys,
-                "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-            return True
-
-        if self.position == -1 and self.tp_target is not None and price <= self.tp_target:
-            trade_pnl = (self.entry_price - price) * self.point_value * self.qty
-            print(f"[{now}] [{self.symbol} TP] SHORT reached lower BB {self.tp_target:.2f} @ {price:.2f} | +${trade_pnl:.2f}")
-            if self.ml and self.entry_features:
-                self.ml.record_trade(self.entry_features, trade_pnl, source="take_profit")
-                self.entry_features = None
-            await self._flatten(price, reason="BB_TP")
-            self.tp_target = None
-            self.last_exit_time = now_ts
-            threading.Thread(target=send_signals, args=(
-                self.tg_token, self.tg_chat, self.tg_keys,
-                "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-            return True
-
-        # Update TP target dynamically with current BB bands
-        if self.position == 1 and self.bb_upper is not None:
-            self.tp_target = self.bb_upper
-        elif self.position == -1 and self.bb_lower is not None:
-            self.tp_target = self.bb_lower
 
         # Position sync (30s interval)
         if now_ts - self.last_position_sync_time >= self.POSITION_SYNC_INTERVAL:
