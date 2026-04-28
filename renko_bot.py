@@ -1,10 +1,10 @@
 """
-TopstepX Renko Fake-Out Strategy Bot (LIVE)
+TopstepX Renko Trend-Follow Strategy Bot (LIVE)
 Multi-symbol support: runs multiple instruments on one connection.
 
-Strategy: Renko Close + Fake-Out / Failure Swing
-- After a brick closes, set its high/low as the range
-- If price fakes one side first then breaks the other → enter in the breakout direction
+Strategy: Renko Close + EMA Trend Entry
+- Brick closes BEARISH and close < EMA → SHORT (enter on ghost candle)
+- Brick closes BULLISH and close > EMA → LONG (enter on ghost candle)
 - EXIT on EMA 9 cross or 1-brick stop loss
 
 Usage:
@@ -573,9 +573,6 @@ class SymbolState:
         side_str = self.prev_price_side or "N/A"
         macd_str = f"{self.macd_hist:.2f}" if self.macd_hist is not None else "N/A"
         print(f"    EMA9: {ema_str} | Price vs EMA: {side_str} | MACD Hist: {macd_str}")
-        fo_str = self.fakeout_state or "NONE"
-        fo_range = f"{self.fakeout_range_low:.2f}-{self.fakeout_range_high:.2f}" if self.fakeout_range_high else "N/A"
-        print(f"    Fakeout: {fo_str} | Range: {fo_range}")
         print(f"    Position: {pos_str} | P&L: ${self.live_pnl:.2f} | PV: ${self.point_value}/pt")
 
     def is_data_stale(self, threshold=120):
@@ -736,12 +733,22 @@ class SymbolState:
                     if new_side is not None:
                         self.prev_price_side = new_side
 
+            # Brick-close trend entry: enter on ghost candle when brick closes in EMA direction
             last_brick = bricks[-1]
-            self.fakeout_range_high = max(last_brick[0], last_brick[1])
-            self.fakeout_range_low = min(last_brick[0], last_brick[1])
-            if self.position == 0:
-                self.fakeout_state = "WAITING"
-                print(f"[{now}] [{self.symbol} FAKEOUT] New range: {self.fakeout_range_low:.2f} - {self.fakeout_range_high:.2f} | Watching for fake-out")
+            last_dir = last_brick[2]
+            last_close = last_brick[1]
+
+            if self.ema is not None and self.position == 0:
+                if now_ts - self.last_exit_time < self.ENTRY_COOLDOWN:
+                    remaining = int(self.ENTRY_COOLDOWN - (now_ts - self.last_exit_time))
+                    trend = "BEARISH" if last_dir == -1 else "BULLISH"
+                    print(f"[{now}] [{self.symbol} COOLDOWN] {trend} brick close signal skipped - {remaining}s remaining")
+                elif last_dir == -1 and last_close < self.ema:
+                    print(f"[{now}] [{self.symbol} SIGNAL] SHORT | Bearish brick closed {last_close:.2f} below EMA {self.ema:.2f} @ {price:.2f}")
+                    await self._enter_short(price)
+                elif last_dir == 1 and last_close > self.ema:
+                    print(f"[{now}] [{self.symbol} SIGNAL] LONG | Bullish brick closed {last_close:.2f} above EMA {self.ema:.2f} @ {price:.2f}")
+                    await self._enter_long(price)
 
         if self.ema is None:
             return True
@@ -755,7 +762,6 @@ class SymbolState:
                 self.entry_features = None
             await self._flatten(price, reason="STOP_LOSS")
             self.last_exit_time = now_ts
-            self.fakeout_state = None
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
                 "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
@@ -770,7 +776,6 @@ class SymbolState:
                 self.entry_features = None
             await self._flatten(price, reason="STOP_LOSS")
             self.last_exit_time = now_ts
-            self.fakeout_state = None
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
                 "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
@@ -789,7 +794,6 @@ class SymbolState:
         cross_down = (self.prev_live_side == "ABOVE" and live_side == "BELOW")
 
         if self.prev_live_side is not None:
-            # EMA cross exits (when in position)
             if cross_up and self.position == -1:
                 trade_pnl = (self.entry_price - price) * self.point_value * self.qty
                 print(f"[{now}] [{self.symbol} EXIT] Price crossed above EMA {self.ema:.2f} | Closing SHORT")
@@ -798,7 +802,6 @@ class SymbolState:
                     self.entry_features = None
                 await self._flatten(price, reason="EMA_CROSS")
                 self.last_exit_time = now_ts
-                self.fakeout_state = None
                 threading.Thread(target=send_signals, args=(
                     self.tg_token, self.tg_chat, self.tg_keys,
                     "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
@@ -811,40 +814,11 @@ class SymbolState:
                     self.entry_features = None
                 await self._flatten(price, reason="EMA_CROSS")
                 self.last_exit_time = now_ts
-                self.fakeout_state = None
                 threading.Thread(target=send_signals, args=(
                     self.tg_token, self.tg_chat, self.tg_keys,
                     "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
 
         self.prev_live_side = live_side
-
-        # Fake-out entry logic (when flat)
-        if self.position == 0 and self.fakeout_range_high is not None and self.fakeout_state is not None:
-            if self.fakeout_state == "WAITING":
-                if price > self.fakeout_range_high:
-                    self.fakeout_state = "FAKED_HIGH"
-                    print(f"[{now}] [{self.symbol} FAKEOUT] Price {price:.2f} broke ABOVE range high {self.fakeout_range_high:.2f} (fake up) | Watching for drop below {self.fakeout_range_low:.2f}")
-                elif price < self.fakeout_range_low:
-                    self.fakeout_state = "FAKED_LOW"
-                    print(f"[{now}] [{self.symbol} FAKEOUT] Price {price:.2f} broke BELOW range low {self.fakeout_range_low:.2f} (fake down) | Watching for break above {self.fakeout_range_high:.2f}")
-
-            elif self.fakeout_state == "FAKED_HIGH" and price < self.fakeout_range_low:
-                if now_ts - self.last_exit_time < self.ENTRY_COOLDOWN:
-                    remaining = int(self.ENTRY_COOLDOWN - (now_ts - self.last_exit_time))
-                    print(f"[{now}] [{self.symbol} COOLDOWN] SHORT fakeout signal skipped - {remaining}s remaining")
-                else:
-                    print(f"[{now}] [{self.symbol} SIGNAL] SHORT | Fake-out confirmed: faked HIGH {self.fakeout_range_high:.2f}, now below LOW {self.fakeout_range_low:.2f} @ {price:.2f}")
-                    self.fakeout_state = None
-                    await self._enter_short(price)
-
-            elif self.fakeout_state == "FAKED_LOW" and price > self.fakeout_range_high:
-                if now_ts - self.last_exit_time < self.ENTRY_COOLDOWN:
-                    remaining = int(self.ENTRY_COOLDOWN - (now_ts - self.last_exit_time))
-                    print(f"[{now}] [{self.symbol} COOLDOWN] LONG fakeout signal skipped - {remaining}s remaining")
-                else:
-                    print(f"[{now}] [{self.symbol} SIGNAL] LONG | Fake-out confirmed: faked LOW {self.fakeout_range_low:.2f}, now above HIGH {self.fakeout_range_high:.2f} @ {price:.2f}")
-                    self.fakeout_state = None
-                    await self._enter_long(price)
 
         # Position sync (30s interval)
         if now_ts - self.last_position_sync_time >= self.POSITION_SYNC_INTERVAL:
