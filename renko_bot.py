@@ -410,6 +410,8 @@ class SymbolState:
 
         self.live_pnl = 0.0
 
+        self.prev_live_side = None
+
         # Connection / freshness tracking
         self.last_new_bar_time = None
         self.last_price_change_time = None
@@ -722,31 +724,48 @@ class SymbolState:
         if self.ema is None:
             return True
 
-        last_bc = self.brick_closes[-1] if self.brick_closes else price
-        above_ema = last_bc > self.ema
-        below_ema = last_bc < self.ema
-
-        macd_rising = (self.macd_hist is not None and self.prev_macd_hist is not None
-                       and self.macd_hist > self.prev_macd_hist)
-        macd_falling = (self.macd_hist is not None and self.prev_macd_hist is not None
-                        and self.macd_hist < self.prev_macd_hist)
-
-        # Exit on brick-close EMA flip (immediate, not gated)
-        if flipped:
-            if flip_above and self.position == -1:
-                trade_pnl = (self.entry_price - price) * self.point_value * self.qty
-                print(f"[{now}] [{self.symbol} EXIT] Brick close crossed above EMA {self.ema:.2f} | Closing SHORT")
-                if self.ml and self.entry_features:
-                    self.ml.record_trade(self.entry_features, trade_pnl, source="bot_ema_exit")
-                    self.entry_features = None
-                await self._flatten(price, reason="EMA_CROSS")
-                threading.Thread(target=send_signals, args=(
-                    self.tg_token, self.tg_chat, self.tg_keys,
-                    "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-
-            elif flip_below and self.position == 1:
+        # Stop loss check: 1 brick (3 points) from entry
+        if self.position == 1 and price <= self.entry_price - self.brick_size:
+            print(f"[{now}] [{self.symbol} STOP] LONG stop hit @ {price:.2f} (entry {self.entry_price:.2f}, SL {self.entry_price - self.brick_size:.2f})")
+            if self.ml and self.entry_features:
                 trade_pnl = (price - self.entry_price) * self.point_value * self.qty
-                print(f"[{now}] [{self.symbol} EXIT] Brick close crossed below EMA {self.ema:.2f} | Closing LONG")
+                self.ml.record_trade(self.entry_features, trade_pnl, source="stop_loss")
+                self.entry_features = None
+            await self._flatten(price, reason="STOP_LOSS")
+            threading.Thread(target=send_signals, args=(
+                self.tg_token, self.tg_chat, self.tg_keys,
+                "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+            self.prev_live_side = "BELOW"
+            return True
+
+        if self.position == -1 and price >= self.entry_price + self.brick_size:
+            print(f"[{now}] [{self.symbol} STOP] SHORT stop hit @ {price:.2f} (entry {self.entry_price:.2f}, SL {self.entry_price + self.brick_size:.2f})")
+            if self.ml and self.entry_features:
+                trade_pnl = (self.entry_price - price) * self.point_value * self.qty
+                self.ml.record_trade(self.entry_features, trade_pnl, source="stop_loss")
+                self.entry_features = None
+            await self._flatten(price, reason="STOP_LOSS")
+            threading.Thread(target=send_signals, args=(
+                self.tg_token, self.tg_chat, self.tg_keys,
+                "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+            self.prev_live_side = "ABOVE"
+            return True
+
+        # Ghost brick EMA cross: live price vs EMA
+        if price > self.ema:
+            live_side = "ABOVE"
+        elif price < self.ema:
+            live_side = "BELOW"
+        else:
+            live_side = self.prev_live_side
+
+        cross_up = (self.prev_live_side == "BELOW" and live_side == "ABOVE")
+        cross_down = (self.prev_live_side == "ABOVE" and live_side == "BELOW")
+
+        if self.prev_live_side is not None:
+            if cross_up and self.position == -1:
+                trade_pnl = (self.entry_price - price) * self.point_value * self.qty
+                print(f"[{now}] [{self.symbol} EXIT] Price crossed above EMA {self.ema:.2f} | Closing SHORT")
                 if self.ml and self.entry_features:
                     self.ml.record_trade(self.entry_features, trade_pnl, source="bot_ema_exit")
                     self.entry_features = None
@@ -755,93 +774,30 @@ class SymbolState:
                     self.tg_token, self.tg_chat, self.tg_keys,
                     "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
 
-        # Cancel existing pending range if EMA flipped back before breakout
-        if flipped and self.pending_range_high is not None:
-            print(f"[{now}] [{self.symbol} RANGE] Cancelled - EMA flipped back")
-            self.pending_range_high = None
-            self.pending_range_low = None
+            elif cross_down and self.position == 1:
+                trade_pnl = (price - self.entry_price) * self.point_value * self.qty
+                print(f"[{now}] [{self.symbol} EXIT] Price crossed below EMA {self.ema:.2f} | Closing LONG")
+                if self.ml and self.entry_features:
+                    self.ml.record_trade(self.entry_features, trade_pnl, source="bot_ema_exit")
+                    self.entry_features = None
+                await self._flatten(price, reason="EMA_CROSS")
+                threading.Thread(target=send_signals, args=(
+                    self.tg_token, self.tg_chat, self.tg_keys,
+                    "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
 
-        # On EMA flip while flat + MACD confirms: arm a breakout range from the flip brick
-        if flipped and self.position == 0 and flip_brick is not None:
-            range_high = max(flip_brick[0], flip_brick[1])
-            range_low = min(flip_brick[0], flip_brick[1])
-
-            if flip_above and macd_rising:
-                self.pending_range_high = range_high
-                self.pending_range_low = range_low
-                print(f"[{now}] [{self.symbol} RANGE] EMA cross + MACD rising | Waiting for breakout of {range_low:.2f} - {range_high:.2f}")
-            elif flip_below and macd_falling:
-                self.pending_range_high = range_high
-                self.pending_range_low = range_low
-                print(f"[{now}] [{self.symbol} RANGE] EMA cross + MACD falling | Waiting for breakout of {range_low:.2f} - {range_high:.2f}")
-            elif flip_above:
-                macd_str = f"{self.macd_hist:.2f}" if self.macd_hist is not None else "N/A"
-                print(f"[{now}] [{self.symbol} SKIP] Cross above EMA but MACD not confirming ({macd_str}) - no range set")
-            elif flip_below:
-                macd_str = f"{self.macd_hist:.2f}" if self.macd_hist is not None else "N/A"
-                print(f"[{now}] [{self.symbol} SKIP] Cross below EMA but MACD not confirming ({macd_str}) - no range set")
-
-        # Entry logic gated by tick interval
-        if now_ts - self.last_tick_time < self.tick_interval:
-            return True
-        self.last_tick_time = now_ts
-
-        ghost_detected = await self.sync_position_with_platform()
-        if ghost_detected:
-            return True
-
-        # Check for breakout of pending range
-        if self.position == 0 and self.pending_range_high is not None:
-            if price > self.pending_range_high:
-                rng_h = self.pending_range_high
-                rng_l = self.pending_range_low
-                # ML check before entry
-                if self.ml:
-                    features = self.ml.extract_features(
-                        direction=1, macd_hist=self.macd_hist or 0,
-                        prev_macd_hist=self.prev_macd_hist,
-                        price=price, ema=self.ema, brick_size=self.brick_size,
-                        brick_closes=self.brick_closes,
-                        range_high=rng_h, range_low=rng_l)
-                    skip, loss_ratio, reason = self.ml.should_skip(features)
-                    if skip:
-                        print(f"[{now}] [{self.symbol} ML-SKIP] LONG skipped | {reason}")
-                        self.pending_range_high = None
-                        self.pending_range_low = None
-                        threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
-                            f"ML-SKIP|{self.symbol} LONG @ {price:.2f} | {reason}"), daemon=True).start()
-                        return True
-                    self.entry_features = features
-                    print(f"[{now}] [{self.symbol} ML-OK] LONG approved | {reason}")
-                print(f"[{now}] [{self.symbol} SIGNAL] LONG | price {price:.2f} broke above range {rng_h:.2f}")
-                self.pending_range_high = None
-                self.pending_range_low = None
+            if cross_up and self.position == 0:
+                print(f"[{now}] [{self.symbol} SIGNAL] LONG | ghost brick crossed above EMA {self.ema:.2f} @ {price:.2f}")
                 await self._enter_long(price)
-            elif price < self.pending_range_low:
-                rng_h = self.pending_range_high
-                rng_l = self.pending_range_low
-                # ML check before entry
-                if self.ml:
-                    features = self.ml.extract_features(
-                        direction=-1, macd_hist=self.macd_hist or 0,
-                        prev_macd_hist=self.prev_macd_hist,
-                        price=price, ema=self.ema, brick_size=self.brick_size,
-                        brick_closes=self.brick_closes,
-                        range_high=rng_h, range_low=rng_l)
-                    skip, loss_ratio, reason = self.ml.should_skip(features)
-                    if skip:
-                        print(f"[{now}] [{self.symbol} ML-SKIP] SHORT skipped | {reason}")
-                        self.pending_range_high = None
-                        self.pending_range_low = None
-                        threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
-                            f"ML-SKIP|{self.symbol} SHORT @ {price:.2f} | {reason}"), daemon=True).start()
-                        return True
-                    self.entry_features = features
-                    print(f"[{now}] [{self.symbol} ML-OK] SHORT approved | {reason}")
-                print(f"[{now}] [{self.symbol} SIGNAL] SHORT | price {price:.2f} broke below range {rng_l:.2f}")
-                self.pending_range_high = None
-                self.pending_range_low = None
+
+            elif cross_down and self.position == 0:
+                print(f"[{now}] [{self.symbol} SIGNAL] SHORT | ghost brick crossed below EMA {self.ema:.2f} @ {price:.2f}")
                 await self._enter_short(price)
+
+        self.prev_live_side = live_side
+
+        # Position sync (30s interval)
+        if now_ts - self.last_position_sync_time >= self.POSITION_SYNC_INTERVAL:
+            await self.sync_position_with_platform()
 
         return True
 
@@ -1152,9 +1108,8 @@ class RenkoBot:
         for sym, st in self.states.items():
             print(f"[BOT]   {sym}: brick={st.brick_size}, qty={st.qty}, pv=${st.point_value}/pt" +
                   (f", ntfy={st.ntfy_topic}" if st.ntfy_topic else ""))
-        print(f"[BOT] SETUP: price crosses EMA + MACD confirms -> set breakout range from crossing brick")
-        print(f"[BOT] ENTRY: price breaks above/below the range")
-        print(f"[BOT] EXIT: price crosses back through EMA")
+        print(f"[BOT] ENTRY: ghost brick (live price) crosses EMA")
+        print(f"[BOT] EXIT: price crosses EMA opposite direction OR stop loss (1 brick = {list(self.states.values())[0].brick_size} pts)")
         day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
         trading_day_str = ", ".join(day_names[d] for d in TRADING_DAYS)
         print(f"[BOT] Session: {SESSION_START.strftime('%H:%M')} - {SESSION_END.strftime('%H:%M')} ET ({trading_day_str})")
