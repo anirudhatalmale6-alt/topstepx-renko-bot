@@ -179,6 +179,14 @@ BB_PERIOD = 20
 BB_STDDEV = 2.0
 MIN_BB_ROOM = 5.0
 
+RSG_DECAY_MULTIPLIER = 250
+RSG_DETECTION = 1
+
+MINTICK_VALUES = {
+    "NQ": 0.25, "ES": 0.25, "MNQ": 0.25, "MES": 0.25,
+    "YM": 1.0, "RTY": 0.10,
+}
+
 POINT_VALUES = {
     "NQ": 20.0,
     "ES": 50.0,
@@ -400,6 +408,9 @@ class SymbolState:
         self.ema = None
         self.prev_price_side = None
 
+        self.rsg_decay = RSG_DECAY_MULTIPLIER * MINTICK_VALUES.get(symbol, 0.25)
+        self.rsg_dosc = None
+        self.rsg_dosc_values = []
         self.renko_sma = None
         self.bb_middle = None
         self.bb_upper = None
@@ -473,6 +484,8 @@ class SymbolState:
             "prev_brick_direction": self.prev_brick_direction,
             "prev_smooth_vs_rma": self.prev_smooth_vs_rma,
             "tp_target": self.tp_target,
+            "rsg_dosc": self.rsg_dosc,
+            "rsg_dosc_values": self.rsg_dosc_values[-100:],
             "saved_at": time.time(),
         }
 
@@ -499,10 +512,15 @@ class SymbolState:
         self.prev_brick_direction = state.get("prev_brick_direction")
         self.prev_smooth_vs_rma = state.get("prev_smooth_vs_rma")
         self.tp_target = state.get("tp_target")
-        if len(self.brick_opens) < len(self.brick_closes):
-            self.brick_opens = [self.brick_closes[0]] + self.brick_closes[:-1]
-        if self.brick_opens and len(self.brick_opens) >= RENKO_SMA_PERIOD:
-            self.renko_sma = sum(self.brick_opens[-RENKO_SMA_PERIOD:]) / RENKO_SMA_PERIOD
+        self.rsg_dosc = state.get("rsg_dosc")
+        self.rsg_dosc_values = state.get("rsg_dosc_values", [])
+        if not self.rsg_dosc_values and self.brick_closes and self.brick_opens:
+            for i in range(len(self.brick_closes)):
+                bo = self.brick_opens[i] if i < len(self.brick_opens) else self.brick_closes[i]
+                bc = self.brick_closes[i]
+                self._update_rsg(bo, bc)
+        if self.rsg_dosc_values and len(self.rsg_dosc_values) >= RENKO_SMA_PERIOD:
+            self.renko_sma = sum(self.rsg_dosc_values[-RENKO_SMA_PERIOD:]) / RENKO_SMA_PERIOD
         if self.brick_closes and len(self.brick_closes) >= BB_PERIOD:
             bb_data = self.brick_closes[-BB_PERIOD:]
             self.bb_middle = sum(bb_data) / BB_PERIOD
@@ -515,6 +533,23 @@ class SymbolState:
     def _add_brick_data(self, brick_open, brick_close):
         self.brick_closes.append(brick_close)
         self.brick_opens.append(brick_open)
+        self._update_rsg(brick_open, brick_close)
+
+    def _update_rsg(self, brick_open, brick_close):
+        hh = max(brick_open, brick_close)
+        ll = min(brick_open, brick_close)
+        rprice = round(brick_close / self.rsg_decay) * self.rsg_decay
+
+        if self.rsg_dosc is None:
+            self.rsg_dosc = rprice
+        else:
+            predosc = self.rsg_dosc
+            if hh > predosc + self.rsg_decay:
+                self.rsg_dosc = rprice
+            elif ll < predosc - self.rsg_decay:
+                self.rsg_dosc = rprice
+
+        self.rsg_dosc_values.append(self.rsg_dosc)
 
     def _calc_indicators(self):
         n = len(self.brick_closes)
@@ -550,8 +585,8 @@ class SymbolState:
             self.prev_macd_hist = self.macd_hist
             self.macd_hist = self.macd_line - self.macd_signal_ema
 
-        if len(self.brick_opens) >= RENKO_SMA_PERIOD:
-            self.renko_sma = sum(self.brick_opens[-RENKO_SMA_PERIOD:]) / RENKO_SMA_PERIOD
+        if len(self.rsg_dosc_values) >= RENKO_SMA_PERIOD:
+            self.renko_sma = sum(self.rsg_dosc_values[-RENKO_SMA_PERIOD:]) / RENKO_SMA_PERIOD
 
         if n >= BB_PERIOD:
             bb_data = self.brick_closes[-BB_PERIOD:]
@@ -580,6 +615,8 @@ class SymbolState:
         self.macd_signal_ema = None
         self.macd_hist = None
         self.prev_macd_hist = None
+        self.rsg_dosc = None
+        self.rsg_dosc_values = []
         self.renko_sma = None
         self.bb_middle = None
         self.bb_upper = None
