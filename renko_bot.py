@@ -158,12 +158,12 @@ class RenkoEngine:
 
 ET = pytz.timezone("America/New_York")
 
-SESSION_START = dtime(10, 15, 0)
-SESSION_END = dtime(16, 0)
-BLACKOUT_START = dtime(9, 30)
-BLACKOUT_END = dtime(10, 0)
+SESSION_START = dtime(0, 0, 0)
+SESSION_END = dtime(23, 59, 59)
+BLACKOUT_START = dtime(0, 0)
+BLACKOUT_END = dtime(0, 0)
 
-TRADING_DAYS = [0, 1, 2, 3, 4, 6]
+TRADING_DAYS = [0, 1, 2, 3, 4, 5, 6]
 
 EMA_PERIOD = 9
 MACD_FAST = 12
@@ -417,6 +417,10 @@ class SymbolState:
         self.prev_brick_direction = None
         self.bridge_gap = None
 
+        self.pending_bridge_signal = None
+        self.pending_bridge_confirm_after = 0
+        self.pending_bridge_threshold = 0.0
+
         # Connection / freshness tracking
         self.last_new_bar_time = None
         self.last_price_change_time = None
@@ -616,10 +620,13 @@ class SymbolState:
 
     async def sync_position_with_platform(self) -> bool:
         """
-        Reconcile internal state with platform reality every 30s.
-        Detects ghost positions: bot thinks in a trade, but platform already closed it.
-        Returns True if ghost detected and state corrected, False otherwise.
+        Disabled: SDK contractDisplayName bug makes get_all_positions() silently
+        return 0 positions when positions exist, causing every trade to be
+        falsely detected as "closed externally" and reset to flat.
         """
+        return False
+
+    async def _sync_position_with_platform_DISABLED(self) -> bool:
         if self.ctx is None or self.position == 0:
             return False
 
@@ -693,8 +700,12 @@ class SymbolState:
 
         now_ts = time.time()
 
-        # Feed Renko on EVERY price check (~0.5s) so bricks match TradingView
-        bricks = self.renko.feed_close(price)
+        # Feed Renko once per second (matching TV's 1s candle close, not every tick)
+        if not hasattr(self, '_last_renko_feed_time') or now_ts - self._last_renko_feed_time >= 1.0:
+            bricks = self.renko.feed_close(price)
+            self._last_renko_feed_time = now_ts
+        else:
+            bricks = []
         now = datetime.now(ET).strftime("%H:%M:%S")
 
         flipped = False
@@ -754,24 +765,56 @@ class SymbolState:
 
                 self.prev_brick_direction = brick_dir
 
-            # Execute entry signal after processing all bricks
+            # Set pending entry signal (wait for confirmation, don't enter immediately)
             if entry_signal is not None and self.position == 0:
-                if now_ts - self.last_exit_time < self.ENTRY_COOLDOWN:
-                    remaining = int(self.ENTRY_COOLDOWN - (now_ts - self.last_exit_time))
-                    print(f"[{now}] [{self.symbol} COOLDOWN] {entry_signal} bridge gap signal skipped - {remaining}s remaining")
-                elif entry_signal == "LONG":
-                    print(f"[{now}] [{self.symbol} SIGNAL] LONG | Bridge gap reversal: bricks were below EMA, bullish flip @ {price:.2f}")
-                    await self._enter_long(price)
-                elif entry_signal == "SHORT":
-                    print(f"[{now}] [{self.symbol} SIGNAL] SHORT | Bridge gap reversal: bricks were above EMA, bearish flip @ {price:.2f}")
-                    await self._enter_short(price)
+                last_b = bricks[-1]
+                threshold = last_b[1]
+                self.pending_bridge_signal = entry_signal
+                self.pending_bridge_confirm_after = now_ts + 3.0
+                self.pending_bridge_threshold = threshold
+                print(f"[{now}] [{self.symbol} PENDING] {entry_signal} signal set | Confirming in 3s if price holds {'below' if entry_signal == 'SHORT' else 'above'} {threshold:.2f}")
+
+            # New brick during pending signal = cancel (price reversed)
+            if self.pending_bridge_signal and bricks:
+                last_dir = bricks[-1][2]
+                if self.pending_bridge_signal == "SHORT" and last_dir == 1:
+                    print(f"[{now}] [{self.symbol} CANCEL] Pending SHORT cancelled - bullish brick formed (price recovered)")
+                    self.pending_bridge_signal = None
+                elif self.pending_bridge_signal == "LONG" and last_dir == -1:
+                    print(f"[{now}] [{self.symbol} CANCEL] Pending LONG cancelled - bearish brick formed (price recovered)")
+                    self.pending_bridge_signal = None
 
         if self.ema is None:
             return True
 
-        # Stop loss: 1 brick from entry
-        if self.position == 1 and price <= self.entry_price - self.brick_size:
-            print(f"[{now}] [{self.symbol} STOP] LONG stop hit @ {price:.2f} (entry {self.entry_price:.2f}, SL {self.entry_price - self.brick_size:.2f})")
+        # Confirm pending bridge gap entry after delay
+        if self.pending_bridge_signal and self.position == 0 and now_ts >= self.pending_bridge_confirm_after:
+            confirmed = False
+            if self.pending_bridge_signal == "SHORT" and price <= self.pending_bridge_threshold:
+                confirmed = True
+            elif self.pending_bridge_signal == "LONG" and price >= self.pending_bridge_threshold:
+                confirmed = True
+
+            if confirmed:
+                if now_ts - self.last_exit_time < self.ENTRY_COOLDOWN:
+                    remaining = int(self.ENTRY_COOLDOWN - (now_ts - self.last_exit_time))
+                    print(f"[{now}] [{self.symbol} COOLDOWN] {self.pending_bridge_signal} confirmed but cooldown - {remaining}s remaining")
+                elif self.pending_bridge_signal == "SHORT":
+                    print(f"[{now}] [{self.symbol} SIGNAL] SHORT CONFIRMED | Price {price:.2f} still below {self.pending_bridge_threshold:.2f} after 3s")
+                    self.pending_bridge_signal = None
+                    await self._enter_short(price)
+                elif self.pending_bridge_signal == "LONG":
+                    print(f"[{now}] [{self.symbol} SIGNAL] LONG CONFIRMED | Price {price:.2f} still above {self.pending_bridge_threshold:.2f} after 3s")
+                    self.pending_bridge_signal = None
+                    await self._enter_long(price)
+            else:
+                print(f"[{now}] [{self.symbol} CANCEL] Pending {self.pending_bridge_signal} cancelled - price {price:.2f} recovered past {self.pending_bridge_threshold:.2f}")
+                self.pending_bridge_signal = None
+
+        # Stop loss: 2 bricks (10 pts = $200) from entry
+        stop_dist = self.brick_size * 2
+        if self.position == 1 and price <= self.entry_price - stop_dist:
+            print(f"[{now}] [{self.symbol} STOP] LONG stop hit @ {price:.2f} (entry {self.entry_price:.2f}, SL {self.entry_price - stop_dist:.2f})")
             if self.ml and self.entry_features:
                 trade_pnl = (price - self.entry_price) * self.point_value * self.qty
                 self.ml.record_trade(self.entry_features, trade_pnl, source="stop_loss")
@@ -783,8 +826,8 @@ class SymbolState:
                 "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
             return True
 
-        if self.position == -1 and price >= self.entry_price + self.brick_size:
-            print(f"[{now}] [{self.symbol} STOP] SHORT stop hit @ {price:.2f} (entry {self.entry_price:.2f}, SL {self.entry_price + self.brick_size:.2f})")
+        if self.position == -1 and price >= self.entry_price + stop_dist:
+            print(f"[{now}] [{self.symbol} STOP] SHORT stop hit @ {price:.2f} (entry {self.entry_price:.2f}, SL {self.entry_price + stop_dist:.2f})")
             if self.ml and self.entry_features:
                 trade_pnl = (self.entry_price - price) * self.point_value * self.qty
                 self.ml.record_trade(self.entry_features, trade_pnl, source="stop_loss")
