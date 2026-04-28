@@ -424,6 +424,9 @@ class SymbolState:
         self.ml = None
         self.ctx = None
 
+        self.last_position_sync_time = 0
+        self.POSITION_SYNC_INTERVAL = 30
+
     def save_state(self) -> dict:
         return {
             "symbol": self.symbol,
@@ -568,6 +571,98 @@ class SymbolState:
             return False
         return (time.time() - self.last_price_change_time) > threshold
 
+    async def _try_get_real_position(self):
+        """
+        Query the real open position from TopstepX.
+        Returns int > 0 (long), < 0 (short), 0 (flat), or None (query failed).
+        None means caller must NOT assume flat.
+        """
+        if self.ctx is None:
+            return None
+        try:
+            positions = await asyncio.wait_for(
+                self.ctx.positions.get_all_positions(), timeout=3.0
+            )
+            cid = self.ctx.instrument_info.id
+            for p in (positions or []):
+                try:
+                    p_cid = (getattr(p, "contract_id", None)
+                             or getattr(p, "contractId", None))
+                    if p_cid == cid:
+                        size = float(getattr(p, "size", 0)
+                                     or getattr(p, "net_pos", 0) or 0)
+                        side = getattr(p, "side", 0)
+                        return int(size) if side == 0 else -int(size)
+                except Exception:
+                    continue
+            return 0
+        except Exception as e:
+            print(f"[{self.symbol}] get_all_positions error: {e}")
+            return None
+
+    async def sync_position_with_platform(self) -> bool:
+        """
+        Reconcile internal state with platform reality every 30s.
+        Detects ghost positions: bot thinks in a trade, but platform already closed it.
+        Returns True if ghost detected and state corrected, False otherwise.
+        """
+        if self.ctx is None or self.position == 0:
+            return False
+
+        now_ts = time.time()
+        if now_ts - self.last_position_sync_time < self.POSITION_SYNC_INTERVAL:
+            return False
+        self.last_position_sync_time = now_ts
+
+        real_pos = await self._try_get_real_position()
+        if real_pos is None:
+            return False
+
+        if real_pos == 0 and self.position != 0:
+            direction = "LONG" if self.position == 1 else "SHORT"
+            now = datetime.now(ET).strftime("%H:%M:%S")
+            price = self.last_price or 0.0
+            pnl_est = (
+                (price - self.entry_price) * self.position
+                * self.point_value * self.qty
+            ) if self.entry_price else 0.0
+
+            print(
+                f"\n[{now}] [{self.symbol}] SYNC: Platform is FLAT but bot "
+                f"thought {direction} - closed externally "
+                f"(TP/SL / manual close / auto-liquidation). "
+                f"Est PnL: ${pnl_est:+.2f}. Correcting state."
+            )
+
+            saved_entry_price = self.entry_price
+            saved_entry_time = self.entry_time
+
+            if self.ml and self.entry_features:
+                self.ml.record_trade(self.entry_features, pnl_est,
+                                     source="platform_closed")
+            self.entry_features = None
+
+            self.live_pnl += pnl_est
+            self.position = 0
+            self.entry_price = 0.0
+            self.entry_time = None
+            self._log_trade(direction, saved_entry_price, price, pnl_est,
+                            "PLATFORM_CLOSED", saved_entry_time)
+
+            threading.Thread(
+                target=send_telegram,
+                args=(
+                    self.tg_token, self.tg_chat,
+                    f"SYNC {self.symbol}: {direction} position was closed "
+                    f"externally (TP/SL / manual / auto-liq).\n"
+                    f"Est PnL: ${pnl_est:+.2f}\nBot state corrected.",
+                ),
+                daemon=True,
+            ).start()
+            return True
+
+        return False
+
     async def tick(self):
         if self.ctx is None:
             return True
@@ -587,8 +682,9 @@ class SymbolState:
             return True
         self.last_tick_time = now_ts
 
-        # Position sync disabled: SDK get_all_positions() broken (contractDisplayName bug)
-        # Bot relies on EMA exit signals; platform TP/SL acts as safety net
+        ghost_detected = await self.sync_position_with_platform()
+        if ghost_detected:
+            return True
 
         # Feed Renko and update indicators on new bricks
         bricks = self.renko.feed_close(price)
@@ -761,13 +857,19 @@ class SymbolState:
             pass
 
     async def _ensure_flat_before_entry(self):
+        real_pos = await self._try_get_real_position()
+        if real_pos is not None and real_pos == 0:
+            return
         try:
             await asyncio.wait_for(
                 self.ctx.positions.close_position_direct(
                     contract_id=self.ctx.instrument_info.id),
                 timeout=5.0)
             now = datetime.now(ET).strftime("%H:%M:%S")
-            print(f"[{now}] [{self.symbol}] Pre-entry safety: cleared any unknown position")
+            if real_pos is None:
+                print(f"[{now}] [{self.symbol}] Pre-entry safety: sent close (position check unavailable)")
+            else:
+                print(f"[{now}] [{self.symbol}] Pre-entry safety: cleared unknown position (was {real_pos})")
         except Exception:
             pass
 
@@ -886,6 +988,14 @@ class SymbolState:
         print(f"\n[{now}] [{self.symbol}] <<< EXITING {direction} @ {price:.2f} | Trade: ${trade_pnl:+.2f} | P&L (est): ${self.live_pnl + trade_pnl:.2f} | {reason}")
 
         async def _do_close():
+            real_pos = await self._try_get_real_position()
+            if real_pos == 0:
+                print(
+                    f"[{self.symbol}] _flatten pre-flight: platform already FLAT "
+                    f"(TP/SL / manual / auto-liq) - skipping close_position_direct "
+                    f"to avoid opening an accidental reverse position."
+                )
+                return True
             try:
                 await asyncio.wait_for(
                     self.ctx.positions.close_position_direct(
@@ -1162,6 +1272,71 @@ class RenkoBot:
                 print(f"[{now}] [LOGOUT] GatewayLogout received from TopstepX")
                 self.last_gateway_logout_time = time.time()
             conn.on("GatewayLogout", on_logout)
+
+            def on_position_ws(*args):
+                for arg in args:
+                    try:
+                        cid = (getattr(arg, "contract_id", None)
+                               or getattr(arg, "contractId", None))
+                        size = float(getattr(arg, "size", 0)
+                                     or getattr(arg, "net_pos", 0) or 0)
+                        if cid is None:
+                            continue
+                        for sym, st in self.states.items():
+                            if (st.ctx
+                                    and st.ctx.instrument_info.id == cid
+                                    and st.position != 0
+                                    and abs(size) < 0.01):
+                                direction = "LONG" if st.position == 1 else "SHORT"
+                                now_str = datetime.now(ET).strftime("%H:%M:%S")
+                                price = st.last_price or 0.0
+                                pnl_est = (
+                                    (price - st.entry_price) * st.position
+                                    * st.point_value * st.qty
+                                ) if st.entry_price else 0.0
+                                print(
+                                    f"[{now_str}] [{sym}] WS-SYNC: "
+                                    f"{direction} closed externally via platform event. "
+                                    f"Est PnL: ${pnl_est:+.2f}"
+                                )
+                                saved_ep = st.entry_price
+                                saved_et = st.entry_time
+                                if st.ml and st.entry_features:
+                                    st.ml.record_trade(st.entry_features, pnl_est,
+                                                       source="ws_platform_closed")
+                                st.entry_features = None
+                                st.live_pnl += pnl_est
+                                st.position = 0
+                                st.entry_price = 0.0
+                                st.entry_time = None
+                                st._log_trade(direction, saved_ep, price, pnl_est,
+                                              "WS_PLATFORM_CLOSED", saved_et)
+                                threading.Thread(
+                                    target=send_telegram,
+                                    args=(
+                                        self.tg_token, self.tg_chat,
+                                        f"WS-SYNC {sym}: {direction} closed externally. "
+                                        f"Est PnL: ${pnl_est:+.2f}. Bot state corrected.",
+                                    ),
+                                    daemon=True,
+                                ).start()
+                                threading.Thread(
+                                    target=send_signals,
+                                    args=(self.tg_token, self.tg_chat, self.tg_keys,
+                                          "FLAT", sym, price, 0),
+                                    kwargs={"ntfy_topic": st.ntfy_topic},
+                                    daemon=True,
+                                ).start()
+                    except Exception:
+                        continue
+            try:
+                conn.on("GatewayUserPosition", on_position_ws)
+            except Exception:
+                pass
+            try:
+                conn.on("PositionUpdate", on_position_ws)
+            except Exception:
+                pass
         except Exception as e:
             print(f"[WARN] Could not register GatewayLogout handler: {e}")
 
