@@ -158,8 +158,8 @@ class RenkoEngine:
 
 ET = pytz.timezone("America/New_York")
 
-SESSION_START = dtime(18, 0, 0)
-SESSION_END = dtime(15, 30)
+SESSION_START = dtime(10, 15, 0)
+SESSION_END = dtime(16, 0)
 BLACKOUT_START = dtime(9, 30)
 BLACKOUT_END = dtime(10, 0)
 
@@ -185,9 +185,11 @@ def in_session() -> bool:
     if now.weekday() not in TRADING_DAYS:
         return False
     t = now.time()
-    if BLACKOUT_START <= t < BLACKOUT_END:
-        return False
-    return True
+    if SESSION_START > SESSION_END:
+        in_main = t >= SESSION_START or t < SESSION_END
+    else:
+        in_main = SESSION_START <= t < SESSION_END
+    return in_main
 
 
 # ============================================================
@@ -407,8 +409,6 @@ class SymbolState:
         self.sync_no_pos_count = 0
 
         self.live_pnl = 0.0
-        self.last_trade_time = 0
-        self.TRADE_COOLDOWN = 180  # 3 min minimum between trades
 
         # Connection / freshness tracking
         self.last_new_bar_time = None
@@ -696,9 +696,7 @@ class SymbolState:
 
         # Check for breakout of pending range
         if self.position == 0 and self.pending_range_high is not None:
-            if time.time() - self.last_trade_time < self.TRADE_COOLDOWN:
-                pass
-            elif price > self.pending_range_high:
+            if price > self.pending_range_high:
                 rng_h = self.pending_range_high
                 rng_l = self.pending_range_low
                 # ML check before entry
@@ -809,7 +807,6 @@ class SymbolState:
         self.last_order_error = result if result != "ok" else None
 
         if result == "ok":
-            self.last_trade_time = time.time()
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
                 "LONG", self.symbol, price, self.qty), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
@@ -860,7 +857,6 @@ class SymbolState:
         self.last_order_error = result if result != "ok" else None
 
         if result == "ok":
-            self.last_trade_time = time.time()
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
                 "SHORT", self.symbol, price, self.qty), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
