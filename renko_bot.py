@@ -1107,8 +1107,8 @@ class RenkoBot:
         self.last_price_time = None
         self.connection_alive = True
         self.disconnect_alert_sent = False
-        self.STALE_THRESHOLD = 60
-        self.RECONNECT_THRESHOLD = 90
+        self.STALE_THRESHOLD = 180
+        self.RECONNECT_THRESHOLD = 300
         self.reconnecting = False
         self.last_reconnect_time = 0
         self.reconnect_failures = 0
@@ -1449,7 +1449,7 @@ class RenkoBot:
                 if st.last_known_price is None or p != st.last_known_price:
                     st.last_known_price = p
                     st.last_price_change_time = now_ts
-                if st.is_price_frozen(threshold=90):
+                if st.is_price_frozen(threshold=180):
                     any_price_frozen = True
                     frozen_sym = sym
 
@@ -1469,7 +1469,7 @@ class RenkoBot:
 
         if any_price_frozen and in_session() and not self.reconnecting:
             now = datetime.now(ET).strftime("%H:%M:%S")
-            print(f"[{now}] [FROZEN] {frozen_sym} price unchanged for 90+ seconds - forcing reconnect")
+            print(f"[{now}] [FROZEN] {frozen_sym} price unchanged for 180+ seconds - forcing reconnect")
             self._notify_status(f"STATUS|{frozen_sym} feed frozen, reconnecting ({now} ET)")
             if now_ts - self.last_reconnect_time > self.reconnect_cooldown:
                 await self._auto_reconnect()
@@ -1553,7 +1553,7 @@ class RenkoBot:
 
         if not self.reconnecting:
             for sym, st in self.states.items():
-                stale_threshold = max(240, st.tick_interval * 4)
+                stale_threshold = max(600, st.tick_interval * 4)
                 if st.is_data_stale(stale_threshold):
                     now = datetime.now(ET).strftime("%H:%M:%S")
                     print(f"[{now}] [STALE] {sym} no new brick for {stale_threshold}s - reconnecting")
