@@ -1,14 +1,14 @@
 """
-TopstepX Renko Fake-Out Strategy Bot (LIVE)
+TopstepX Renko Bridge Gap Reversal Bot (LIVE)
 Multi-symbol support: runs multiple instruments on one connection.
 
-Strategy: Renko Close + Fake-Out / Failure Swing
-- After a brick closes, set its high/low as the range
-- If price fakes one side first then breaks the other → enter in the breakout direction
-- EXIT on EMA 9 cross or 1-brick stop loss
+Strategy: Bridge Gap Reversal (Mean Reversion)
+- When bricks are fully on one side of EMA (visible gap) and an opposite-color brick forms → enter
+- Bricks below EMA + bullish flip → LONG | Bricks above EMA + bearish flip → SHORT
+- EXIT: price reaches EMA (take profit) or 1-brick stop loss
 
 Usage:
-    python renko_bot.py --symbols "NQ:3:1:ntfy-topic" --tick-interval 60
+    python renko_bot.py --symbols "NQ:5:1:ntfy-topic" --tick-interval 1
 """
 
 import asyncio
@@ -414,9 +414,8 @@ class SymbolState:
         self.last_exit_time = 0
         self.ENTRY_COOLDOWN = 60
 
-        self.fakeout_state = None
-        self.fakeout_range_high = None
-        self.fakeout_range_low = None
+        self.prev_brick_direction = None
+        self.bridge_gap = None
 
         # Connection / freshness tracking
         self.last_new_bar_time = None
@@ -456,9 +455,8 @@ class SymbolState:
             "live_pnl": self.live_pnl,
             "pending_range_high": self.pending_range_high,
             "pending_range_low": self.pending_range_low,
-            "fakeout_state": self.fakeout_state,
-            "fakeout_range_high": self.fakeout_range_high,
-            "fakeout_range_low": self.fakeout_range_low,
+            "prev_brick_direction": self.prev_brick_direction,
+            "bridge_gap": self.bridge_gap,
             "saved_at": time.time(),
         }
 
@@ -483,9 +481,8 @@ class SymbolState:
         self.live_pnl = state.get("live_pnl", 0.0)
         self.pending_range_high = state.get("pending_range_high")
         self.pending_range_low = state.get("pending_range_low")
-        self.fakeout_state = state.get("fakeout_state")
-        self.fakeout_range_high = state.get("fakeout_range_high")
-        self.fakeout_range_low = state.get("fakeout_range_low")
+        self.prev_brick_direction = state.get("prev_brick_direction")
+        self.bridge_gap = state.get("bridge_gap")
         return True
 
     def _add_brick_data(self, brick_open, brick_close):
@@ -573,9 +570,9 @@ class SymbolState:
         side_str = self.prev_price_side or "N/A"
         macd_str = f"{self.macd_hist:.2f}" if self.macd_hist is not None else "N/A"
         print(f"    EMA9: {ema_str} | Price vs EMA: {side_str} | MACD Hist: {macd_str}")
-        fo_str = self.fakeout_state or "NONE"
-        fo_range = f"{self.fakeout_range_low:.2f}-{self.fakeout_range_high:.2f}" if self.fakeout_range_high else "N/A"
-        print(f"    Fakeout: {fo_str} | Range: {fo_range}")
+        gap_str = self.bridge_gap or "NONE"
+        prev_dir = "BULL" if self.prev_brick_direction == 1 else "BEAR" if self.prev_brick_direction == -1 else "N/A"
+        print(f"    Bridge Gap: {gap_str} | Last Brick: {prev_dir}")
         print(f"    Position: {pos_str} | P&L: ${self.live_pnl:.2f} | PV: ${self.point_value}/pt")
 
     def is_data_stale(self, threshold=120):
@@ -707,16 +704,31 @@ class SymbolState:
 
         if bricks:
             self.last_new_bar_time = now_ts
+            entry_signal = None
+
             for b in bricks:
                 brick_dir = b[2]
                 brick_color = "BULLISH" if brick_dir == 1 else "BEARISH"
+
+                # Check for bridge gap reversal BEFORE updating indicators
+                if (self.prev_brick_direction is not None
+                        and brick_dir != self.prev_brick_direction
+                        and self.bridge_gap is not None
+                        and self.ema is not None
+                        and self.position == 0):
+                    gap_dist = abs(max(b[0], b[1]) - self.ema) if self.bridge_gap == "BELOW" else abs(min(b[0], b[1]) - self.ema)
+                    if self.bridge_gap == "BELOW" and brick_dir == 1:
+                        entry_signal = "LONG"
+                        print(f"[{now}] [{self.symbol} BRIDGE] Color flip BULLISH while gap BELOW EMA {self.ema:.2f} (gap ~{gap_dist:.1f}pts)")
+                    elif self.bridge_gap == "ABOVE" and brick_dir == -1:
+                        entry_signal = "SHORT"
+                        print(f"[{now}] [{self.symbol} BRIDGE] Color flip BEARISH while gap ABOVE EMA {self.ema:.2f} (gap ~{gap_dist:.1f}pts)")
+
                 self._add_brick_data(b[0], b[1])
                 self._calc_indicators()
 
                 ema_str = f"EMA: {self.ema:.2f}" if self.ema is not None else "EMA: N/A"
-                macd_h = f"MACD: {self.macd_hist:.2f}" if self.macd_hist is not None else "MACD: N/A"
-                prev_h = f"prev: {self.prev_macd_hist:.2f}" if self.prev_macd_hist is not None else ""
-                print(f"[{now}] [{self.symbol} RENKO] {brick_color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | {ema_str} | {macd_h} {prev_h}")
+                print(f"[{now}] [{self.symbol} RENKO] {brick_color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | {ema_str}")
 
                 if self.ema is not None and self.brick_closes:
                     bc = self.brick_closes[-1]
@@ -726,27 +738,38 @@ class SymbolState:
                         new_side = "BELOW"
                     else:
                         new_side = self.prev_price_side
-                    if (self.prev_price_side is not None
-                            and new_side is not None
-                            and new_side != self.prev_price_side):
-                        flipped = True
-                        flip_above = (new_side == "ABOVE")
-                        flip_below = (new_side == "BELOW")
-                        flip_brick = b
                     if new_side is not None:
                         self.prev_price_side = new_side
 
-            last_brick = bricks[-1]
-            self.fakeout_range_high = max(last_brick[0], last_brick[1])
-            self.fakeout_range_low = min(last_brick[0], last_brick[1])
-            if self.position == 0:
-                self.fakeout_state = "WAITING"
-                print(f"[{now}] [{self.symbol} FAKEOUT] New range: {self.fakeout_range_low:.2f} - {self.fakeout_range_high:.2f} | Watching for fake-out")
+                # Update bridge gap: is this brick fully on one side of EMA?
+                if self.ema is not None:
+                    brick_high = max(b[0], b[1])
+                    brick_low = min(b[0], b[1])
+                    if brick_high < self.ema:
+                        self.bridge_gap = "BELOW"
+                    elif brick_low > self.ema:
+                        self.bridge_gap = "ABOVE"
+                    else:
+                        self.bridge_gap = None
+
+                self.prev_brick_direction = brick_dir
+
+            # Execute entry signal after processing all bricks
+            if entry_signal is not None and self.position == 0:
+                if now_ts - self.last_exit_time < self.ENTRY_COOLDOWN:
+                    remaining = int(self.ENTRY_COOLDOWN - (now_ts - self.last_exit_time))
+                    print(f"[{now}] [{self.symbol} COOLDOWN] {entry_signal} bridge gap signal skipped - {remaining}s remaining")
+                elif entry_signal == "LONG":
+                    print(f"[{now}] [{self.symbol} SIGNAL] LONG | Bridge gap reversal: bricks were below EMA, bullish flip @ {price:.2f}")
+                    await self._enter_long(price)
+                elif entry_signal == "SHORT":
+                    print(f"[{now}] [{self.symbol} SIGNAL] SHORT | Bridge gap reversal: bricks were above EMA, bearish flip @ {price:.2f}")
+                    await self._enter_short(price)
 
         if self.ema is None:
             return True
 
-        # Stop loss check: 1 brick (3 points) from entry
+        # Stop loss: 1 brick from entry
         if self.position == 1 and price <= self.entry_price - self.brick_size:
             print(f"[{now}] [{self.symbol} STOP] LONG stop hit @ {price:.2f} (entry {self.entry_price:.2f}, SL {self.entry_price - self.brick_size:.2f})")
             if self.ml and self.entry_features:
@@ -755,11 +778,9 @@ class SymbolState:
                 self.entry_features = None
             await self._flatten(price, reason="STOP_LOSS")
             self.last_exit_time = now_ts
-            self.fakeout_state = None
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
                 "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-            self.prev_live_side = "BELOW"
             return True
 
         if self.position == -1 and price >= self.entry_price + self.brick_size:
@@ -770,80 +791,37 @@ class SymbolState:
                 self.entry_features = None
             await self._flatten(price, reason="STOP_LOSS")
             self.last_exit_time = now_ts
-            self.fakeout_state = None
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
                 "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-            self.prev_live_side = "ABOVE"
             return True
 
-        # EMA cross tracking for exits
-        if price > self.ema:
-            live_side = "ABOVE"
-        elif price < self.ema:
-            live_side = "BELOW"
-        else:
-            live_side = self.prev_live_side
+        # Take profit: price reaches EMA (mean reversion target)
+        if self.position == 1 and price >= self.ema:
+            trade_pnl = (price - self.entry_price) * self.point_value * self.qty
+            print(f"[{now}] [{self.symbol} TP] LONG reached EMA {self.ema:.2f} @ {price:.2f} | +${trade_pnl:.2f}")
+            if self.ml and self.entry_features:
+                self.ml.record_trade(self.entry_features, trade_pnl, source="take_profit")
+                self.entry_features = None
+            await self._flatten(price, reason="EMA_TP")
+            self.last_exit_time = now_ts
+            threading.Thread(target=send_signals, args=(
+                self.tg_token, self.tg_chat, self.tg_keys,
+                "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+            return True
 
-        cross_up = (self.prev_live_side == "BELOW" and live_side == "ABOVE")
-        cross_down = (self.prev_live_side == "ABOVE" and live_side == "BELOW")
-
-        if self.prev_live_side is not None:
-            if cross_up and self.position == -1:
-                trade_pnl = (self.entry_price - price) * self.point_value * self.qty
-                print(f"[{now}] [{self.symbol} EXIT] Price crossed above EMA {self.ema:.2f} | Closing SHORT")
-                if self.ml and self.entry_features:
-                    self.ml.record_trade(self.entry_features, trade_pnl, source="bot_ema_exit")
-                    self.entry_features = None
-                await self._flatten(price, reason="EMA_CROSS")
-                self.last_exit_time = now_ts
-                self.fakeout_state = None
-                threading.Thread(target=send_signals, args=(
-                    self.tg_token, self.tg_chat, self.tg_keys,
-                    "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-
-            elif cross_down and self.position == 1:
-                trade_pnl = (price - self.entry_price) * self.point_value * self.qty
-                print(f"[{now}] [{self.symbol} EXIT] Price crossed below EMA {self.ema:.2f} | Closing LONG")
-                if self.ml and self.entry_features:
-                    self.ml.record_trade(self.entry_features, trade_pnl, source="bot_ema_exit")
-                    self.entry_features = None
-                await self._flatten(price, reason="EMA_CROSS")
-                self.last_exit_time = now_ts
-                self.fakeout_state = None
-                threading.Thread(target=send_signals, args=(
-                    self.tg_token, self.tg_chat, self.tg_keys,
-                    "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-
-        self.prev_live_side = live_side
-
-        # Fake-out entry logic (when flat)
-        if self.position == 0 and self.fakeout_range_high is not None and self.fakeout_state is not None:
-            if self.fakeout_state == "WAITING":
-                if price > self.fakeout_range_high:
-                    self.fakeout_state = "FAKED_HIGH"
-                    print(f"[{now}] [{self.symbol} FAKEOUT] Price {price:.2f} broke ABOVE range high {self.fakeout_range_high:.2f} (fake up) | Watching for drop below {self.fakeout_range_low:.2f}")
-                elif price < self.fakeout_range_low:
-                    self.fakeout_state = "FAKED_LOW"
-                    print(f"[{now}] [{self.symbol} FAKEOUT] Price {price:.2f} broke BELOW range low {self.fakeout_range_low:.2f} (fake down) | Watching for break above {self.fakeout_range_high:.2f}")
-
-            elif self.fakeout_state == "FAKED_HIGH" and price < self.fakeout_range_low:
-                if now_ts - self.last_exit_time < self.ENTRY_COOLDOWN:
-                    remaining = int(self.ENTRY_COOLDOWN - (now_ts - self.last_exit_time))
-                    print(f"[{now}] [{self.symbol} COOLDOWN] SHORT fakeout signal skipped - {remaining}s remaining")
-                else:
-                    print(f"[{now}] [{self.symbol} SIGNAL] SHORT | Fake-out confirmed: faked HIGH {self.fakeout_range_high:.2f}, now below LOW {self.fakeout_range_low:.2f} @ {price:.2f}")
-                    self.fakeout_state = None
-                    await self._enter_short(price)
-
-            elif self.fakeout_state == "FAKED_LOW" and price > self.fakeout_range_high:
-                if now_ts - self.last_exit_time < self.ENTRY_COOLDOWN:
-                    remaining = int(self.ENTRY_COOLDOWN - (now_ts - self.last_exit_time))
-                    print(f"[{now}] [{self.symbol} COOLDOWN] LONG fakeout signal skipped - {remaining}s remaining")
-                else:
-                    print(f"[{now}] [{self.symbol} SIGNAL] LONG | Fake-out confirmed: faked LOW {self.fakeout_range_low:.2f}, now above HIGH {self.fakeout_range_high:.2f} @ {price:.2f}")
-                    self.fakeout_state = None
-                    await self._enter_long(price)
+        if self.position == -1 and price <= self.ema:
+            trade_pnl = (self.entry_price - price) * self.point_value * self.qty
+            print(f"[{now}] [{self.symbol} TP] SHORT reached EMA {self.ema:.2f} @ {price:.2f} | +${trade_pnl:.2f}")
+            if self.ml and self.entry_features:
+                self.ml.record_trade(self.entry_features, trade_pnl, source="take_profit")
+                self.entry_features = None
+            await self._flatten(price, reason="EMA_TP")
+            self.last_exit_time = now_ts
+            threading.Thread(target=send_signals, args=(
+                self.tg_token, self.tg_chat, self.tg_keys,
+                "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+            return True
 
         # Position sync (30s interval)
         if now_ts - self.last_position_sync_time >= self.POSITION_SYNC_INTERVAL:
