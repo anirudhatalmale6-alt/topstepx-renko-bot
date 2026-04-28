@@ -411,6 +411,8 @@ class SymbolState:
         self.live_pnl = 0.0
 
         self.prev_live_side = None
+        self.last_exit_time = 0
+        self.ENTRY_COOLDOWN = 60
 
         # Connection / freshness tracking
         self.last_new_bar_time = None
@@ -732,6 +734,7 @@ class SymbolState:
                 self.ml.record_trade(self.entry_features, trade_pnl, source="stop_loss")
                 self.entry_features = None
             await self._flatten(price, reason="STOP_LOSS")
+            self.last_exit_time = now_ts
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
                 "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
@@ -745,6 +748,7 @@ class SymbolState:
                 self.ml.record_trade(self.entry_features, trade_pnl, source="stop_loss")
                 self.entry_features = None
             await self._flatten(price, reason="STOP_LOSS")
+            self.last_exit_time = now_ts
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
                 "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
@@ -770,6 +774,7 @@ class SymbolState:
                     self.ml.record_trade(self.entry_features, trade_pnl, source="bot_ema_exit")
                     self.entry_features = None
                 await self._flatten(price, reason="EMA_CROSS")
+                self.last_exit_time = now_ts
                 threading.Thread(target=send_signals, args=(
                     self.tg_token, self.tg_chat, self.tg_keys,
                     "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
@@ -781,17 +786,26 @@ class SymbolState:
                     self.ml.record_trade(self.entry_features, trade_pnl, source="bot_ema_exit")
                     self.entry_features = None
                 await self._flatten(price, reason="EMA_CROSS")
+                self.last_exit_time = now_ts
                 threading.Thread(target=send_signals, args=(
                     self.tg_token, self.tg_chat, self.tg_keys,
                     "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
 
             if cross_up and self.position == 0:
-                print(f"[{now}] [{self.symbol} SIGNAL] LONG | ghost brick crossed above EMA {self.ema:.2f} @ {price:.2f}")
-                await self._enter_long(price)
+                if now_ts - self.last_exit_time < self.ENTRY_COOLDOWN:
+                    remaining = int(self.ENTRY_COOLDOWN - (now_ts - self.last_exit_time))
+                    print(f"[{now}] [{self.symbol} COOLDOWN] LONG signal skipped - {remaining}s remaining")
+                else:
+                    print(f"[{now}] [{self.symbol} SIGNAL] LONG | ghost brick crossed above EMA {self.ema:.2f} @ {price:.2f}")
+                    await self._enter_long(price)
 
             elif cross_down and self.position == 0:
-                print(f"[{now}] [{self.symbol} SIGNAL] SHORT | ghost brick crossed below EMA {self.ema:.2f} @ {price:.2f}")
-                await self._enter_short(price)
+                if now_ts - self.last_exit_time < self.ENTRY_COOLDOWN:
+                    remaining = int(self.ENTRY_COOLDOWN - (now_ts - self.last_exit_time))
+                    print(f"[{now}] [{self.symbol} COOLDOWN] SHORT signal skipped - {remaining}s remaining")
+                else:
+                    print(f"[{now}] [{self.symbol} SIGNAL] SHORT | ghost brick crossed below EMA {self.ema:.2f} @ {price:.2f}")
+                    await self._enter_short(price)
 
         self.prev_live_side = live_side
 
