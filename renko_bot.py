@@ -678,19 +678,11 @@ class SymbolState:
         self.last_price = price
 
         now_ts = time.time()
-        if now_ts - self.last_tick_time < self.tick_interval:
-            return True
-        self.last_tick_time = now_ts
 
-        ghost_detected = await self.sync_position_with_platform()
-        if ghost_detected:
-            return True
-
-        # Feed Renko and update indicators on new bricks
+        # Feed Renko on EVERY price check (~0.5s) so bricks match TradingView
         bricks = self.renko.feed_close(price)
         now = datetime.now(ET).strftime("%H:%M:%S")
 
-        # EMA-cross detection happens PER BRICK (not on live price ticks).
         flipped = False
         flip_above = False
         flip_below = False
@@ -709,7 +701,6 @@ class SymbolState:
                 prev_h = f"prev: {self.prev_macd_hist:.2f}" if self.prev_macd_hist is not None else ""
                 print(f"[{now}] [{self.symbol} RENKO] {brick_color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | {ema_str} | {macd_h} {prev_h}")
 
-                # Check EMA cross on THIS brick close (not live price)
                 if self.ema is not None and self.brick_closes:
                     bc = self.brick_closes[-1]
                     if bc > self.ema:
@@ -740,7 +731,7 @@ class SymbolState:
         macd_falling = (self.macd_hist is not None and self.prev_macd_hist is not None
                         and self.macd_hist < self.prev_macd_hist)
 
-        # Exit on brick-close EMA flip
+        # Exit on brick-close EMA flip (immediate, not gated)
         if flipped:
             if flip_above and self.position == -1:
                 trade_pnl = (self.entry_price - price) * self.point_value * self.qty
@@ -789,6 +780,15 @@ class SymbolState:
             elif flip_below:
                 macd_str = f"{self.macd_hist:.2f}" if self.macd_hist is not None else "N/A"
                 print(f"[{now}] [{self.symbol} SKIP] Cross below EMA but MACD not confirming ({macd_str}) - no range set")
+
+        # Entry logic gated by tick interval
+        if now_ts - self.last_tick_time < self.tick_interval:
+            return True
+        self.last_tick_time = now_ts
+
+        ghost_detected = await self.sync_position_with_platform()
+        if ghost_detected:
+            return True
 
         # Check for breakout of pending range
         if self.position == 0 and self.pending_range_high is not None:
