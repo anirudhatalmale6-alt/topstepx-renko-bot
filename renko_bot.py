@@ -438,6 +438,7 @@ class SymbolState:
         self.last_price = 0.0
 
         self.position = 0
+        self.contracts_held = 0
         self.entry_price = 0.0
         self.entry_time = None
         self.entry_features = None
@@ -486,6 +487,7 @@ class SymbolState:
             "renko_direction": self.renko.direction,
             "renko_brick_count": self.renko.brick_count,
             "position": self.position,
+            "contracts_held": self.contracts_held,
             "entry_price": self.entry_price,
             "live_pnl": self.live_pnl,
             "prev_brick_direction": self.prev_brick_direction,
@@ -518,6 +520,7 @@ class SymbolState:
         self.renko.direction = state.get("renko_direction", 0)
         self.renko.brick_count = state.get("renko_brick_count", 0)
         self.position = state.get("position", 0)
+        self.contracts_held = state.get("contracts_held", 0)
         self.entry_price = state.get("entry_price", 0.0)
         self.live_pnl = state.get("live_pnl", 0.0)
         self.prev_brick_direction = state.get("prev_brick_direction")
@@ -713,7 +716,7 @@ class SymbolState:
         os_str = "DOT" if self.mfi_oversold_dot else "no"
         ob_str = "DOT" if self.mfi_overbought_dot else "no"
         print(f"    MFI(14): {mfi_str} | Oversold dot: {os_str} | Overbought dot: {ob_str}")
-        print(f"    Position: {pos_str} | P&L: ${self.live_pnl:.2f} | PV: ${self.point_value}/pt")
+        print(f"    Position: {pos_str} x{self.contracts_held} | P&L: ${self.live_pnl:.2f} | PV: ${self.point_value}/pt")
 
     def is_data_stale(self, threshold=120):
         if self.last_new_bar_time is None:
@@ -865,46 +868,69 @@ class SymbolState:
 
             if self.mfi_value is not None and last_brick_dir is not None:
                 if self.mfi_oversold_dot and last_brick_dir == 1:
-                    if self.position == 1:
-                        print(f"[{now}] [{self.symbol} MFI] BUY dot + GREEN brick but already LONG - holding")
+                    if self.position == 1 and self.contracts_held >= 2:
+                        print(f"[{now}] [{self.symbol} MFI] BUY dot + GREEN brick but already LONG x2 (max) - holding")
+                    elif self.position == 1 and self.contracts_held == 1:
+                        entry_signal = "LONG_SCALE"
+                        print(f"[{now}] [{self.symbol} MFI] BUY scale-in | 2nd oversold dot while LONG | MFI={self.mfi_value:.2f}")
                     else:
                         entry_signal = "LONG"
                         print(f"[{now}] [{self.symbol} MFI] BUY signal | MFI crossed below {MFI_OVERSOLD} + GREEN brick confirmed | MFI={self.mfi_value:.2f}")
                     self.mfi_oversold_dot = False
                 elif self.mfi_overbought_dot and last_brick_dir == -1:
-                    if self.position == -1:
-                        print(f"[{now}] [{self.symbol} MFI] SELL dot + RED brick but already SHORT - holding")
+                    if self.position == -1 and self.contracts_held >= 2:
+                        print(f"[{now}] [{self.symbol} MFI] SELL dot + RED brick but already SHORT x2 (max) - holding")
+                    elif self.position == -1 and self.contracts_held == 1:
+                        entry_signal = "SHORT_SCALE"
+                        print(f"[{now}] [{self.symbol} MFI] SELL scale-in | 2nd overbought dot while SHORT | MFI={self.mfi_value:.2f}")
                     else:
                         entry_signal = "SHORT"
                         print(f"[{now}] [{self.symbol} MFI] SELL signal | MFI crossed above {MFI_OVERBOUGHT} + RED brick confirmed | MFI={self.mfi_value:.2f}")
                     self.mfi_overbought_dot = False
 
             if entry_signal is not None:
+                is_scale = entry_signal.endswith("_SCALE")
+                base_signal = entry_signal.replace("_SCALE", "")
+
                 rsg_filter_skip = False
-                if self.renko_sma is not None:
+                if self.renko_sma is not None and not is_scale:
                     last_brick_close = self.brick_closes[-1]
                     rsg_distance = abs(last_brick_close - self.renko_sma)
                     if rsg_distance <= self.brick_size:
                         rsg_filter_skip = True
-                        print(f"[{now}] [{self.symbol} RSG FILTER] {entry_signal} skipped - price {last_brick_close:.2f} at R.sg line {self.renko_sma:.2f} (dist={rsg_distance:.2f}, need >{self.brick_size:.0f})")
+                        print(f"[{now}] [{self.symbol} RSG FILTER] {base_signal} skipped - price {last_brick_close:.2f} at R.sg line {self.renko_sma:.2f} (dist={rsg_distance:.2f}, need >{self.brick_size:.0f})")
 
                 if not rsg_filter_skip:
-                    if self.position != 0:
+                    if not is_scale and self.position != 0:
                         old_dir = "LONG" if self.position == 1 else "SHORT"
-                        trade_pnl = ((price - self.entry_price) if self.position == 1 else (self.entry_price - price)) * self.point_value * self.qty
-                        print(f"[{now}] [{self.symbol} FLIP] Closing {old_dir} for {entry_signal} | Trade: ${trade_pnl:+.2f}")
+                        trade_pnl = ((price - self.entry_price) if self.position == 1 else (self.entry_price - price)) * self.point_value * self.contracts_held
+                        print(f"[{now}] [{self.symbol} FLIP] Closing {old_dir} x{self.contracts_held} for {base_signal} | Trade: ${trade_pnl:+.2f}")
                         if self.ml and self.entry_features:
                             self.ml.record_trade(self.entry_features, trade_pnl, source="signal_flip")
                             self.entry_features = None
                         await self._flatten(price, reason="SIGNAL_FLIP")
                         self.last_exit_time = 0
 
-                    if entry_signal == "LONG":
-                        print(f"[{now}] [{self.symbol} ENTRY] LONG | MFI oversold reversal")
-                        await self._enter_long(price)
-                    elif entry_signal == "SHORT":
-                        print(f"[{now}] [{self.symbol} ENTRY] SHORT | MFI overbought reversal")
-                        await self._enter_short(price)
+                    if base_signal == "LONG":
+                        if is_scale:
+                            print(f"[{now}] [{self.symbol} SCALE] Adding LONG contract #2 | Avg entry: {self.entry_price:.2f} -> {(self.entry_price + price) / 2:.2f}")
+                            old_entry = self.entry_price
+                            success = await self._enter_long_addon(price)
+                            if success:
+                                self.entry_price = (old_entry + price) / 2.0
+                        else:
+                            print(f"[{now}] [{self.symbol} ENTRY] LONG | MFI oversold reversal")
+                            await self._enter_long(price)
+                    elif base_signal == "SHORT":
+                        if is_scale:
+                            print(f"[{now}] [{self.symbol} SCALE] Adding SHORT contract #2 | Avg entry: {self.entry_price:.2f} -> {(self.entry_price + price) / 2:.2f}")
+                            old_entry = self.entry_price
+                            success = await self._enter_short_addon(price)
+                            if success:
+                                self.entry_price = (old_entry + price) / 2.0
+                        else:
+                            print(f"[{now}] [{self.symbol} ENTRY] SHORT | MFI overbought reversal")
+                            await self._enter_short(price)
 
         if self.renko_sma is None:
             return True
@@ -941,7 +967,7 @@ class SymbolState:
         if self.position != 0:
             now = datetime.now(ET).strftime("%H:%M:%S")
             direction = "LONG" if self.position == 1 else "SHORT"
-            print(f"[{now}] [{self.symbol}] BLOCKED LONG entry - already in {direction} (max 1 position)")
+            print(f"[{now}] [{self.symbol}] BLOCKED LONG entry - already in {direction}")
             return False
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG @ {price:.2f} | P&L: ${self.live_pnl:.2f}")
@@ -960,6 +986,7 @@ class SymbolState:
                 )
                 if response.success:
                     self.position = 1
+                    self.contracts_held = 1
                     self.entry_price = price
                     self.entry_time = datetime.now(ET)
                     print(f"[{self.symbol}] Order filled. ID: {response.orderId}")
@@ -992,11 +1019,56 @@ class SymbolState:
                 f"ALERT|{self.symbol} LONG order {result.upper()} @ {price:.2f} - reconnecting"), daemon=True).start()
             return False
 
+    async def _enter_long_addon(self, price: float):
+        now = datetime.now(ET).strftime("%H:%M:%S")
+        print(f"\n[{now}] [{self.symbol}] >>> SCALE-IN LONG #2 @ {price:.2f}")
+
+        async def _do_order():
+            try:
+                response = await asyncio.wait_for(
+                    self.ctx.orders.place_market_order(
+                        contract_id=self.ctx.instrument_info.id,
+                        side=0,
+                        size=self.qty,
+                    ),
+                    timeout=15.0,
+                )
+                if response.success:
+                    self.contracts_held = 2
+                    print(f"[{self.symbol}] Scale-in filled. ID: {response.orderId}")
+                    return "ok"
+                else:
+                    print(f"[{self.symbol}] Scale-in REJECTED: {response.errorMessage}")
+                    return "rejected"
+            except asyncio.TimeoutError:
+                print(f"[{self.symbol}] Scale-in TIMEOUT (15s)")
+                return "timeout"
+            except Exception as ex:
+                print(f"[{self.symbol}] Scale-in ERROR: {ex}")
+                return "error"
+
+        result = await asyncio.shield(_do_order())
+        self.last_order_error = result if result != "ok" else None
+
+        if result == "ok":
+            threading.Thread(target=send_signals, args=(
+                self.tg_token, self.tg_chat, self.tg_keys,
+                "LONG", self.symbol, price, self.qty), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+            return True
+        elif result == "rejected":
+            threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
+                f"ALERT|{self.symbol} LONG scale-in REJECTED @ {price:.2f}"), daemon=True).start()
+            return False
+        else:
+            threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
+                f"ALERT|{self.symbol} LONG scale-in {result.upper()} @ {price:.2f}"), daemon=True).start()
+            return False
+
     async def _enter_short(self, price: float):
         if self.position != 0:
             now = datetime.now(ET).strftime("%H:%M:%S")
             direction = "LONG" if self.position == 1 else "SHORT"
-            print(f"[{now}] [{self.symbol}] BLOCKED SHORT entry - already in {direction} (max 1 position)")
+            print(f"[{now}] [{self.symbol}] BLOCKED SHORT entry - already in {direction}")
             return False
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT @ {price:.2f} | P&L: ${self.live_pnl:.2f}")
@@ -1015,6 +1087,7 @@ class SymbolState:
                 )
                 if response.success:
                     self.position = -1
+                    self.contracts_held = 1
                     self.entry_price = price
                     self.entry_time = datetime.now(ET)
                     print(f"[{self.symbol}] Order filled. ID: {response.orderId}")
@@ -1047,6 +1120,51 @@ class SymbolState:
                 f"ALERT|{self.symbol} SHORT order {result.upper()} @ {price:.2f} - reconnecting"), daemon=True).start()
             return False
 
+    async def _enter_short_addon(self, price: float):
+        now = datetime.now(ET).strftime("%H:%M:%S")
+        print(f"\n[{now}] [{self.symbol}] >>> SCALE-IN SHORT #2 @ {price:.2f}")
+
+        async def _do_order():
+            try:
+                response = await asyncio.wait_for(
+                    self.ctx.orders.place_market_order(
+                        contract_id=self.ctx.instrument_info.id,
+                        side=1,
+                        size=self.qty,
+                    ),
+                    timeout=15.0,
+                )
+                if response.success:
+                    self.contracts_held = 2
+                    print(f"[{self.symbol}] Scale-in filled. ID: {response.orderId}")
+                    return "ok"
+                else:
+                    print(f"[{self.symbol}] Scale-in REJECTED: {response.errorMessage}")
+                    return "rejected"
+            except asyncio.TimeoutError:
+                print(f"[{self.symbol}] Scale-in TIMEOUT (15s)")
+                return "timeout"
+            except Exception as ex:
+                print(f"[{self.symbol}] Scale-in ERROR: {ex}")
+                return "error"
+
+        result = await asyncio.shield(_do_order())
+        self.last_order_error = result if result != "ok" else None
+
+        if result == "ok":
+            threading.Thread(target=send_signals, args=(
+                self.tg_token, self.tg_chat, self.tg_keys,
+                "SHORT", self.symbol, price, self.qty), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+            return True
+        elif result == "rejected":
+            threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
+                f"ALERT|{self.symbol} SHORT scale-in REJECTED @ {price:.2f}"), daemon=True).start()
+            return False
+        else:
+            threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
+                f"ALERT|{self.symbol} SHORT scale-in {result.upper()} @ {price:.2f}"), daemon=True).start()
+            return False
+
     async def _flatten(self, price: float, reason: str = ""):
         if self.position == 0:
             return True
@@ -1054,12 +1172,12 @@ class SymbolState:
         direction = "LONG" if self.position == 1 else "SHORT"
         saved_entry_price = self.entry_price
         saved_position = self.position
-        saved_qty = self.qty
+        saved_contracts = self.contracts_held or 1
 
-        trade_pnl = (price - saved_entry_price) * saved_position * self.point_value * saved_qty
+        trade_pnl = (price - saved_entry_price) * saved_position * self.point_value * saved_contracts
 
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [{self.symbol}] <<< EXITING {direction} @ {price:.2f} | Trade: ${trade_pnl:+.2f} | P&L (est): ${self.live_pnl + trade_pnl:.2f} | {reason}")
+        print(f"\n[{now}] [{self.symbol}] <<< EXITING {direction} x{saved_contracts} @ {price:.2f} | Trade: ${trade_pnl:+.2f} | P&L (est): ${self.live_pnl + trade_pnl:.2f} | {reason}")
 
         async def _do_close():
             try:
@@ -1084,6 +1202,7 @@ class SymbolState:
             saved_entry_time = self.entry_time
             self.live_pnl += trade_pnl
             self.position = 0
+            self.contracts_held = 0
             self.entry_price = 0.0
             self.entry_time = None
             self._log_trade(direction, saved_entry_price, price, trade_pnl, reason, saved_entry_time)
@@ -1280,6 +1399,7 @@ class RenkoBot:
                 except Exception:
                     pass
             st.position = 0
+            st.contracts_held = 0
             st.entry_price = 0.0
 
         print()
@@ -1372,6 +1492,7 @@ class RenkoBot:
                                 st.entry_features = None
                                 st.live_pnl += pnl_est
                                 st.position = 0
+                                st.contracts_held = 0
                                 st.entry_price = 0.0
                                 st.entry_time = None
                                 st._log_trade(direction, saved_ep, price, pnl_est,
