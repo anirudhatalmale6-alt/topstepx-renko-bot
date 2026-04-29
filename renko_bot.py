@@ -421,8 +421,9 @@ class SymbolState:
         self.brick_volumes = []
         self.brick_typicals = []
         self.mfi_value = None
-        self.mfi_was_oversold = False
-        self.mfi_was_overbought = False
+        self.prev_mfi_value = None
+        self.mfi_oversold_dot = False
+        self.mfi_overbought_dot = False
 
         self.macd_fast_ema = None
         self.macd_slow_ema = None
@@ -493,8 +494,9 @@ class SymbolState:
             "brick_volumes": self.brick_volumes[-100:],
             "brick_typicals": self.brick_typicals[-100:],
             "mfi_value": self.mfi_value,
-            "mfi_was_oversold": self.mfi_was_oversold,
-            "mfi_was_overbought": self.mfi_was_overbought,
+            "prev_mfi_value": self.prev_mfi_value,
+            "mfi_oversold_dot": self.mfi_oversold_dot,
+            "mfi_overbought_dot": self.mfi_overbought_dot,
             "saved_at": time.time(),
         }
 
@@ -524,8 +526,9 @@ class SymbolState:
         self.brick_volumes = state.get("brick_volumes", [])
         self.brick_typicals = state.get("brick_typicals", [])
         self.mfi_value = state.get("mfi_value")
-        self.mfi_was_oversold = state.get("mfi_was_oversold", False)
-        self.mfi_was_overbought = state.get("mfi_was_overbought", False)
+        self.prev_mfi_value = state.get("prev_mfi_value")
+        self.mfi_oversold_dot = state.get("mfi_oversold_dot", False)
+        self.mfi_overbought_dot = state.get("mfi_overbought_dot", False)
         if not self.rsg_dosc_values and self.brick_closes and self.brick_opens:
             for i in range(len(self.brick_closes)):
                 bo = self.brick_opens[i] if i < len(self.brick_opens) else self.brick_closes[i]
@@ -635,15 +638,21 @@ class SymbolState:
                 elif typicals[i] < typicals[i - 1]:
                     neg_flow += raw_flow
             if neg_flow < 1e-10:
-                self.mfi_value = 100.0
+                new_mfi = 100.0
             else:
                 ratio = pos_flow / neg_flow
-                self.mfi_value = 100.0 - (100.0 / (1.0 + ratio))
+                new_mfi = 100.0 - (100.0 / (1.0 + ratio))
 
-            if self.mfi_value <= MFI_OVERSOLD:
-                self.mfi_was_oversold = True
-            if self.mfi_value >= MFI_OVERBOUGHT:
-                self.mfi_was_overbought = True
+            if self.prev_mfi_value is not None:
+                if new_mfi <= MFI_OVERSOLD and self.prev_mfi_value > MFI_OVERSOLD:
+                    self.mfi_oversold_dot = True
+                    self.mfi_overbought_dot = False
+                elif new_mfi >= MFI_OVERBOUGHT and self.prev_mfi_value < MFI_OVERBOUGHT:
+                    self.mfi_overbought_dot = True
+                    self.mfi_oversold_dot = False
+
+            self.prev_mfi_value = new_mfi
+            self.mfi_value = new_mfi
 
     async def seed_history(self):
         data = await self.ctx.data.get_data("1sec", bars=800)
@@ -670,8 +679,9 @@ class SymbolState:
         self.rsg_dosc_values = []
         self.renko_sma = None
         self.mfi_value = None
-        self.mfi_was_oversold = False
-        self.mfi_was_overbought = False
+        self.prev_mfi_value = None
+        self.mfi_oversold_dot = False
+        self.mfi_overbought_dot = False
 
         for row in rows:
             close = float(row["close"])
@@ -679,6 +689,9 @@ class SymbolState:
             for brick in bricks:
                 self._add_brick_data(brick[0], brick[1], brick[3])
                 self._calc_indicators()
+
+        self.mfi_oversold_dot = False
+        self.mfi_overbought_dot = False
 
         dir_str = "BULLISH" if self.renko.direction == 1 else "BEARISH" if self.renko.direction == -1 else "NONE"
         print(f"  [{self.symbol}] Renko: {self.renko.brick_count} bricks, {dir_str}, ref={self.renko.last_close:.2f}")
@@ -697,9 +710,9 @@ class SymbolState:
         rma_str = f"{self.renko_sma:.2f}" if self.renko_sma is not None else "N/A"
         print(f"    R.sg RMA(12): {rma_str}")
         mfi_str = f"{self.mfi_value:.2f}" if self.mfi_value is not None else "N/A"
-        os_str = "YES" if self.mfi_was_oversold else "no"
-        ob_str = "YES" if self.mfi_was_overbought else "no"
-        print(f"    MFI(14): {mfi_str} | Oversold flag: {os_str} | Overbought flag: {ob_str}")
+        os_str = "DOT" if self.mfi_oversold_dot else "no"
+        ob_str = "DOT" if self.mfi_overbought_dot else "no"
+        print(f"    MFI(14): {mfi_str} | Oversold dot: {os_str} | Overbought dot: {ob_str}")
         print(f"    Position: {pos_str} | P&L: ${self.live_pnl:.2f} | PV: ${self.point_value}/pt")
 
     def is_data_stale(self, threshold=120):
@@ -851,16 +864,20 @@ class SymbolState:
                 self.prev_brick_direction = brick_dir
 
             if self.mfi_value is not None and last_brick_dir is not None:
-                if self.mfi_was_oversold and last_brick_dir == 1:
-                    entry_signal = "LONG"
-                    print(f"[{now}] [{self.symbol} MFI] BUY signal | MFI was oversold (<{MFI_OVERSOLD}) + GREEN brick confirmed | MFI={self.mfi_value:.2f}")
-                    self.mfi_was_oversold = False
-                    self.mfi_was_overbought = False
-                elif self.mfi_was_overbought and last_brick_dir == -1:
-                    entry_signal = "SHORT"
-                    print(f"[{now}] [{self.symbol} MFI] SELL signal | MFI was overbought (>{MFI_OVERBOUGHT}) + RED brick confirmed | MFI={self.mfi_value:.2f}")
-                    self.mfi_was_overbought = False
-                    self.mfi_was_oversold = False
+                if self.mfi_oversold_dot and last_brick_dir == 1:
+                    if self.position == 1:
+                        print(f"[{now}] [{self.symbol} MFI] BUY dot + GREEN brick but already LONG - holding")
+                    else:
+                        entry_signal = "LONG"
+                        print(f"[{now}] [{self.symbol} MFI] BUY signal | MFI crossed below {MFI_OVERSOLD} + GREEN brick confirmed | MFI={self.mfi_value:.2f}")
+                    self.mfi_oversold_dot = False
+                elif self.mfi_overbought_dot and last_brick_dir == -1:
+                    if self.position == -1:
+                        print(f"[{now}] [{self.symbol} MFI] SELL dot + RED brick but already SHORT - holding")
+                    else:
+                        entry_signal = "SHORT"
+                        print(f"[{now}] [{self.symbol} MFI] SELL signal | MFI crossed above {MFI_OVERBOUGHT} + RED brick confirmed | MFI={self.mfi_value:.2f}")
+                    self.mfi_overbought_dot = False
 
             if entry_signal is not None:
                 rsg_filter_skip = False
