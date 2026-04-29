@@ -1,14 +1,13 @@
 """
-TopstepX Renko Crossover + Bollinger Band Bot (LIVE)
+TopstepX Renko MFI Bot (LIVE)
 Multi-symbol support: runs multiple instruments on one connection.
 
-Strategy: Renko Stop-and-Go Crossover with BB Filter
-- SMA(12) of renko brick opens = renko MA line
-- SMA(2) of brick closes = smoothed price
-- When smoothed price crosses renko MA → signal
-- BB(20,2) filter: only enter if >= 5pts room to target band
-  - LONG: need room to upper BB | SHORT: need room to lower BB
-- EXIT: opposite crossover signal flips the position (no fixed SL/TP)
+Strategy: MFI Oversold/Overbought + R.sg Distance Filter
+- MFI(14) on renko bricks (tick volume as proxy)
+- MFI < 20 (oversold) + confirmed GREEN brick = LONG
+- MFI > 85 (overbought) + confirmed RED brick = SHORT
+- R.sg distance filter: skip if price is at the R.sg crossover line
+- EXIT: opposite MFI signal flips the position (no fixed SL/TP)
 
 Usage:
     python renko_bot.py --symbols "NQ:5:1:ntfy-topic" --tick-interval 1
@@ -99,6 +98,7 @@ class RenkoEngine:
         self.last_close = None
         self.direction = 0
         self.brick_count = 0
+        self.current_tick_volume = 0
 
     def initialize(self, price: float):
         if self.brick_size <= 0:
@@ -114,6 +114,8 @@ class RenkoEngine:
         if self.brick_size <= 0:
             return []
 
+        self.current_tick_volume += 1
+
         new_bricks = []
         MAX_BRICKS_PER_FEED = 10000
         iterations = 0
@@ -122,14 +124,18 @@ class RenkoEngine:
             if close_price >= self.last_close + self.brick_size:
                 new_open = self.last_close
                 new_close = self.last_close + self.brick_size
-                new_bricks.append((new_open, new_close, 1))
+                vol = max(self.current_tick_volume, 1)
+                new_bricks.append((new_open, new_close, 1, vol))
+                self.current_tick_volume = 0
                 self.last_close = new_close
                 self.direction = 1
                 self.brick_count += 1
             elif close_price <= self.last_close - self.brick_size:
                 new_open = self.last_close
                 new_close = self.last_close - self.brick_size
-                new_bricks.append((new_open, new_close, -1))
+                vol = max(self.current_tick_volume, 1)
+                new_bricks.append((new_open, new_close, -1, vol))
+                self.current_tick_volume = 0
                 self.last_close = new_close
                 self.direction = -1
                 self.brick_count += 1
@@ -174,13 +180,12 @@ MACD_SLOW = 26
 MACD_SIGNAL = 9
 
 RENKO_SMA_PERIOD = 12
-PRICE_SMOOTH_PERIOD = 1
-BB_PERIOD = 20
-BB_STDDEV = 2.0
-MIN_BB_ROOM = 5.0
 
 RSG_DECAY_MULTIPLIER = 250
-RSG_DETECTION = 1
+
+MFI_PERIOD = 14
+MFI_OVERSOLD = 20.0
+MFI_OVERBOUGHT = 85.0
 
 MINTICK_VALUES = {
     "NQ": 0.25, "ES": 0.25, "MNQ": 0.25, "MES": 0.25,
@@ -412,11 +417,12 @@ class SymbolState:
         self.rsg_dosc = None
         self.rsg_dosc_values = []
         self.renko_sma = None
-        self.bb_middle = None
-        self.bb_upper = None
-        self.bb_lower = None
-        self.prev_smooth_vs_rma = None
-        self.tp_target = None
+
+        self.brick_volumes = []
+        self.brick_typicals = []
+        self.mfi_value = None
+        self.mfi_was_oversold = False
+        self.mfi_was_overbought = False
 
         self.macd_fast_ema = None
         self.macd_slow_ema = None
@@ -482,10 +488,13 @@ class SymbolState:
             "entry_price": self.entry_price,
             "live_pnl": self.live_pnl,
             "prev_brick_direction": self.prev_brick_direction,
-            "prev_smooth_vs_rma": self.prev_smooth_vs_rma,
-            "tp_target": self.tp_target,
             "rsg_dosc": self.rsg_dosc,
             "rsg_dosc_values": self.rsg_dosc_values[-100:],
+            "brick_volumes": self.brick_volumes[-100:],
+            "brick_typicals": self.brick_typicals[-100:],
+            "mfi_value": self.mfi_value,
+            "mfi_was_oversold": self.mfi_was_oversold,
+            "mfi_was_overbought": self.mfi_was_overbought,
             "saved_at": time.time(),
         }
 
@@ -510,10 +519,13 @@ class SymbolState:
         self.entry_price = state.get("entry_price", 0.0)
         self.live_pnl = state.get("live_pnl", 0.0)
         self.prev_brick_direction = state.get("prev_brick_direction")
-        self.prev_smooth_vs_rma = state.get("prev_smooth_vs_rma")
-        self.tp_target = state.get("tp_target")
         self.rsg_dosc = state.get("rsg_dosc")
         self.rsg_dosc_values = state.get("rsg_dosc_values", [])
+        self.brick_volumes = state.get("brick_volumes", [])
+        self.brick_typicals = state.get("brick_typicals", [])
+        self.mfi_value = state.get("mfi_value")
+        self.mfi_was_oversold = state.get("mfi_was_oversold", False)
+        self.mfi_was_overbought = state.get("mfi_was_overbought", False)
         if not self.rsg_dosc_values and self.brick_closes and self.brick_opens:
             for i in range(len(self.brick_closes)):
                 bo = self.brick_opens[i] if i < len(self.brick_opens) else self.brick_closes[i]
@@ -521,18 +533,41 @@ class SymbolState:
                 self._update_rsg(bo, bc)
         if self.rsg_dosc_values and len(self.rsg_dosc_values) >= RENKO_SMA_PERIOD:
             self.renko_sma = sum(self.rsg_dosc_values[-RENKO_SMA_PERIOD:]) / RENKO_SMA_PERIOD
-        if self.brick_closes and len(self.brick_closes) >= BB_PERIOD:
-            bb_data = self.brick_closes[-BB_PERIOD:]
-            self.bb_middle = sum(bb_data) / BB_PERIOD
-            variance = sum((x - self.bb_middle) ** 2 for x in bb_data) / BB_PERIOD
-            std_dev = math.sqrt(variance)
-            self.bb_upper = self.bb_middle + BB_STDDEV * std_dev
-            self.bb_lower = self.bb_middle - BB_STDDEV * std_dev
+        if not self.brick_volumes and self.brick_closes:
+            self.brick_volumes = [1] * len(self.brick_closes)
+        if not self.brick_typicals and self.brick_closes and self.brick_opens:
+            for i in range(len(self.brick_closes)):
+                bo = self.brick_opens[i] if i < len(self.brick_opens) else self.brick_closes[i]
+                bc = self.brick_closes[i]
+                h = max(bo, bc)
+                l = min(bo, bc)
+                self.brick_typicals.append((h + l + bc) / 3.0)
+        if len(self.brick_typicals) >= MFI_PERIOD + 1 and self.mfi_value is None:
+            typicals = self.brick_typicals[-(MFI_PERIOD + 1):]
+            volumes = self.brick_volumes[-(MFI_PERIOD + 1):]
+            pos_flow = 0.0
+            neg_flow = 0.0
+            for i in range(1, len(typicals)):
+                raw_flow = typicals[i] * volumes[i]
+                if typicals[i] > typicals[i - 1]:
+                    pos_flow += raw_flow
+                elif typicals[i] < typicals[i - 1]:
+                    neg_flow += raw_flow
+            if neg_flow < 1e-10:
+                self.mfi_value = 100.0
+            else:
+                ratio = pos_flow / neg_flow
+                self.mfi_value = 100.0 - (100.0 / (1.0 + ratio))
         return True
 
-    def _add_brick_data(self, brick_open, brick_close):
+    def _add_brick_data(self, brick_open, brick_close, volume=1):
         self.brick_closes.append(brick_close)
         self.brick_opens.append(brick_open)
+        self.brick_volumes.append(volume)
+        high = max(brick_open, brick_close)
+        low = min(brick_open, brick_close)
+        typical = (high + low + brick_close) / 3.0
+        self.brick_typicals.append(typical)
         self._update_rsg(brick_open, brick_close)
 
     def _update_rsg(self, brick_open, brick_close):
@@ -588,13 +623,27 @@ class SymbolState:
         if len(self.rsg_dosc_values) >= RENKO_SMA_PERIOD:
             self.renko_sma = sum(self.rsg_dosc_values[-RENKO_SMA_PERIOD:]) / RENKO_SMA_PERIOD
 
-        if n >= BB_PERIOD:
-            bb_data = self.brick_closes[-BB_PERIOD:]
-            self.bb_middle = sum(bb_data) / BB_PERIOD
-            variance = sum((x - self.bb_middle) ** 2 for x in bb_data) / BB_PERIOD
-            std_dev = math.sqrt(variance)
-            self.bb_upper = self.bb_middle + BB_STDDEV * std_dev
-            self.bb_lower = self.bb_middle - BB_STDDEV * std_dev
+        if n >= MFI_PERIOD + 1:
+            typicals = self.brick_typicals[-(MFI_PERIOD + 1):]
+            volumes = self.brick_volumes[-(MFI_PERIOD + 1):]
+            pos_flow = 0.0
+            neg_flow = 0.0
+            for i in range(1, len(typicals)):
+                raw_flow = typicals[i] * volumes[i]
+                if typicals[i] > typicals[i - 1]:
+                    pos_flow += raw_flow
+                elif typicals[i] < typicals[i - 1]:
+                    neg_flow += raw_flow
+            if neg_flow < 1e-10:
+                self.mfi_value = 100.0
+            else:
+                ratio = pos_flow / neg_flow
+                self.mfi_value = 100.0 - (100.0 / (1.0 + ratio))
+
+            if self.mfi_value <= MFI_OVERSOLD:
+                self.mfi_was_oversold = True
+            if self.mfi_value >= MFI_OVERBOUGHT:
+                self.mfi_was_overbought = True
 
     async def seed_history(self):
         data = await self.ctx.data.get_data("1sec", bars=800)
@@ -607,6 +656,8 @@ class SymbolState:
 
         self.brick_closes = []
         self.brick_opens = []
+        self.brick_volumes = []
+        self.brick_typicals = []
         self.ema = None
         self.prev_price_side = None
         self.macd_fast_ema = None
@@ -618,28 +669,23 @@ class SymbolState:
         self.rsg_dosc = None
         self.rsg_dosc_values = []
         self.renko_sma = None
-        self.bb_middle = None
-        self.bb_upper = None
-        self.bb_lower = None
-        self.prev_smooth_vs_rma = None
+        self.mfi_value = None
+        self.mfi_was_oversold = False
+        self.mfi_was_overbought = False
 
         for row in rows:
             close = float(row["close"])
             bricks = self.renko.feed_close(close)
             for brick in bricks:
-                self._add_brick_data(brick[0], brick[1])
+                self._add_brick_data(brick[0], brick[1], brick[3])
                 self._calc_indicators()
-
-        if self.renko_sma is not None and len(self.brick_closes) >= PRICE_SMOOTH_PERIOD:
-            smooth_price = sum(self.brick_closes[-PRICE_SMOOTH_PERIOD:]) / PRICE_SMOOTH_PERIOD
-            self.prev_smooth_vs_rma = "ABOVE" if smooth_price > self.renko_sma else "BELOW"
 
         dir_str = "BULLISH" if self.renko.direction == 1 else "BEARISH" if self.renko.direction == -1 else "NONE"
         print(f"  [{self.symbol}] Renko: {self.renko.brick_count} bricks, {dir_str}, ref={self.renko.last_close:.2f}")
         print(f"  [{self.symbol}] Data: {len(self.brick_closes)} brick closes, {len(self.brick_opens)} brick opens")
         rma_str = f"{self.renko_sma:.2f}" if self.renko_sma is not None else "N/A"
-        bb_str = f"Upper={self.bb_upper:.2f} Mid={self.bb_middle:.2f} Lower={self.bb_lower:.2f}" if self.bb_upper is not None else "N/A"
-        print(f"  [{self.symbol}] RMA(12): {rma_str} | BB(20,2): {bb_str}")
+        mfi_str = f"{self.mfi_value:.2f}" if self.mfi_value is not None else "N/A"
+        print(f"  [{self.symbol}] RMA(12): {rma_str} | MFI(14): {mfi_str}")
 
     def print_status(self):
         now = datetime.now(ET).strftime("%H:%M:%S")
@@ -649,14 +695,12 @@ class SymbolState:
         print(f"  [{self.symbol} @ {now}]")
         print(f"    Renko: {dir_str} | last_close={self.renko.last_close:.2f} | bricks={self.renko.brick_count}")
         rma_str = f"{self.renko_sma:.2f}" if self.renko_sma is not None else "N/A"
-        cross_str = self.prev_smooth_vs_rma or "N/A"
-        print(f"    Renko SMA(12): {rma_str} | Smooth vs RMA: {cross_str}")
-        bb_u = f"{self.bb_upper:.2f}" if self.bb_upper is not None else "N/A"
-        bb_m = f"{self.bb_middle:.2f}" if self.bb_middle is not None else "N/A"
-        bb_l = f"{self.bb_lower:.2f}" if self.bb_lower is not None else "N/A"
-        print(f"    BB(20,2): Upper={bb_u} | Mid={bb_m} | Lower={bb_l}")
-        tp_str = f"{self.tp_target:.2f}" if self.tp_target is not None else "N/A"
-        print(f"    Position: {pos_str} | TP: {tp_str} | P&L: ${self.live_pnl:.2f} | PV: ${self.point_value}/pt")
+        print(f"    R.sg RMA(12): {rma_str}")
+        mfi_str = f"{self.mfi_value:.2f}" if self.mfi_value is not None else "N/A"
+        os_str = "YES" if self.mfi_was_oversold else "no"
+        ob_str = "YES" if self.mfi_was_overbought else "no"
+        print(f"    MFI(14): {mfi_str} | Oversold flag: {os_str} | Overbought flag: {ob_str}")
+        print(f"    Position: {pos_str} | P&L: ${self.live_pnl:.2f} | PV: ${self.point_value}/pt")
 
     def is_data_stale(self, threshold=120):
         if self.last_new_bar_time is None:
@@ -787,76 +831,63 @@ class SymbolState:
             bricks = []
         now = datetime.now(ET).strftime("%H:%M:%S")
 
-        flipped = False
-        flip_above = False
-        flip_below = False
-        flip_brick = None
-
         if bricks:
             self.last_new_bar_time = now_ts
             entry_signal = None
+            last_brick_dir = None
 
             for b in bricks:
                 brick_dir = b[2]
+                last_brick_dir = brick_dir
                 brick_color = "BULLISH" if brick_dir == 1 else "BEARISH"
 
-                self._add_brick_data(b[0], b[1])
+                self._add_brick_data(b[0], b[1], b[3])
                 self._calc_indicators()
 
                 rma_str = f"RMA: {self.renko_sma:.2f}" if self.renko_sma is not None else "RMA: N/A"
-                bb_str = ""
-                if self.bb_upper is not None:
-                    bb_str = f" | BB: {self.bb_lower:.2f}/{self.bb_middle:.2f}/{self.bb_upper:.2f}"
-                print(f"[{now}] [{self.symbol} RENKO] {brick_color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | {rma_str}{bb_str}")
-
-                if self.renko_sma is not None and len(self.brick_closes) >= PRICE_SMOOTH_PERIOD:
-                    smooth_price = sum(self.brick_closes[-PRICE_SMOOTH_PERIOD:]) / PRICE_SMOOTH_PERIOD
-                    if smooth_price > self.renko_sma:
-                        cur_side = "ABOVE"
-                    elif smooth_price < self.renko_sma:
-                        cur_side = "BELOW"
-                    else:
-                        cur_side = self.prev_smooth_vs_rma
-
-                    if self.prev_smooth_vs_rma is not None and cur_side != self.prev_smooth_vs_rma:
-                        if cur_side == "ABOVE":
-                            entry_signal = "LONG"
-                            print(f"[{now}] [{self.symbol} CROSS] Bullish crossover | Smooth {smooth_price:.2f} crossed ABOVE RMA {self.renko_sma:.2f}")
-                        elif cur_side == "BELOW":
-                            entry_signal = "SHORT"
-                            print(f"[{now}] [{self.symbol} CROSS] Bearish crossover | Smooth {smooth_price:.2f} crossed BELOW RMA {self.renko_sma:.2f}")
-
-                    self.prev_smooth_vs_rma = cur_side
+                mfi_str = f"MFI: {self.mfi_value:.2f}" if self.mfi_value is not None else "MFI: N/A"
+                print(f"[{now}] [{self.symbol} RENKO] {brick_color} brick #{self.renko.brick_count}: {b[0]:.2f} -> {b[1]:.2f} | {rma_str} | {mfi_str}")
 
                 self.prev_brick_direction = brick_dir
 
-            if entry_signal is not None and self.bb_upper is not None:
-                if self.position != 0:
-                    old_dir = "LONG" if self.position == 1 else "SHORT"
-                    trade_pnl = ((price - self.entry_price) if self.position == 1 else (self.entry_price - price)) * self.point_value * self.qty
-                    print(f"[{now}] [{self.symbol} FLIP] Closing {old_dir} for {entry_signal} | Trade: ${trade_pnl:+.2f}")
-                    if self.ml and self.entry_features:
-                        self.ml.record_trade(self.entry_features, trade_pnl, source="signal_flip")
-                        self.entry_features = None
-                    await self._flatten(price, reason="SIGNAL_FLIP")
-                    self.last_exit_time = 0
+            if self.mfi_value is not None and last_brick_dir is not None:
+                if self.mfi_was_oversold and last_brick_dir == 1:
+                    entry_signal = "LONG"
+                    print(f"[{now}] [{self.symbol} MFI] BUY signal | MFI was oversold (<{MFI_OVERSOLD}) + GREEN brick confirmed | MFI={self.mfi_value:.2f}")
+                    self.mfi_was_oversold = False
+                    self.mfi_was_overbought = False
+                elif self.mfi_was_overbought and last_brick_dir == -1:
+                    entry_signal = "SHORT"
+                    print(f"[{now}] [{self.symbol} MFI] SELL signal | MFI was overbought (>{MFI_OVERBOUGHT}) + RED brick confirmed | MFI={self.mfi_value:.2f}")
+                    self.mfi_was_overbought = False
+                    self.mfi_was_oversold = False
 
-                if entry_signal == "LONG":
-                    room = self.bb_upper - price
-                    if room >= MIN_BB_ROOM:
-                        print(f"[{now}] [{self.symbol} ENTRY] LONG | Room to upper BB: {room:.1f}pts (>= {MIN_BB_ROOM})")
+            if entry_signal is not None:
+                rsg_filter_skip = False
+                if self.renko_sma is not None:
+                    last_brick_close = self.brick_closes[-1]
+                    rsg_distance = abs(last_brick_close - self.renko_sma)
+                    if rsg_distance <= self.brick_size:
+                        rsg_filter_skip = True
+                        print(f"[{now}] [{self.symbol} RSG FILTER] {entry_signal} skipped - price {last_brick_close:.2f} at R.sg line {self.renko_sma:.2f} (dist={rsg_distance:.2f}, need >{self.brick_size:.0f})")
+
+                if not rsg_filter_skip:
+                    if self.position != 0:
+                        old_dir = "LONG" if self.position == 1 else "SHORT"
+                        trade_pnl = ((price - self.entry_price) if self.position == 1 else (self.entry_price - price)) * self.point_value * self.qty
+                        print(f"[{now}] [{self.symbol} FLIP] Closing {old_dir} for {entry_signal} | Trade: ${trade_pnl:+.2f}")
+                        if self.ml and self.entry_features:
+                            self.ml.record_trade(self.entry_features, trade_pnl, source="signal_flip")
+                            self.entry_features = None
+                        await self._flatten(price, reason="SIGNAL_FLIP")
+                        self.last_exit_time = 0
+
+                    if entry_signal == "LONG":
+                        print(f"[{now}] [{self.symbol} ENTRY] LONG | MFI oversold reversal")
                         await self._enter_long(price)
-                    else:
-                        print(f"[{now}] [{self.symbol} BB FILTER] LONG skipped - only {room:.1f}pts room to upper BB {self.bb_upper:.2f} (need {MIN_BB_ROOM})")
-                elif entry_signal == "SHORT":
-                    room = price - self.bb_lower
-                    if room >= MIN_BB_ROOM:
-                        print(f"[{now}] [{self.symbol} ENTRY] SHORT | Room to lower BB: {room:.1f}pts (>= {MIN_BB_ROOM})")
+                    elif entry_signal == "SHORT":
+                        print(f"[{now}] [{self.symbol} ENTRY] SHORT | MFI overbought reversal")
                         await self._enter_short(price)
-                    else:
-                        print(f"[{now}] [{self.symbol} BB FILTER] SHORT skipped - only {room:.1f}pts room to lower BB {self.bb_lower:.2f} (need {MIN_BB_ROOM})")
-            elif entry_signal is not None and self.bb_upper is None:
-                print(f"[{now}] [{self.symbol} WAIT] {entry_signal} signal but BB not ready (need {BB_PERIOD} bricks)")
 
         if self.renko_sma is None:
             return True
@@ -1242,7 +1273,7 @@ class RenkoBot:
             st.print_status()
 
         print(f"\n[BOT] Session active: {self.was_in_session}")
-        print(f"[BOT] Trading LIVE - EMA + MACD ({', '.join(symbols)})")
+        print(f"[BOT] Trading LIVE - MFI + R.sg ({', '.join(symbols)})")
         print(f"[BOT] Press Ctrl+C to stop\n")
 
         try:
