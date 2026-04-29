@@ -187,7 +187,8 @@ MFI_PERIOD = 14
 MFI_OVERSOLD = 20.0
 MFI_OVERBOUGHT = 85.0
 
-TP_TARGET_DOLLARS = 100.0
+TP_BASE_DOLLARS = 100.0
+TP_INCREMENT_DOLLARS = 50.0
 MAX_CONTRACTS = 5
 
 MINTICK_VALUES = {
@@ -940,16 +941,17 @@ class SymbolState:
         if self.renko_sma is None:
             return True
 
-        if self.position != 0 and self.contracts_held > 0 and TP_TARGET_DOLLARS > 0:
+        if self.position != 0 and self.contracts_held > 0:
             contracts = self.contracts_held
+            tp_target = TP_BASE_DOLLARS + TP_INCREMENT_DOLLARS * (contracts - 1)
             if self.position == 1:
                 unrealized = (price - self.entry_price) * self.point_value * contracts
             else:
                 unrealized = (self.entry_price - price) * self.point_value * contracts
-            if unrealized >= TP_TARGET_DOLLARS:
+            if unrealized >= tp_target:
                 direction = "LONG" if self.position == 1 else "SHORT"
                 now = datetime.now(ET).strftime("%H:%M:%S")
-                print(f"[{now}] [{self.symbol} TP] ${TP_TARGET_DOLLARS:.0f} target hit! {direction} x{contracts} | Unrealized: ${unrealized:.2f}")
+                print(f"[{now}] [{self.symbol} TP] ${tp_target:.0f} target hit! {direction} x{contracts} | Unrealized: ${unrealized:.2f}")
                 await self._flatten(price, reason="TP_HIT")
                 self.last_exit_time = time.time()
                 threading.Thread(target=send_signals, args=(
