@@ -188,6 +188,7 @@ MFI_OVERSOLD = 20.0
 MFI_OVERBOUGHT = 85.0
 
 TP_TARGET_DOLLARS = 100.0
+MAX_CONTRACTS = 5
 
 MINTICK_VALUES = {
     "NQ": 0.25, "ES": 0.25, "MNQ": 0.25, "MES": 0.25,
@@ -870,21 +871,21 @@ class SymbolState:
 
             if self.mfi_value is not None and last_brick_dir is not None:
                 if self.mfi_oversold_dot and last_brick_dir == 1:
-                    if self.position == 1 and self.contracts_held >= 2:
-                        print(f"[{now}] [{self.symbol} MFI] BUY dot + GREEN brick but already LONG x2 (max) - holding")
-                    elif self.position == 1 and self.contracts_held == 1:
+                    if self.position == 1 and self.contracts_held >= MAX_CONTRACTS:
+                        print(f"[{now}] [{self.symbol} MFI] BUY dot + GREEN brick but already LONG x{self.contracts_held} (max) - holding")
+                    elif self.position == 1 and self.contracts_held >= 1:
                         entry_signal = "LONG_SCALE"
-                        print(f"[{now}] [{self.symbol} MFI] BUY scale-in | 2nd oversold dot while LONG | MFI={self.mfi_value:.2f}")
+                        print(f"[{now}] [{self.symbol} MFI] BUY scale-in #{self.contracts_held + 1} | oversold dot while LONG x{self.contracts_held} | MFI={self.mfi_value:.2f}")
                     else:
                         entry_signal = "LONG"
                         print(f"[{now}] [{self.symbol} MFI] BUY signal | MFI crossed below {MFI_OVERSOLD} + GREEN brick confirmed | MFI={self.mfi_value:.2f}")
                     self.mfi_oversold_dot = False
                 elif self.mfi_overbought_dot and last_brick_dir == -1:
-                    if self.position == -1 and self.contracts_held >= 2:
-                        print(f"[{now}] [{self.symbol} MFI] SELL dot + RED brick but already SHORT x2 (max) - holding")
-                    elif self.position == -1 and self.contracts_held == 1:
+                    if self.position == -1 and self.contracts_held >= MAX_CONTRACTS:
+                        print(f"[{now}] [{self.symbol} MFI] SELL dot + RED brick but already SHORT x{self.contracts_held} (max) - holding")
+                    elif self.position == -1 and self.contracts_held >= 1:
                         entry_signal = "SHORT_SCALE"
-                        print(f"[{now}] [{self.symbol} MFI] SELL scale-in | 2nd overbought dot while SHORT | MFI={self.mfi_value:.2f}")
+                        print(f"[{now}] [{self.symbol} MFI] SELL scale-in #{self.contracts_held + 1} | overbought dot while SHORT x{self.contracts_held} | MFI={self.mfi_value:.2f}")
                     else:
                         entry_signal = "SHORT"
                         print(f"[{now}] [{self.symbol} MFI] SELL signal | MFI crossed above {MFI_OVERBOUGHT} + RED brick confirmed | MFI={self.mfi_value:.2f}")
@@ -915,21 +916,23 @@ class SymbolState:
 
                     if base_signal == "LONG":
                         if is_scale:
-                            print(f"[{now}] [{self.symbol} SCALE] Adding LONG contract #2 | Avg entry: {self.entry_price:.2f} -> {(self.entry_price + price) / 2:.2f}")
-                            old_entry = self.entry_price
-                            success = await self._enter_long_addon(price)
+                            old_qty = self.contracts_held
+                            new_avg = (self.entry_price * old_qty + price) / (old_qty + 1)
+                            print(f"[{now}] [{self.symbol} SCALE] Adding LONG #{old_qty + 1} | Avg entry: {self.entry_price:.2f} -> {new_avg:.2f}")
+                            success = await self._enter_addon(price, side=0)
                             if success:
-                                self.entry_price = (old_entry + price) / 2.0
+                                self.entry_price = new_avg
                         else:
                             print(f"[{now}] [{self.symbol} ENTRY] LONG | MFI oversold reversal")
                             await self._enter_long(price)
                     elif base_signal == "SHORT":
                         if is_scale:
-                            print(f"[{now}] [{self.symbol} SCALE] Adding SHORT contract #2 | Avg entry: {self.entry_price:.2f} -> {(self.entry_price + price) / 2:.2f}")
-                            old_entry = self.entry_price
-                            success = await self._enter_short_addon(price)
+                            old_qty = self.contracts_held
+                            new_avg = (self.entry_price * old_qty + price) / (old_qty + 1)
+                            print(f"[{now}] [{self.symbol} SCALE] Adding SHORT #{old_qty + 1} | Avg entry: {self.entry_price:.2f} -> {new_avg:.2f}")
+                            success = await self._enter_addon(price, side=1)
                             if success:
-                                self.entry_price = (old_entry + price) / 2.0
+                                self.entry_price = new_avg
                         else:
                             print(f"[{now}] [{self.symbol} ENTRY] SHORT | MFI overbought reversal")
                             await self._enter_short(price)
@@ -1037,23 +1040,25 @@ class SymbolState:
                 f"ALERT|{self.symbol} LONG order {result.upper()} @ {price:.2f} - reconnecting"), daemon=True).start()
             return False
 
-    async def _enter_long_addon(self, price: float):
+    async def _enter_addon(self, price: float, side: int):
+        dir_str = "LONG" if side == 0 else "SHORT"
+        new_count = self.contracts_held + 1
         now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [{self.symbol}] >>> SCALE-IN LONG #2 @ {price:.2f}")
+        print(f"\n[{now}] [{self.symbol}] >>> SCALE-IN {dir_str} #{new_count} @ {price:.2f}")
 
         async def _do_order():
             try:
                 response = await asyncio.wait_for(
                     self.ctx.orders.place_market_order(
                         contract_id=self.ctx.instrument_info.id,
-                        side=0,
+                        side=side,
                         size=self.qty,
                     ),
                     timeout=15.0,
                 )
                 if response.success:
-                    self.contracts_held = 2
-                    print(f"[{self.symbol}] Scale-in filled. ID: {response.orderId}")
+                    self.contracts_held = new_count
+                    print(f"[{self.symbol}] Scale-in #{new_count} filled. ID: {response.orderId}")
                     return "ok"
                 else:
                     print(f"[{self.symbol}] Scale-in REJECTED: {response.errorMessage}")
@@ -1071,15 +1076,15 @@ class SymbolState:
         if result == "ok":
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
-                "LONG", self.symbol, price, self.qty), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
+                dir_str, self.symbol, price, self.qty), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
             return True
         elif result == "rejected":
             threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
-                f"ALERT|{self.symbol} LONG scale-in REJECTED @ {price:.2f}"), daemon=True).start()
+                f"ALERT|{self.symbol} {dir_str} scale-in REJECTED @ {price:.2f}"), daemon=True).start()
             return False
         else:
             threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
-                f"ALERT|{self.symbol} LONG scale-in {result.upper()} @ {price:.2f}"), daemon=True).start()
+                f"ALERT|{self.symbol} {dir_str} scale-in {result.upper()} @ {price:.2f}"), daemon=True).start()
             return False
 
     async def _enter_short(self, price: float):
@@ -1138,50 +1143,6 @@ class SymbolState:
                 f"ALERT|{self.symbol} SHORT order {result.upper()} @ {price:.2f} - reconnecting"), daemon=True).start()
             return False
 
-    async def _enter_short_addon(self, price: float):
-        now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [{self.symbol}] >>> SCALE-IN SHORT #2 @ {price:.2f}")
-
-        async def _do_order():
-            try:
-                response = await asyncio.wait_for(
-                    self.ctx.orders.place_market_order(
-                        contract_id=self.ctx.instrument_info.id,
-                        side=1,
-                        size=self.qty,
-                    ),
-                    timeout=15.0,
-                )
-                if response.success:
-                    self.contracts_held = 2
-                    print(f"[{self.symbol}] Scale-in filled. ID: {response.orderId}")
-                    return "ok"
-                else:
-                    print(f"[{self.symbol}] Scale-in REJECTED: {response.errorMessage}")
-                    return "rejected"
-            except asyncio.TimeoutError:
-                print(f"[{self.symbol}] Scale-in TIMEOUT (15s)")
-                return "timeout"
-            except Exception as ex:
-                print(f"[{self.symbol}] Scale-in ERROR: {ex}")
-                return "error"
-
-        result = await asyncio.shield(_do_order())
-        self.last_order_error = result if result != "ok" else None
-
-        if result == "ok":
-            threading.Thread(target=send_signals, args=(
-                self.tg_token, self.tg_chat, self.tg_keys,
-                "SHORT", self.symbol, price, self.qty), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
-            return True
-        elif result == "rejected":
-            threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
-                f"ALERT|{self.symbol} SHORT scale-in REJECTED @ {price:.2f}"), daemon=True).start()
-            return False
-        else:
-            threading.Thread(target=send_telegram, args=(self.tg_token, self.tg_chat,
-                f"ALERT|{self.symbol} SHORT scale-in {result.upper()} @ {price:.2f}"), daemon=True).start()
-            return False
 
     async def _flatten(self, price: float, reason: str = ""):
         if self.position == 0:
