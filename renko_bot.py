@@ -187,6 +187,8 @@ MFI_PERIOD = 14
 MFI_OVERSOLD = 20.0
 MFI_OVERBOUGHT = 85.0
 
+TP_TARGET_DOLLARS = 100.0
+
 MINTICK_VALUES = {
     "NQ": 0.25, "ES": 0.25, "MNQ": 0.25, "MES": 0.25,
     "YM": 1.0, "RTY": 0.10,
@@ -934,6 +936,22 @@ class SymbolState:
 
         if self.renko_sma is None:
             return True
+
+        if self.position != 0 and self.contracts_held > 0 and TP_TARGET_DOLLARS > 0:
+            contracts = self.contracts_held
+            if self.position == 1:
+                unrealized = (price - self.entry_price) * self.point_value * contracts
+            else:
+                unrealized = (self.entry_price - price) * self.point_value * contracts
+            if unrealized >= TP_TARGET_DOLLARS:
+                direction = "LONG" if self.position == 1 else "SHORT"
+                now = datetime.now(ET).strftime("%H:%M:%S")
+                print(f"[{now}] [{self.symbol} TP] ${TP_TARGET_DOLLARS:.0f} target hit! {direction} x{contracts} | Unrealized: ${unrealized:.2f}")
+                await self._flatten(price, reason="TP_HIT")
+                self.last_exit_time = time.time()
+                threading.Thread(target=send_signals, args=(
+                    self.tg_token, self.tg_chat, self.tg_keys,
+                    "FLAT", self.symbol, price, 0), kwargs={"ntfy_topic": self.ntfy_topic}, daemon=True).start()
 
         # Position sync (30s interval)
         if now_ts - self.last_position_sync_time >= self.POSITION_SYNC_INTERVAL:
