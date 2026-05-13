@@ -3,7 +3,8 @@ TopstepX FCO Bot (LIVE)
 =======================
 Multi-symbol support: runs multiple instruments on one connection.
 
-Strategy: Fancy Chande Oscillator (FCO) crossover
+Strategy: Fancy Chande Oscillator (FCO) on Renko bricks
+- Renko bricks built from 1-second price feed (configurable brick size)
 - FCO = dual-period Forecast Oscillator on hlc3, blended 50/50
   FCO(n) = ((hlc3 - LinReg(hlc3, n)) / hlc3) * 100
   Blended: 0.5 * FCO(14) + 0.5 * FCO(20), smoothed SMA(3)
@@ -13,11 +14,9 @@ Strategy: Fancy Chande Oscillator (FCO) crossover
 - ADX(14) filter: only trade when ADX > threshold (optional)
 - EXIT: opposite FCO signal flips position.
 - Scale-in up to MAX_CONTRACTS on repeated signals.
-- Bot-side TP available (incrementing dollar target).
 
 Usage:
-    python fco_bot.py --symbols "NQ:1:disabled" --candle-size 300 \\
-                      --tg-token TOKEN --tg-chat CHAT
+    python fco_bot.py --symbols "NQ:2:1:disabled" --tg-token TOKEN --tg-chat CHAT
 """
 
 import asyncio
@@ -113,6 +112,56 @@ def send_signals(token, chat_id, keys, direction, symbol, price, qty,
 
 
 # ============================================================
+# Renko Engine (Traditional - matches TradingView)
+# ============================================================
+
+class RenkoEngine:
+    def __init__(self, brick_size: float, label: str = ""):
+        self.brick_size = brick_size
+        self.label = label
+        self.last_close = None
+        self.direction = 0
+        self.brick_count = 0
+
+    def initialize(self, price: float):
+        if self.brick_size <= 0:
+            self.last_close = price
+            return
+        self.last_close = round(price / self.brick_size) * self.brick_size
+
+    def feed_close(self, close_price: float) -> list:
+        if self.last_close is None:
+            self.initialize(close_price)
+            return []
+        if self.brick_size <= 0:
+            return []
+        new_bricks = []
+        MAX_BRICKS = 10000
+        iters = 0
+        while iters < MAX_BRICKS:
+            iters += 1
+            if close_price >= self.last_close + self.brick_size:
+                new_open = self.last_close
+                new_close = self.last_close + self.brick_size
+                new_bricks.append((new_open, new_close, 1))
+                self.last_close = new_close
+                self.direction = 1
+                self.brick_count += 1
+            elif close_price <= self.last_close - self.brick_size:
+                new_open = self.last_close
+                new_close = self.last_close - self.brick_size
+                new_bricks.append((new_open, new_close, -1))
+                self.last_close = new_close
+                self.direction = -1
+                self.brick_count += 1
+            else:
+                break
+        if iters >= MAX_BRICKS:
+            print(f"[RENKO {self.label}] WARNING: safety cap hit")
+        return new_bricks
+
+
+# ============================================================
 # Configuration
 # ============================================================
 
@@ -124,7 +173,7 @@ TRADING_DAYS = [0, 1, 2, 3, 4, 6]
 BLACKOUT_START = dtime(16, 10, 0)
 BLACKOUT_END = dtime(16, 35, 0)
 
-# FCO default parameters
+# FCO parameters
 FCO_LENGTH_1 = 14
 FCO_LENGTH_2 = 20
 FCO_WEIGHT = 0.5
@@ -200,12 +249,12 @@ def forecast_osc(values, length):
 # ============================================================
 
 class SymbolState:
-    def __init__(self, symbol, qty, ntfy_topic, tg_token, tg_chat, tg_keys,
-                 candle_size=300, use_adx_filter=True, adx_threshold=20.0,
+    def __init__(self, symbol, brick_size, qty, ntfy_topic, tg_token, tg_chat,
+                 tg_keys, use_adx_filter=True, adx_threshold=20.0,
                  fco_long_cross=-1.0, fco_short_cross=1.0, tp_webhooks=None):
         self.symbol = symbol
+        self.brick_size = brick_size
         self.qty = qty
-        self.candle_size = candle_size
         self.ntfy_topic = ntfy_topic
         self.tg_token = tg_token
         self.tg_chat = tg_chat
@@ -217,19 +266,15 @@ class SymbolState:
         self.fco_short_cross = fco_short_cross
         self.tp_webhooks = tp_webhooks or []
 
-        # Candle building (time-based OHLC)
-        self._candle_start_time = 0.0
-        self._candle_open = None
-        self._candle_high = None
-        self._candle_low = None
-        self._candle_close = None
+        # Renko engine
+        self.renko = RenkoEngine(brick_size, symbol)
+        self._last_renko_feed_time = 0.0
 
-        # Candle history
-        self.candle_highs = []
-        self.candle_lows = []
-        self.candle_closes = []
-        self.candle_hlc3 = []
-        self.candle_count = 0
+        # Brick history (for FCO computation)
+        self.brick_highs = []
+        self.brick_lows = []
+        self.brick_closes = []
+        self.brick_hlc3 = []
 
         # FCO state
         self.fco_raw_values = []
@@ -262,7 +307,7 @@ class SymbolState:
         # Connection tracking
         self.last_known_price = None
         self.last_price_change_time = None
-        self.last_candle_time = None
+        self.last_new_bar_time = None
         self.last_price = 0.0
         self.last_order_error = None
 
@@ -284,13 +329,12 @@ class SymbolState:
     def save_state(self) -> dict:
         return {
             "symbol": self.symbol,
-            "schema": 1,
+            "schema": 2,
             "saved_at": time.time(),
-            "candle_highs": self.candle_highs[-300:],
-            "candle_lows": self.candle_lows[-300:],
-            "candle_closes": self.candle_closes[-300:],
-            "candle_hlc3": self.candle_hlc3[-300:],
-            "candle_count": self.candle_count,
+            "brick_highs": self.brick_highs[-300:],
+            "brick_lows": self.brick_lows[-300:],
+            "brick_closes": self.brick_closes[-300:],
+            "brick_hlc3": self.brick_hlc3[-300:],
             "fco_raw_values": self.fco_raw_values[-300:],
             "fco_values": self.fco_values[-300:],
             "fco_signal_values": self.fco_signal_values[-300:],
@@ -303,6 +347,9 @@ class SymbolState:
             "_smoothed_plus_dm": self._smoothed_plus_dm,
             "_smoothed_minus_dm": self._smoothed_minus_dm,
             "_adx_dx_values": self._adx_dx_values[-100:],
+            "renko_last_close": self.renko.last_close,
+            "renko_direction": self.renko.direction,
+            "renko_brick_count": self.renko.brick_count,
             "position": self.position,
             "contracts_held": self.contracts_held,
             "entry_price": self.entry_price,
@@ -311,11 +358,10 @@ class SymbolState:
         }
 
     def restore_state(self, state: dict, position_ttl: int = 600) -> bool:
-        self.candle_highs = state.get("candle_highs", [])
-        self.candle_lows = state.get("candle_lows", [])
-        self.candle_closes = state.get("candle_closes", [])
-        self.candle_hlc3 = state.get("candle_hlc3", [])
-        self.candle_count = state.get("candle_count", 0)
+        self.brick_highs = state.get("brick_highs", [])
+        self.brick_lows = state.get("brick_lows", [])
+        self.brick_closes = state.get("brick_closes", [])
+        self.brick_hlc3 = state.get("brick_hlc3", [])
         self.fco_raw_values = state.get("fco_raw_values", [])
         self.fco_values = state.get("fco_values", [])
         self.fco_signal_values = state.get("fco_signal_values", [])
@@ -328,11 +374,15 @@ class SymbolState:
         self._smoothed_plus_dm = state.get("_smoothed_plus_dm")
         self._smoothed_minus_dm = state.get("_smoothed_minus_dm")
         self._adx_dx_values = state.get("_adx_dx_values", [])
+        self.renko.last_close = state.get("renko_last_close")
+        self.renko.direction = state.get("renko_direction", 0)
+        self.renko.brick_count = state.get("renko_brick_count", 0)
         self.last_price = state.get("last_price", 0.0)
 
         position_age = time.time() - state.get("saved_at", 0)
         if position_age > position_ttl:
-            print(f"  [{self.symbol}] Position state too old ({int(position_age)}s) - will sync from platform")
+            print(f"  [{self.symbol}] Position state too old ({int(position_age)}s) "
+                  f"- will sync from platform")
             self.position = 0
             self.contracts_held = 0
             self.entry_price = 0.0
@@ -344,15 +394,30 @@ class SymbolState:
         return True
 
     # ----------------------------------------------------------------
-    # FCO computation
+    # FCO computation (called after each new Renko brick)
     # ----------------------------------------------------------------
 
     _MAX_HIST = 350
 
+    def _add_brick(self, brick_open: float, brick_close: float):
+        """Append a new brick and compute hlc3."""
+        h = max(brick_open, brick_close)
+        l = min(brick_open, brick_close)
+        hlc3 = (h + l + brick_close) / 3.0
+        self.brick_highs.append(h)
+        self.brick_lows.append(l)
+        self.brick_closes.append(brick_close)
+        self.brick_hlc3.append(hlc3)
+        if len(self.brick_hlc3) > self._MAX_HIST:
+            self.brick_highs = self.brick_highs[-self._MAX_HIST:]
+            self.brick_lows = self.brick_lows[-self._MAX_HIST:]
+            self.brick_closes = self.brick_closes[-self._MAX_HIST:]
+            self.brick_hlc3 = self.brick_hlc3[-self._MAX_HIST:]
+
     def _compute_fco(self):
-        """Compute FCO from hlc3 history after a candle closes."""
-        fo1 = forecast_osc(self.candle_hlc3, FCO_LENGTH_1)
-        fo2 = forecast_osc(self.candle_hlc3, FCO_LENGTH_2)
+        """Compute FCO from hlc3 history after a brick closes."""
+        fo1 = forecast_osc(self.brick_hlc3, FCO_LENGTH_1)
+        fo2 = forecast_osc(self.brick_hlc3, FCO_LENGTH_2)
         if fo1 is None or fo2 is None:
             return
 
@@ -361,7 +426,6 @@ class SymbolState:
         if len(self.fco_raw_values) > self._MAX_HIST:
             self.fco_raw_values = self.fco_raw_values[-self._MAX_HIST:]
 
-        # SMA smoothing
         if len(self.fco_raw_values) >= FCO_SMOOTH_LENGTH:
             smoothed = sum(self.fco_raw_values[-FCO_SMOOTH_LENGTH:]) / FCO_SMOOTH_LENGTH
         else:
@@ -373,7 +437,6 @@ class SymbolState:
         if len(self.fco_values) > self._MAX_HIST:
             self.fco_values = self.fco_values[-self._MAX_HIST:]
 
-        # WMA signal line
         if len(self.fco_values) >= FCO_SIGNAL_LENGTH:
             weights = list(range(1, FCO_SIGNAL_LENGTH + 1))
             total_w = sum(weights)
@@ -389,16 +452,16 @@ class SymbolState:
         self.fco_momentum = smoothed - self.fco_signal
 
     def _compute_adx(self):
-        """Compute ADX from OHLC candle history (Wilder's method)."""
-        n = len(self.candle_highs)
+        """Compute ADX from brick OHLC (Wilder's method)."""
+        n = len(self.brick_highs)
         if n < 2:
             return
 
-        h = self.candle_highs[-1]
-        l = self.candle_lows[-1]
-        prev_h = self.candle_highs[-2]
-        prev_l = self.candle_lows[-2]
-        prev_c = self.candle_closes[-2]
+        h = self.brick_highs[-1]
+        l = self.brick_lows[-1]
+        prev_h = self.brick_highs[-2]
+        prev_l = self.brick_lows[-2]
+        prev_c = self.brick_closes[-2]
 
         tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
         up_move = h - prev_h
@@ -414,11 +477,11 @@ class SymbolState:
             init_m = 0.0
             for i in range(1, ADX_LENGTH + 1):
                 idx = n - ADX_LENGTH - 1 + i
-                hi = self.candle_highs[idx]
-                lo = self.candle_lows[idx]
-                phi = self.candle_highs[idx - 1]
-                plo = self.candle_lows[idx - 1]
-                pcl = self.candle_closes[idx - 1]
+                hi = self.brick_highs[idx]
+                lo = self.brick_lows[idx]
+                phi = self.brick_highs[idx - 1]
+                plo = self.brick_lows[idx - 1]
+                pcl = self.brick_closes[idx - 1]
                 init_tr += max(hi - lo, abs(hi - pcl), abs(lo - pcl))
                 um = hi - phi
                 dm = plo - lo
@@ -454,55 +517,6 @@ class SymbolState:
             self.adx_value = ((self.adx_value * (ADX_SMOOTHING - 1)) + dx) / ADX_SMOOTHING
 
     # ----------------------------------------------------------------
-    # Candle building
-    # ----------------------------------------------------------------
-
-    def _update_candle(self, price: float, now_ts: float) -> bool:
-        """Build time-based candles. Returns True when a candle closes."""
-        if self._candle_open is None:
-            self._candle_start_time = now_ts
-            self._candle_open = price
-            self._candle_high = price
-            self._candle_low = price
-            self._candle_close = price
-            return False
-
-        self._candle_high = max(self._candle_high, price)
-        self._candle_low = min(self._candle_low, price)
-        self._candle_close = price
-
-        if now_ts - self._candle_start_time >= self.candle_size:
-            h = self._candle_high
-            l = self._candle_low
-            c = self._candle_close
-            hlc3 = (h + l + c) / 3.0
-
-            self.candle_highs.append(h)
-            self.candle_lows.append(l)
-            self.candle_closes.append(c)
-            self.candle_hlc3.append(hlc3)
-            self.candle_count += 1
-
-            if len(self.candle_hlc3) > self._MAX_HIST:
-                self.candle_highs = self.candle_highs[-self._MAX_HIST:]
-                self.candle_lows = self.candle_lows[-self._MAX_HIST:]
-                self.candle_closes = self.candle_closes[-self._MAX_HIST:]
-                self.candle_hlc3 = self.candle_hlc3[-self._MAX_HIST:]
-
-            self._compute_fco()
-            if self.use_adx_filter:
-                self._compute_adx()
-
-            self._candle_start_time = now_ts
-            self._candle_open = price
-            self._candle_high = price
-            self._candle_low = price
-            self._candle_close = price
-            return True
-
-        return False
-
-    # ----------------------------------------------------------------
     # Signal detection
     # ----------------------------------------------------------------
 
@@ -515,11 +529,9 @@ class SymbolState:
             if self.adx_value < self.adx_threshold:
                 return None
 
-        # LONG: FCO crosses UP through long_cross level (default -1)
         if self.prev_fco_value <= self.fco_long_cross and self.fco_value > self.fco_long_cross:
             return "LONG"
 
-        # SHORT: FCO crosses DOWN through short_cross level (default +1)
         if self.prev_fco_value >= self.fco_short_cross and self.fco_value < self.fco_short_cross:
             return "SHORT"
 
@@ -530,12 +542,9 @@ class SymbolState:
     # ----------------------------------------------------------------
 
     async def seed_history(self):
-        """Fill FCO/ADX buffers from TopstepX historical bars."""
-        needed_candles = max(FCO_LENGTH_1, FCO_LENGTH_2) + FCO_SMOOTH_LENGTH + FCO_SIGNAL_LENGTH + ADX_LENGTH + 20
-        needed_bars = min(needed_candles * self.candle_size, 50000)
-
+        """Fill FCO buffers from TopstepX historical 1sec bars."""
         try:
-            data = await self.ctx.data.get_data("1sec", bars=needed_bars)
+            data = await self.ctx.data.get_data("1sec", bars=5000)
         except Exception as e:
             print(f"[{self.symbol}] Historical fetch failed: {e}")
             return
@@ -546,10 +555,10 @@ class SymbolState:
         rows = list(data.iter_rows(named=True))
         print(f"[{self.symbol}] Seeding FCO from {len(rows)} 1sec bars...")
 
-        self.candle_highs.clear()
-        self.candle_lows.clear()
-        self.candle_closes.clear()
-        self.candle_hlc3.clear()
+        self.brick_highs.clear()
+        self.brick_lows.clear()
+        self.brick_closes.clear()
+        self.brick_hlc3.clear()
         self.fco_raw_values.clear()
         self.fco_values.clear()
         self.fco_signal_values.clear()
@@ -562,45 +571,23 @@ class SymbolState:
         self._smoothed_plus_dm = None
         self._smoothed_minus_dm = None
         self._adx_dx_values.clear()
-        self.candle_count = 0
-
-        c_high = c_low = c_close = None
-        bar_count = 0
 
         for row in rows:
-            price = float(row["close"])
-            h = float(row.get("high", price))
-            l = float(row.get("low", price))
-
-            if c_high is None:
-                c_high = h
-                c_low = l
-                c_close = price
-                bar_count = 1
-            else:
-                c_high = max(c_high, h)
-                c_low = min(c_low, l)
-                c_close = price
-                bar_count += 1
-
-            if bar_count >= self.candle_size:
-                hlc3 = (c_high + c_low + c_close) / 3.0
-                self.candle_highs.append(c_high)
-                self.candle_lows.append(c_low)
-                self.candle_closes.append(c_close)
-                self.candle_hlc3.append(hlc3)
-                self.candle_count += 1
+            close = float(row["close"])
+            for brick in self.renko.feed_close(close):
+                self._add_brick(brick[0], brick[1])
                 self._compute_fco()
                 if self.use_adx_filter:
                     self._compute_adx()
-                c_high = c_low = c_close = None
-                bar_count = 0
 
+        dir_str = "BULLISH" if self.renko.direction == 1 else \
+                  "BEARISH" if self.renko.direction == -1 else "NONE"
         fco_str = f"{self.fco_value:.4f}" if self.fco_value is not None else "N/A"
         sig_str = f"{self.fco_signal:.4f}" if self.fco_signal is not None else "N/A"
         adx_str = f"{self.adx_value:.2f}" if self.adx_value is not None else "N/A"
-        print(f"  [{self.symbol}] Seeded: {self.candle_count} candles | "
-              f"FCO: {fco_str} | Signal: {sig_str} | ADX: {adx_str}")
+        ref_str = f"{self.renko.last_close:.2f}" if self.renko.last_close is not None else "N/A"
+        print(f"  [{self.symbol}] Renko: {self.renko.brick_count} bricks, {dir_str}, ref={ref_str}")
+        print(f"  [{self.symbol}] FCO: {fco_str} | Signal: {sig_str} | ADX: {adx_str}")
 
     # ----------------------------------------------------------------
     # Status display
@@ -609,6 +596,9 @@ class SymbolState:
     def print_status(self):
         now = datetime.now(ET).strftime("%H:%M:%S")
         pos_str = "LONG" if self.position == 1 else "SHORT" if self.position == -1 else "FLAT"
+        dir_str = "BULLISH" if self.renko.direction == 1 else \
+                  "BEARISH" if self.renko.direction == -1 else "NONE"
+        ref_str = f"{self.renko.last_close:.2f}" if self.renko.last_close is not None else "N/A"
         fco_str = f"{self.fco_value:.4f}" if self.fco_value is not None else "N/A"
         sig_str = f"{self.fco_signal:.4f}" if self.fco_signal is not None else "N/A"
         mom_str = f"{self.fco_momentum:.4f}" if self.fco_momentum is not None else "N/A"
@@ -619,13 +609,18 @@ class SymbolState:
             tp_str = f" | TP: ${tp:.0f}"
 
         print(f"  [{self.symbol} @ {now}]")
-        print(f"    FCO: {fco_str} | Signal: {sig_str} | Momentum: {mom_str}")
-        print(f"    ADX: {adx_str} | Candles: {self.candle_count} | "
-              f"Candle size: {self.candle_size}s")
+        print(f"    Renko: {dir_str} | ref={ref_str} | bricks={self.renko.brick_count} | "
+              f"brick_size={self.brick_size}")
+        print(f"    FCO: {fco_str} | Signal: {sig_str} | Momentum: {mom_str} | ADX: {adx_str}")
         print(f"    Levels: LONG cross-up {self.fco_long_cross} | "
               f"SHORT cross-down {self.fco_short_cross}")
         print(f"    Position: {pos_str} x{self.contracts_held} | "
               f"P&L: ${self.live_pnl:.2f} | PV=${self.point_value}/pt{tp_str}")
+
+    def is_data_stale(self, threshold: int = 300) -> bool:
+        if self.last_new_bar_time is None:
+            return False
+        return (time.time() - self.last_new_bar_time) > threshold
 
     def is_price_frozen(self, threshold: int = 180) -> bool:
         if self.last_price_change_time is None:
@@ -633,7 +628,7 @@ class SymbolState:
         return (time.time() - self.last_price_change_time) > threshold
 
     # ----------------------------------------------------------------
-    # Tick loop (called by FCOBot every ~0.5s)
+    # Tick loop (called every ~0.5s)
     # ----------------------------------------------------------------
 
     async def tick(self, cached_price=None):
@@ -659,23 +654,34 @@ class SymbolState:
         now_ts = time.time()
         now = datetime.now(ET).strftime("%H:%M:%S")
 
-        new_candle = self._update_candle(price, now_ts)
+        # Feed renko at most once per second (1s timeframe)
+        if now_ts - self._last_renko_feed_time >= 1.0:
+            bricks = self.renko.feed_close(price)
+            self._last_renko_feed_time = now_ts
+        else:
+            bricks = []
 
-        if new_candle:
-            self.last_candle_time = now_ts
-            fco_str = f"{self.fco_value:.4f}" if self.fco_value is not None else "N/A"
-            sig_str = f"{self.fco_signal:.4f}" if self.fco_signal is not None else "N/A"
-            adx_str = f"{self.adx_value:.2f}" if self.adx_value is not None else "N/A"
-            print(f"[{now}] [{self.symbol} CANDLE #{self.candle_count}] "
-                  f"H={self.candle_highs[-1]:.2f} L={self.candle_lows[-1]:.2f} "
-                  f"C={self.candle_closes[-1]:.2f} | FCO: {fco_str} | "
-                  f"Sig: {sig_str} | ADX: {adx_str}")
+        if bricks:
+            self.last_new_bar_time = now_ts
+            for b in bricks:
+                brick_dir = b[2]
+                self._add_brick(b[0], b[1])
+                self._compute_fco()
+                if self.use_adx_filter:
+                    self._compute_adx()
 
-            direction = self.check_signals()
-            if direction:
-                print(f"[{now}] [{self.symbol} SIGNAL] {direction} | "
-                      f"FCO: {self.prev_fco_value:.4f} -> {self.fco_value:.4f}")
-                await self._handle_signal(direction, price, now)
+                color = "BULLISH" if brick_dir == 1 else "BEARISH"
+                fco_str = f"{self.fco_value:.4f}" if self.fco_value is not None else "N/A"
+                adx_str = f"{self.adx_value:.2f}" if self.adx_value is not None else "N/A"
+                print(f"[{now}] [{self.symbol} BRICK] {color} #{self.renko.brick_count}: "
+                      f"{b[0]:.2f} -> {b[1]:.2f} | FCO: {fco_str} | ADX: {adx_str}")
+
+                direction = self.check_signals()
+                if direction:
+                    print(f"[{now}] [{self.symbol} FCO-SIGNAL] {direction} | "
+                          f"FCO: {self.prev_fco_value:.4f} -> {self.fco_value:.4f}")
+                    await self._handle_signal(direction, price, now)
+                    break
 
         # Take profit check
         if self.position != 0 and self.contracts_held > 0:
@@ -739,15 +745,14 @@ class SymbolState:
             await self._enter_short(price)
 
     # ----------------------------------------------------------------
-    # Order placement (shielded against task cancellation)
+    # Order placement (shielded)
     # ----------------------------------------------------------------
 
     async def _ensure_flat_before_entry(self):
         try:
             await asyncio.wait_for(
                 self.ctx.positions.close_position_direct(
-                    contract_id=self.ctx.instrument_info.id),
-                timeout=4.0)
+                    contract_id=self.ctx.instrument_info.id), timeout=4.0)
         except Exception:
             pass
 
@@ -755,8 +760,7 @@ class SymbolState:
         try:
             await asyncio.wait_for(
                 self.ctx.positions.close_position_direct(
-                    contract_id=self.ctx.instrument_info.id),
-                timeout=4.0)
+                    contract_id=self.ctx.instrument_info.id), timeout=4.0)
             now = datetime.now(ET).strftime("%H:%M:%S")
             print(f"[{now}] [{self.symbol}] Ghost-position cleanup attempted")
         except Exception:
@@ -764,7 +768,6 @@ class SymbolState:
 
     async def _enter_long(self, price: float):
         if self.position != 0:
-            print(f"[{self.symbol}] BLOCKED LONG: already in position")
             return False
         await self._ensure_flat_before_entry()
         now = datetime.now(ET).strftime("%H:%M:%S")
@@ -776,8 +779,7 @@ class SymbolState:
                 response = await asyncio.wait_for(
                     self.ctx.orders.place_market_order(
                         contract_id=self.ctx.instrument_info.id,
-                        side=0, size=self.qty),
-                    timeout=15.0)
+                        side=0, size=self.qty), timeout=15.0)
                 if response.success:
                     self.position = 1
                     self.contracts_held = 1
@@ -796,7 +798,6 @@ class SymbolState:
 
         result = await asyncio.shield(_do_order())
         self.last_order_error = result if result != "ok" else None
-
         if result == "ok":
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
@@ -815,7 +816,6 @@ class SymbolState:
 
     async def _enter_short(self, price: float):
         if self.position != 0:
-            print(f"[{self.symbol}] BLOCKED SHORT: already in position")
             return False
         await self._ensure_flat_before_entry()
         now = datetime.now(ET).strftime("%H:%M:%S")
@@ -827,8 +827,7 @@ class SymbolState:
                 response = await asyncio.wait_for(
                     self.ctx.orders.place_market_order(
                         contract_id=self.ctx.instrument_info.id,
-                        side=1, size=self.qty),
-                    timeout=15.0)
+                        side=1, size=self.qty), timeout=15.0)
                 if response.success:
                     self.position = -1
                     self.contracts_held = 1
@@ -847,7 +846,6 @@ class SymbolState:
 
         result = await asyncio.shield(_do_order())
         self.last_order_error = result if result != "ok" else None
-
         if result == "ok":
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
@@ -870,8 +868,7 @@ class SymbolState:
                 response = await asyncio.wait_for(
                     self.ctx.orders.place_market_order(
                         contract_id=self.ctx.instrument_info.id,
-                        side=side, size=self.qty),
-                    timeout=15.0)
+                        side=side, size=self.qty), timeout=15.0)
                 if response.success:
                     self.contracts_held += 1
                     print(f"[{self.symbol}] Scale-in filled #{self.contracts_held}. "
@@ -897,21 +894,19 @@ class SymbolState:
         trade_pnl = (price - saved_entry) * saved_pos * self.point_value * saved_qty
         now = datetime.now(ET).strftime("%H:%M:%S")
         print(f"\n[{now}] [{self.symbol}] <<< EXITING {direction} x{saved_qty} @ {price:.2f} | "
-              f"Trade: ${trade_pnl:+.2f} | Session est: ${self.live_pnl + trade_pnl:.2f} | {reason}")
+              f"Trade: ${trade_pnl:+.2f} | Session: ${self.live_pnl + trade_pnl:.2f} | {reason}")
 
         async def _do_close():
             try:
                 await asyncio.wait_for(
                     self.ctx.positions.close_position_direct(
-                        contract_id=self.ctx.instrument_info.id),
-                    timeout=5.0)
-                print(f"[{self.symbol}] Closed via close_position_direct")
+                        contract_id=self.ctx.instrument_info.id), timeout=5.0)
                 return True
             except asyncio.TimeoutError:
-                print(f"[{self.symbol}] close TIMEOUT — assuming closed externally")
+                print(f"[{self.symbol}] close TIMEOUT — assuming closed")
                 return True
             except Exception as ex:
-                print(f"[{self.symbol}] close failed ({ex}) — assuming closed externally")
+                print(f"[{self.symbol}] close failed ({ex}) — assuming closed")
                 return True
 
         close_ok = await asyncio.shield(_do_close())
@@ -951,7 +946,7 @@ class SymbolState:
             print(f"[{self.symbol}] Trade log write error: {e}")
 
     # ----------------------------------------------------------------
-    # Position safety net (HTTP poll with divergence counter)
+    # Position safety net
     # ----------------------------------------------------------------
 
     async def _query_platform_position(self):
@@ -994,12 +989,12 @@ class SymbolState:
             if (real_pos > 0) != (self.position > 0):
                 print(f"[{self.symbol}] WARNING: bot={self.position}, platform={real_pos}")
                 send_telegram(self.tg_token, self.tg_chat,
-                              f"WARN|{self.symbol} state mismatch: bot={self.position} vs platform={real_pos}")
+                              f"WARN|{self.symbol} mismatch: bot={self.position} vs platform={real_pos}")
             self.platform_flat_streak = 0
             return
         if self.position != 0 and real_pos == 0:
             self.platform_flat_streak += 1
-            print(f"[{self.symbol}] platform shows flat (streak {self.platform_flat_streak}"
+            print(f"[{self.symbol}] platform flat (streak {self.platform_flat_streak}"
                   f"/{self.PLATFORM_FLAT_THRESHOLD})")
             if self.platform_flat_streak >= self.PLATFORM_FLAT_THRESHOLD:
                 direction = "LONG" if self.position == 1 else "SHORT"
@@ -1022,17 +1017,17 @@ class SymbolState:
                               f"Est PnL: ${pnl_est:+.2f}")
             return
         if self.position == 0 and real_pos != 0:
-            print(f"[{self.symbol}] WARN: bot=FLAT, platform shows {real_pos} contracts")
+            print(f"[{self.symbol}] WARN: bot=FLAT, platform shows {real_pos}")
             self.platform_flat_streak = 0
 
 
 # ============================================================
-# Main Bot (connection, session, multi-symbol orchestration)
+# Main Bot
 # ============================================================
 
 class FCOBot:
     def __init__(self, symbol_configs, tg_token="", tg_chat="", tg_keys=None,
-                 candle_size=300, use_adx_filter=True, adx_threshold=20.0,
+                 use_adx_filter=True, adx_threshold=20.0,
                  fco_long_cross=-1.0, fco_short_cross=1.0, tp_webhooks=None):
         self.tg_token = tg_token
         self.tg_chat = tg_chat
@@ -1044,12 +1039,12 @@ class FCOBot:
             sym = cfg["symbol"]
             state = SymbolState(
                 symbol=sym,
+                brick_size=cfg["brick_size"],
                 qty=cfg["qty"],
                 ntfy_topic=cfg.get("ntfy_topic", ""),
                 tg_token=tg_token,
                 tg_chat=tg_chat,
                 tg_keys=self.tg_keys,
-                candle_size=candle_size,
                 use_adx_filter=use_adx_filter,
                 adx_threshold=adx_threshold,
                 fco_long_cross=fco_long_cross,
@@ -1090,10 +1085,6 @@ class FCOBot:
     def _symbols_list(self):
         return list(self.states.keys())
 
-    # ----------------------------------------------------------------
-    # State persistence
-    # ----------------------------------------------------------------
-
     def save_all_state(self):
         try:
             state = {sym: st.save_state() for sym, st in self.states.items()}
@@ -1116,7 +1107,7 @@ class FCOBot:
                     if st.restore_state(saved[sym]):
                         fco_s = f"{st.fco_value:.4f}" if st.fco_value is not None else "N/A"
                         adx_s = f"{st.adx_value:.2f}" if st.adx_value is not None else "N/A"
-                        print(f"  [{sym}] Restored: candles={st.candle_count}, "
+                        print(f"  [{sym}] Restored: bricks={st.renko.brick_count}, "
                               f"FCO={fco_s}, ADX={adx_s}")
                         restored_any = True
             return restored_any
@@ -1130,29 +1121,24 @@ class FCOBot:
             send_telegram(self.tg_token, self.tg_chat, msg)
             self.last_status_notify = now_ts
 
-    # ----------------------------------------------------------------
-    # Main run loop
-    # ----------------------------------------------------------------
-
     async def run(self):
         from project_x_py import TradingSuite
 
         symbols = self._symbols_list()
-        candle_s = next(iter(self.states.values())).candle_size
         long_lvl = next(iter(self.states.values())).fco_long_cross
         short_lvl = next(iter(self.states.values())).fco_short_cross
         adx_on = next(iter(self.states.values())).use_adx_filter
         adx_thr = next(iter(self.states.values())).adx_threshold
 
-        print(f"[BOT] FCO Strategy - LIVE MODE")
+        print(f"[BOT] FCO Renko Strategy - LIVE MODE")
         print(f"[BOT] Symbols: {', '.join(symbols)}")
         for sym, st in self.states.items():
-            print(f"[BOT]   {sym}: qty={st.qty}, pv=${st.point_value}/pt"
+            print(f"[BOT]   {sym}: brick={st.brick_size}, qty={st.qty}, "
+                  f"pv=${st.point_value}/pt"
                   + (f", ntfy={st.ntfy_topic}" if st.ntfy_topic else ""))
         print(f"[BOT] FCO: Forecast Oscillator({FCO_LENGTH_1}/{FCO_LENGTH_2}) on hlc3, "
               f"SMA({FCO_SMOOTH_LENGTH}), Signal WMA({FCO_SIGNAL_LENGTH})")
         print(f"[BOT] ENTRY: LONG cross-up {long_lvl} | SHORT cross-down {short_lvl}")
-        print(f"[BOT] Candle size: {candle_s}s ({candle_s // 60}min)")
         print(f"[BOT] ADX filter: {'ENABLED (>' + str(adx_thr) + ')' if adx_on else 'disabled'}")
         day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
         trading_day_str = ", ".join(day_names[d] for d in TRADING_DAYS)
@@ -1166,8 +1152,8 @@ class FCOBot:
 
         self.suite = await TradingSuite.create(
             instruments=symbols,
-            timeframes=["1sec"],
-            initial_days=2,
+            timeframes=["1sec", "15min"],
+            initial_days=1,
         )
         self._register_websocket_handlers()
 
@@ -1187,9 +1173,11 @@ class FCOBot:
             except Exception:
                 price = None
             if price:
+                if not restored or st.renko.last_close is None:
+                    st.renko.initialize(price)
                 st.last_price = price
                 print(f"[BOT] {sym} price: {price:.2f}")
-            if not restored or not st.candle_hlc3:
+            if not restored or not st.brick_hlc3:
                 await st.seed_history()
             else:
                 print(f"  [{sym}] Using restored indicator state (skipping seed)")
@@ -1215,8 +1203,7 @@ class FCOBot:
                 try:
                     await asyncio.wait_for(
                         st.ctx.positions.close_position_direct(
-                            contract_id=st.ctx.instrument_info.id),
-                        timeout=5.0)
+                            contract_id=st.ctx.instrument_info.id), timeout=5.0)
                 except Exception as e:
                     print(f"  [{sym}] startup close failed: {e}")
             elif real_pos != 0 and st.position != 0:
@@ -1246,8 +1233,7 @@ class FCOBot:
                     print(f"[{now}] [WARN] Task cancelled - reconnecting...")
                     try:
                         await self._auto_reconnect()
-                    except (asyncio.CancelledError, Exception) as re:
-                        print(f"[{now}] [WARN] Reconnect failed: {re}")
+                    except (asyncio.CancelledError, Exception):
                         try:
                             await asyncio.sleep(5)
                         except asyncio.CancelledError:
@@ -1259,8 +1245,7 @@ class FCOBot:
                     print(f"[{now}] [WARN] Tick error: {e} - reconnecting...")
                     try:
                         await self._auto_reconnect()
-                    except (asyncio.CancelledError, Exception) as re:
-                        print(f"[{now}] [WARN] Reconnect failed: {re}")
+                    except (asyncio.CancelledError, Exception):
                         try:
                             await asyncio.sleep(5)
                         except asyncio.CancelledError:
@@ -1269,10 +1254,6 @@ class FCOBot:
             pass
         finally:
             await self._shutdown()
-
-    # ----------------------------------------------------------------
-    # WebSocket handlers
-    # ----------------------------------------------------------------
 
     def _register_websocket_handlers(self):
         try:
@@ -1298,7 +1279,6 @@ class FCOBot:
                     if now_ts - last_seen < 2.0:
                         continue
                     self._ws_close_seen[cid] = now_ts
-
                     for sym, st in self.states.items():
                         if st.ctx is None or st.ctx.instrument_info.id != cid:
                             continue
@@ -1311,7 +1291,6 @@ class FCOBot:
                         ts = datetime.now(ET).strftime("%H:%M:%S")
                         print(f"\n[{ts}] [{sym}] WS-SYNC: {direction} closed externally. "
                               f"Est PnL: ${pnl_est:+.2f}")
-
                         st.live_pnl += pnl_est
                         st._log_trade(direction, st.entry_price, price, pnl_est,
                                       "WS_PLATFORM_CLOSED", st.entry_time)
@@ -1320,7 +1299,6 @@ class FCOBot:
                         st.entry_price = 0.0
                         st.entry_time = None
                         st.platform_flat_streak = 0
-
                         threading.Thread(target=send_telegram, args=(
                             self.tg_token, self.tg_chat,
                             f"WS-SYNC|{sym} {direction} closed externally. "
@@ -1334,27 +1312,16 @@ class FCOBot:
                     continue
 
         registered = []
-        try:
-            conn.on("GatewayLogout", on_logout)
-            registered.append("GatewayLogout")
-        except Exception as e:
-            print(f"[WARN] GatewayLogout register failed: {e}")
-        try:
-            conn.on("GatewayUserPosition", on_position_event)
-            registered.append("GatewayUserPosition")
-        except Exception as e:
-            print(f"[WARN] GatewayUserPosition register failed: {e}")
-        try:
-            conn.on("PositionUpdate", on_position_event)
-            registered.append("PositionUpdate")
-        except Exception as e:
-            print(f"[WARN] PositionUpdate register failed: {e}")
+        for name, handler in [("GatewayLogout", on_logout),
+                              ("GatewayUserPosition", on_position_event),
+                              ("PositionUpdate", on_position_event)]:
+            try:
+                conn.on(name, handler)
+                registered.append(name)
+            except Exception as e:
+                print(f"[WARN] {name} register failed: {e}")
         if registered:
             print(f"[BOT] WS handlers registered: {', '.join(registered)}")
-
-    # ----------------------------------------------------------------
-    # Reconnect with exponential backoff
-    # ----------------------------------------------------------------
 
     async def _auto_reconnect(self):
         from project_x_py import TradingSuite
@@ -1374,17 +1341,14 @@ class FCOBot:
         try:
             self.suite = await asyncio.wait_for(
                 TradingSuite.create(
-                    instruments=symbols,
-                    timeframes=["1sec"],
-                    initial_days=2,
-                ),
-                timeout=60.0,
-            )
+                    instruments=symbols, timeframes=["1sec", "15min"],
+                    initial_days=1),
+                timeout=60.0)
             for sym, st in self.states.items():
                 st.ctx = self.suite[sym]
                 st.last_known_price = None
                 st.last_price_change_time = time.time()
-                st.last_candle_time = time.time()
+                st.last_new_bar_time = time.time()
                 st.platform_flat_streak = 0
 
             self._register_websocket_handlers()
@@ -1409,18 +1373,17 @@ class FCOBot:
 
         except asyncio.TimeoutError:
             now = datetime.now(ET).strftime("%H:%M:%S")
-            print(f"[{now}] [RECONNECT] TIMEOUT (60s) — forcing clean restart")
+            print(f"[{now}] [RECONNECT] TIMEOUT — forcing restart")
             self._notify_status(f"STATUS|Reconnect timeout, restarting ({now} ET)")
             self.save_all_state()
             self.suite = None
             self.reconnecting = False
-            raise RuntimeError("Reconnect timeout — forcing restart")
+            raise RuntimeError("Reconnect timeout")
         except Exception as e:
             self.reconnect_failures += 1
             self.reconnect_cooldown = min(
                 5 * (2 ** (self.reconnect_failures - 1)),
-                self.RECONNECT_COOLDOWN_MAX,
-            )
+                self.RECONNECT_COOLDOWN_MAX)
             now = datetime.now(ET).strftime("%H:%M:%S")
             print(f"[{now}] [RECONNECT] Failed (#{self.reconnect_failures}): {e} — "
                   f"retry in {self.reconnect_cooldown}s")
@@ -1429,10 +1392,6 @@ class FCOBot:
                 st.ctx = None
         finally:
             self.reconnecting = False
-
-    # ----------------------------------------------------------------
-    # Main tick (multi-symbol orchestration)
-    # ----------------------------------------------------------------
 
     async def _tick(self):
         if self.suite is None:
@@ -1481,7 +1440,7 @@ class FCOBot:
         if any_price_frozen and in_session() and not in_blackout() and not self.reconnecting:
             now = datetime.now(ET).strftime("%H:%M:%S")
             print(f"[{now}] [FROZEN] {frozen_sym} price unchanged 180+s — reconnecting")
-            self._notify_status(f"STATUS|{frozen_sym} feed frozen, reconnecting ({now} ET)")
+            self._notify_status(f"STATUS|{frozen_sym} feed frozen ({now} ET)")
             if now_ts - self.last_reconnect_time > self.reconnect_cooldown:
                 await self._auto_reconnect()
                 return
@@ -1530,7 +1489,8 @@ class FCOBot:
                 symbols = self._symbols_list()
                 print(f"[{now_str}] [SESSION] Reconnecting for new session...")
                 self.suite = await TradingSuite.create(
-                    instruments=symbols, timeframes=["1sec"], initial_days=2)
+                    instruments=symbols, timeframes=["1sec", "15min"],
+                    initial_days=1)
                 self._register_websocket_handlers()
                 for sym, st in self.states.items():
                     st.ctx = self.suite[sym]
@@ -1563,16 +1523,23 @@ class FCOBot:
             if time.time() - self.last_reconnect_time > self.reconnect_cooldown:
                 await self._auto_reconnect()
 
-        # Periodic state save
+        if not self.reconnecting:
+            for sym, st in self.states.items():
+                if st.is_data_stale(threshold=600):
+                    now = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now}] [STALE] {sym} no new brick 600s — reconnecting")
+                    self._notify_status(f"STATUS|{sym} data stale ({now} ET)")
+                    if time.time() - self.last_reconnect_time > self.reconnect_cooldown:
+                        await self._auto_reconnect()
+                    break
+
         if time.time() - self.last_state_save > 30:
             self.save_all_state()
             self.last_state_save = time.time()
 
-        # GatewayLogout handling
         if self.last_gateway_logout_time > 0 and time.time() - self.last_gateway_logout_time > 5:
             self.last_gateway_logout_time = 0
 
-        # Periodic GC + memory monitoring
         if time.time() - self.last_gc_time > self.GC_INTERVAL:
             self.last_gc_time = time.time()
             cutoff = time.time() - 60
@@ -1587,21 +1554,19 @@ class FCOBot:
                             now = datetime.now(ET).strftime("%H:%M:%S")
                             print(f"[{now}] [MEM] RSS: {rss_mb}MB (gc collected)")
                             if rss_mb > 500:
-                                print(f"[{now}] [MEM] RSS {rss_mb}MB exceeds 500MB — "
-                                      f"saving state and restarting...")
+                                print(f"[{now}] [MEM] RSS {rss_mb}MB > 500MB — restarting...")
                                 self.save_all_state()
                                 os._exit(0)
                             break
             except Exception:
                 pass
 
-        # Heartbeat (every 30 min)
         if time.time() - self.last_heartbeat > self.HEARTBEAT_INTERVAL:
             self.last_heartbeat = time.time()
             now = datetime.now(ET).strftime("%H:%M:%S")
             for sym, st in self.states.items():
-                pos_str = ("FLAT" if st.position == 0
-                           else "LONG" if st.position == 1 else "SHORT")
+                pos_str = "FLAT" if st.position == 0 else \
+                          "LONG" if st.position == 1 else "SHORT"
                 fco_str = f"{st.fco_value:.4f}" if st.fco_value is not None else "N/A"
                 adx_str = f"{st.adx_value:.2f}" if st.adx_value is not None else "N/A"
                 msg = (f"HEARTBEAT|{sym} alive ({now} ET) | {pos_str} | "
@@ -1646,28 +1611,27 @@ class FCOBot:
 # ============================================================
 
 def parse_symbol_configs(symbols_str: str) -> list:
-    """Parse 'NQ:1:ntfy-topic,ES:2' into list of config dicts."""
+    """Parse 'NQ:2:1:ntfy-topic,ES:3:2' into config dicts."""
     configs = []
     for part in symbols_str.split(","):
         parts = part.strip().split(":")
-        if len(parts) < 2:
+        if len(parts) < 3:
             raise ValueError(f"Invalid symbol config '{part}'. "
-                             f"Format: SYMBOL:QTY[:NTFY_TOPIC]")
+                             f"Format: SYMBOL:BRICK_SIZE:QTY[:NTFY_TOPIC]")
         cfg = {
             "symbol": parts[0].strip().upper(),
-            "qty": int(parts[1]),
-            "ntfy_topic": parts[2].strip() if len(parts) > 2 else "",
+            "brick_size": float(parts[1]),
+            "qty": int(parts[2]),
+            "ntfy_topic": parts[3].strip() if len(parts) > 3 else "",
         }
         configs.append(cfg)
     return configs
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TopstepX FCO Bot (Multi-Symbol)")
-    parser.add_argument("--symbols", default="NQ:1:disabled",
-                        help="Multi-symbol config: 'NQ:1:ntfy,ES:2'")
-    parser.add_argument("--candle-size", type=int, default=300,
-                        help="Candle size in seconds (default 300 = 5min)")
+    parser = argparse.ArgumentParser(description="TopstepX FCO Renko Bot")
+    parser.add_argument("--symbols", default="NQ:2:1:disabled",
+                        help="Config: 'NQ:BRICK_SIZE:QTY:NTFY_TOPIC'")
     parser.add_argument("--tg-token", default="", help="Telegram bot token")
     parser.add_argument("--tg-chat", default="", help="Telegram chat ID")
     parser.add_argument("--tg-keys", default="", help="Comma-separated passkeys")
@@ -1685,7 +1649,6 @@ def main():
 
     keys = [k.strip() for k in args.tg_keys.split(",") if k.strip()] if args.tg_keys else []
     tp_webhooks = [u.strip() for u in args.tp_webhooks.split(",") if u.strip()] if args.tp_webhooks else []
-
     symbol_configs = parse_symbol_configs(args.symbols)
 
     stopped = False
@@ -1709,7 +1672,6 @@ def main():
     try:
         if os.path.exists(log_file) and os.path.getsize(log_file) > 10_000_000:
             os.truncate(log_file, 0)
-            print(f"[BOT] Log file truncated (>10MB)")
     except Exception:
         pass
 
@@ -1719,7 +1681,6 @@ def main():
             tg_token=args.tg_token,
             tg_chat=args.tg_chat,
             tg_keys=keys,
-            candle_size=args.candle_size,
             use_adx_filter=not args.no_adx,
             adx_threshold=args.adx_threshold,
             fco_long_cross=args.fco_long_cross,
@@ -1747,10 +1708,7 @@ def main():
                               f"STATUS|FCO Bot crashed, restarting in {retry_delay}s ({now} ET)")
                 last_crash_notify = time.time()
             run_duration = time.time() - run_start
-            if run_duration > 300:
-                retry_delay = 30
-            else:
-                retry_delay = min(retry_delay * 2, 300)
+            retry_delay = 30 if run_duration > 300 else min(retry_delay * 2, 300)
         finally:
             if current_bot:
                 current_bot.save_all_state()
