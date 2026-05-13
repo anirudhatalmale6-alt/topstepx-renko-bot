@@ -3,12 +3,12 @@ TopstepX FCO Bot (LIVE)
 =======================
 Multi-symbol support: runs multiple instruments on one connection.
 
-Strategy: Fancy Chande Oscillator (FCO) on Renko bricks
+Strategy: Flow Control Oscillator (FCO) on Renko bricks
 - Renko bricks built from 1-second price feed (configurable brick size)
-- FCO = dual-period Forecast Oscillator on hlc3, blended 50/50
-  FCO(n) = ((hlc3 - LinReg(hlc3, n)) / hlc3) * 100
-  Blended: 0.5 * FCO(14) + 0.5 * FCO(20), smoothed SMA(3)
-- Signal line: WMA(6)
+- FCO = MFI(14) scaled to -1..+1  +  CMF(20) (-1..+1)
+  Based on WalrusQuant's Pine Script indicator.
+  Volume = 1 per brick (TopstepX has no real volume).
+- Smoothed: SMA(3), Signal: WMA(6)
 - LONG entry: FCO crosses UP through -1 (recovering from oversold)
 - SHORT entry: FCO crosses DOWN through +1 (reversing from overbought)
 - ADX(14) filter: only trade when ADX > threshold (optional)
@@ -210,38 +210,46 @@ def in_blackout() -> bool:
 
 
 # ============================================================
-# Indicator Math
+# Indicator Math  (Flow Control Oscillator – MFI + CMF)
 # ============================================================
 
-def linreg_value(values, length):
-    """Linear regression value at the most recent bar."""
-    if len(values) < length:
+def compute_mfi(highs, lows, closes, volumes, length):
+    """MFI(length) → 0‥100.  volume=1 per brick makes this price-only."""
+    n = len(closes)
+    if n < length + 1:
         return None
-    y = values[-length:]
-    n = length
-    x_mean = (n - 1) / 2.0
-    y_mean = sum(y) / n
-    num = 0.0
-    den = 0.0
-    for i in range(n):
-        dx = i - x_mean
-        num += dx * (y[i] - y_mean)
-        den += dx * dx
-    if abs(den) < 1e-10:
-        return y_mean
-    slope = num / den
-    return y_mean + slope * x_mean
+    pos_flow = 0.0
+    neg_flow = 0.0
+    for i in range(n - length, n):
+        tp = (highs[i] + lows[i] + closes[i]) / 3.0
+        prev_tp = (highs[i - 1] + lows[i - 1] + closes[i - 1]) / 3.0
+        mf = tp * volumes[i]
+        if tp > prev_tp:
+            pos_flow += mf
+        elif tp < prev_tp:
+            neg_flow += mf
+    if neg_flow < 1e-10:
+        return 100.0
+    ratio = pos_flow / neg_flow
+    return 100.0 - 100.0 / (1.0 + ratio)
 
 
-def forecast_osc(values, length):
-    """Chande Forecast Oscillator: ((current - linreg) / current) * 100."""
-    lr = linreg_value(values, length)
-    if lr is None:
+def compute_cmf(highs, lows, closes, volumes, length):
+    """CMF(length) → -1‥+1."""
+    n = len(closes)
+    if n < length:
         return None
-    current = values[-1]
-    if abs(current) < 1e-10:
+    ad_sum = 0.0
+    vol_sum = 0.0
+    for i in range(n - length, n):
+        h, l, c, v = highs[i], lows[i], closes[i], volumes[i]
+        hl = h - l
+        ad = ((2.0 * c - h - l) / hl * v) if hl > 1e-10 else 0.0
+        ad_sum += ad
+        vol_sum += v
+    if vol_sum < 1e-10:
         return 0.0
-    return ((current - lr) / current) * 100.0
+    return ad_sum / vol_sum
 
 
 # ============================================================
@@ -275,6 +283,7 @@ class SymbolState:
         self.brick_lows = []
         self.brick_closes = []
         self.brick_hlc3 = []
+        self.brick_volumes = []
 
         # FCO state
         self.fco_raw_values = []
@@ -335,6 +344,7 @@ class SymbolState:
             "brick_lows": self.brick_lows[-300:],
             "brick_closes": self.brick_closes[-300:],
             "brick_hlc3": self.brick_hlc3[-300:],
+            "brick_volumes": self.brick_volumes[-300:],
             "fco_raw_values": self.fco_raw_values[-300:],
             "fco_values": self.fco_values[-300:],
             "fco_signal_values": self.fco_signal_values[-300:],
@@ -362,6 +372,8 @@ class SymbolState:
         self.brick_lows = state.get("brick_lows", [])
         self.brick_closes = state.get("brick_closes", [])
         self.brick_hlc3 = state.get("brick_hlc3", [])
+        self.brick_volumes = state.get("brick_volumes",
+                                       [1.0] * len(self.brick_highs))
         self.fco_raw_values = state.get("fco_raw_values", [])
         self.fco_values = state.get("fco_values", [])
         self.fco_signal_values = state.get("fco_signal_values", [])
@@ -399,7 +411,7 @@ class SymbolState:
 
     _MAX_HIST = 350
 
-    def _add_brick(self, brick_open: float, brick_close: float):
+    def _add_brick(self, brick_open: float, brick_close: float, vol: float = 1.0):
         """Append a new brick and compute hlc3."""
         h = max(brick_open, brick_close)
         l = min(brick_open, brick_close)
@@ -408,20 +420,25 @@ class SymbolState:
         self.brick_lows.append(l)
         self.brick_closes.append(brick_close)
         self.brick_hlc3.append(hlc3)
+        self.brick_volumes.append(vol)
         if len(self.brick_hlc3) > self._MAX_HIST:
             self.brick_highs = self.brick_highs[-self._MAX_HIST:]
             self.brick_lows = self.brick_lows[-self._MAX_HIST:]
             self.brick_closes = self.brick_closes[-self._MAX_HIST:]
             self.brick_hlc3 = self.brick_hlc3[-self._MAX_HIST:]
+            self.brick_volumes = self.brick_volumes[-self._MAX_HIST:]
 
     def _compute_fco(self):
-        """Compute FCO from hlc3 history after a brick closes."""
-        fo1 = forecast_osc(self.brick_hlc3, FCO_LENGTH_1)
-        fo2 = forecast_osc(self.brick_hlc3, FCO_LENGTH_2)
-        if fo1 is None or fo2 is None:
+        """Compute FCO = MFI_scaled + CMF  (Flow Control Oscillator)."""
+        mfi_raw = compute_mfi(self.brick_highs, self.brick_lows,
+                              self.brick_closes, self.brick_volumes, FCO_LENGTH_1)
+        cmf = compute_cmf(self.brick_highs, self.brick_lows,
+                          self.brick_closes, self.brick_volumes, FCO_LENGTH_2)
+        if mfi_raw is None or cmf is None:
             return
 
-        raw = FCO_WEIGHT * fo1 + (1 - FCO_WEIGHT) * fo2
+        mfi_scaled = (mfi_raw - 50.0) / 50.0
+        raw = mfi_scaled + cmf
         self.fco_raw_values.append(raw)
         if len(self.fco_raw_values) > self._MAX_HIST:
             self.fco_raw_values = self.fco_raw_values[-self._MAX_HIST:]
@@ -559,6 +576,7 @@ class SymbolState:
         self.brick_lows.clear()
         self.brick_closes.clear()
         self.brick_hlc3.clear()
+        self.brick_volumes.clear()
         self.fco_raw_values.clear()
         self.fco_values.clear()
         self.fco_signal_values.clear()
