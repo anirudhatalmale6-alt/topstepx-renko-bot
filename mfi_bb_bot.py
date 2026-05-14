@@ -7,8 +7,8 @@ Strategy: MFI Oversold/Overbought + 15-sec Bollinger Band Break + Candle Color
 - MFI(14) on Renko bricks (volume = 1 per brick)
 - Oversold dot: MFI crosses BELOW 20 (prev > 20, new <= 20)
 - Overbought dot: MFI crosses ABOVE 80 (prev < 80, new >= 80)
-- SHORT entry: overbought dot → 15s candle closes above upper BB(20,2) → next red 15s candle
-- LONG  entry: oversold dot  → 15s candle closes below lower BB(20,2) → next green 15s candle
+- SHORT entry: overbought dot → 15s candle closes above upper BB(20,2) → wait for any red 15s candle
+- LONG  entry: oversold dot  → 15s candle closes below lower BB(20,2) → wait for any green 15s candle
 - EXIT: opposite MFI signal flips the position or TP hit.
 
 Usage:
@@ -699,9 +699,13 @@ class SymbolState:
                 if new_mfi <= MFI_OVERSOLD and self.prev_mfi_value > MFI_OVERSOLD:
                     self.mfi_oversold_dot = True
                     self.mfi_overbought_dot = False
+                    if self.bb_break_armed == "SHORT":
+                        self.bb_break_armed = None
                 elif new_mfi >= MFI_OVERBOUGHT and self.prev_mfi_value < MFI_OVERBOUGHT:
                     self.mfi_overbought_dot = True
                     self.mfi_oversold_dot = False
+                    if self.bb_break_armed == "LONG":
+                        self.bb_break_armed = None
 
             self.prev_mfi_value = self.mfi_value if self.mfi_value is not None else new_mfi
             self.mfi_value = new_mfi
@@ -986,20 +990,19 @@ class SymbolState:
                 self.bb_break_armed = None
                 await self._handle_signal("LONG", price, now)
             elif self.bb_break_armed is not None and c_color is not None:
-                # Wrong color candle — cancel the armed signal
-                print(f"[{now}] [{self.symbol} BB-CANCEL] {self.bb_break_armed} cancelled — "
-                      f"got {c_color} candle instead")
-                self.bb_break_armed = None
+                # Wrong color candle — keep waiting (don't cancel)
+                print(f"[{now}] [{self.symbol} BB-WAIT] {self.bb_break_armed} still armed — "
+                      f"got {c_color} candle, waiting for {'red' if self.bb_break_armed == 'SHORT' else 'green'}")
 
             # Phase 1: MFI dot armed → check for BB break
             if self.bb_upper is not None:
                 if self.mfi_overbought_dot and c_close > self.bb_upper:
-                    print(f"[{now}] [{self.symbol} BB-BREAK] SHORT: 15s candle {c_close:.2f} > "
+                    print(f"[{now}] [{self.symbol} BB-BREAK] SHORT: 15s candle close {c_close:.2f} > "
                           f"upper BB {self.bb_upper:.2f} | MFI overbought | waiting for red candle")
                     self.mfi_overbought_dot = False
                     self.bb_break_armed = "SHORT"
                 elif self.mfi_oversold_dot and c_close < self.bb_lower:
-                    print(f"[{now}] [{self.symbol} BB-BREAK] LONG: 15s candle {c_close:.2f} < "
+                    print(f"[{now}] [{self.symbol} BB-BREAK] LONG: 15s candle close {c_close:.2f} < "
                           f"lower BB {self.bb_lower:.2f} | MFI oversold | waiting for green candle")
                     self.mfi_oversold_dot = False
                     self.bb_break_armed = "LONG"
@@ -1904,12 +1907,14 @@ class RenkoBot:
             if time.time() - self.last_reconnect_time > self.reconnect_cooldown:
                 await self._auto_reconnect()
 
-        # Stale-data detection: no new brick in 10+ minutes during session
+        # Stale-data detection: only reconnect if price feed is truly dead
+        # (no new brick AND price frozen). Low-volatility periods can go 10+ min
+        # without a new brick even though the feed is alive.
         if not self.reconnecting:
             for sym, st in self.states.items():
-                if st.is_data_stale(threshold=600):
+                if st.is_data_stale(threshold=600) and st.is_price_frozen(threshold=180):
                     now = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now}] [STALE] {sym} no new brick 600s — reconnecting")
+                    print(f"[{now}] [STALE] {sym} no new brick 600s AND price frozen 180s — reconnecting")
                     self._notify_status(f"STATUS|{sym} data stale, reconnecting ({now} ET)")
                     if time.time() - self.last_reconnect_time > self.reconnect_cooldown:
                         await self._auto_reconnect()
