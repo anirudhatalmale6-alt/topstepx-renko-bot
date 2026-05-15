@@ -421,8 +421,8 @@ class SymbolState:
         self.entry_features = None  # snapshot for ML
         self.live_pnl = 0.0
         self.MAX_CONTRACTS = 2
-        self.TP_BASE_DOLLARS = 100.0
-        self.TP_INCREMENT_DOLLARS = 100.0
+        self.TP_BASE_DOLLARS = 200.0
+        self.TP_INCREMENT_DOLLARS = 0.0
 
         # Connection / freshness tracking
         self.last_known_price = None
