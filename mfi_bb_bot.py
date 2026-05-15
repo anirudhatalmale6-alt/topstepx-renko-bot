@@ -420,6 +420,8 @@ class SymbolState:
         self.entry_time = None
         self.entry_features = None  # snapshot for ML
         self.live_pnl = 0.0
+        self.trade_mae = 0.0        # max adverse excursion (worst drawdown $ during trade)
+        self.mae_history = []        # list of MAE values for averaging
         self.MAX_CONTRACTS = 3
         self.TP_BASE_DOLLARS = 200.0
         self.TP_INCREMENT_DOLLARS = 0.0
@@ -486,6 +488,8 @@ class SymbolState:
             "entry_price": self.entry_price,
             "entry_features": self.entry_features,
             "live_pnl": self.live_pnl,
+            "trade_mae": self.trade_mae,
+            "mae_history": self.mae_history[-100:],
         }
 
     def restore_state(self, state: dict, position_ttl: int = 600) -> bool:
@@ -551,6 +555,8 @@ class SymbolState:
             self.entry_features = state.get("entry_features")
 
         self.live_pnl = state.get("live_pnl", 0.0)
+        self.trade_mae = state.get("trade_mae", 0.0)
+        self.mae_history = state.get("mae_history", [])
         return True
 
     # ----------------------------------------------------------------
@@ -741,8 +747,11 @@ class SymbolState:
         if self.contracts_held > 0:
             tp = self.TP_BASE_DOLLARS + self.TP_INCREMENT_DOLLARS * (self.contracts_held - 1)
             tp_str = f" | TP: ${tp:.0f}"
+        avg_mae_str = ""
+        if self.mae_history:
+            avg_mae_str = f" | Avg MAE: ${sum(self.mae_history)/len(self.mae_history):.2f} ({len(self.mae_history)} trades)"
         print(f"    Position: {pos_str} x{self.contracts_held} | P&L: ${self.live_pnl:.2f} | "
-              f"PV=${self.point_value}/pt{tp_str}")
+              f"PV=${self.point_value}/pt{tp_str}{avg_mae_str}")
 
     def is_data_stale(self, threshold: int = 300) -> bool:
         if self.last_new_bar_time is None:
@@ -951,7 +960,17 @@ class SymbolState:
                     else:
                         print(f"[{now}] [{self.symbol} SKIP] LONG: MFI overbought but Vortex warming")
 
-        # Take profit check (incrementing: $100 base + $100 per additional contract)
+        # MAE tracking: track worst drawdown during open trade
+        if self.position != 0 and self.contracts_held > 0:
+            contracts = self.contracts_held
+            if self.position == 1:
+                unrealized = (price - self.entry_price) * self.point_value * contracts
+            else:
+                unrealized = (self.entry_price - price) * self.point_value * contracts
+            if unrealized < self.trade_mae:
+                self.trade_mae = unrealized
+
+        # Take profit check
         if self.position != 0 and self.contracts_held > 0:
             contracts = self.contracts_held
             tp_target = self.TP_BASE_DOLLARS + self.TP_INCREMENT_DOLLARS * (contracts - 1)
@@ -1095,6 +1114,7 @@ class SymbolState:
                     self.contracts_held = self.qty
                     self.entry_price = price
                     self.entry_time = datetime.now(ET)
+                    self.trade_mae = 0.0
                     print(f"[{self.symbol}] Order filled. ID: {response.orderId}")
                     return "ok"
                 print(f"[{self.symbol}] Order REJECTED: {response.errorMessage}")
@@ -1151,6 +1171,7 @@ class SymbolState:
                     self.contracts_held = self.qty
                     self.entry_price = price
                     self.entry_time = datetime.now(ET)
+                    self.trade_mae = 0.0
                     print(f"[{self.symbol}] Order filled. ID: {response.orderId}")
                     return "ok"
                 print(f"[{self.symbol}] Order REJECTED: {response.errorMessage}")
@@ -1267,15 +1288,25 @@ class SymbolState:
 
         if close_ok:
             saved_entry_time = self.entry_time
+            saved_mae = self.trade_mae
+            self.mae_history.append(saved_mae)
+            if len(self.mae_history) > 100:
+                self.mae_history = self.mae_history[-100:]
+            avg_mae = sum(self.mae_history) / len(self.mae_history)
+            now_t = datetime.now(ET).strftime("%H:%M:%S")
+            print(f"[{now_t}] [{self.symbol} MAE] This trade: ${saved_mae:.2f} | "
+                  f"Avg MAE ({len(self.mae_history)} trades): ${avg_mae:.2f}")
             self.live_pnl += trade_pnl
             self.position = 0
             self.contracts_held = 0
             self.entry_price = 0.0
             self.entry_time = None
-            self._log_trade(direction, saved_entry_price, price, trade_pnl, reason, saved_entry_time)
+            self.trade_mae = 0.0
+            self._log_trade(direction, saved_entry_price, price, trade_pnl, reason,
+                            saved_entry_time, mae=saved_mae)
         return close_ok
 
-    def _log_trade(self, direction, entry_price, exit_price, pnl, reason, entry_time=None):
+    def _log_trade(self, direction, entry_price, exit_price, pnl, reason, entry_time=None, mae=0.0):
         now = datetime.now(ET)
         et_str = "N/A"
         if entry_time is not None:
@@ -1295,6 +1326,8 @@ class SymbolState:
             "mfi": self.mfi_value,
             "rsg_sma": self.renko_sma,
             "ema": self.ema,
+            "mae": mae,
+            "avg_mae": sum(self.mae_history) / len(self.mae_history) if self.mae_history else 0.0,
             "account": os.environ.get("PROJECT_X_ACCOUNT_NAME", "unknown"),
             "session_pnl": self.live_pnl,
         }
@@ -1319,7 +1352,8 @@ class RenkoBot:
         self.tp_webhooks = tp_webhooks or []
         self.tick_interval = tick_interval
 
-        self.ml = None
+        ml_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ml_trades.json")
+        self.ml = TradeML(ml_file)
 
         self.states = {}
         for cfg in symbol_configs:
