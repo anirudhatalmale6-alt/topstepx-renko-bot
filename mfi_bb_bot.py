@@ -1,14 +1,16 @@
 """
-TopstepX Renko MFI + BB Bot (LIVE)
-===================================
+TopstepX Renko MFI + S/R Channel Bot (LIVE)
+=============================================
 Multi-symbol support: runs multiple instruments on one connection.
 
-Strategy: MFI Oversold/Overbought + 15-sec Bollinger Band Break + Candle Color
+Strategy: MFI + Support/Resistance Channel Filter (5-min candles)
 - MFI(14) on Renko bricks (volume = 1 per brick)
 - Oversold dot: MFI crosses BELOW 20 (prev > 20, new <= 20)
 - Overbought dot: MFI crosses ABOVE 80 (prev < 80, new >= 80)
-- SHORT entry: overbought dot → 15s candle closes above upper BB(20,2) → wait for any red 15s candle
-- LONG  entry: oversold dot  → 15s candle closes below lower BB(20,2) → wait for any green 15s candle
+- S/R Channels: pivot-based support/resistance zones on 5-min candles
+- LONG  entry: oversold dot + price at S/R zone (support bounce)
+- SHORT entry: overbought dot + price at S/R zone (resistance bounce)
+- If not at any S/R zone → skip (fake signal)
 - EXIT: opposite MFI signal flips the position or TP hit.
 
 Usage:
@@ -194,8 +196,12 @@ BLACKOUT_END = dtime(16, 35, 0)
 MFI_PERIOD = 14
 MFI_OVERSOLD = 20.0
 MFI_OVERBOUGHT = 80.0
-BB_PERIOD = 20
-BB_STD = 2.0
+# Support/Resistance channel settings (5-min candles)
+SR_PIVOT_PERIOD = 10
+SR_CHANNEL_WIDTH_PCT = 5
+SR_MIN_STRENGTH = 1
+SR_MAX_LEVELS = 6
+SR_LOOPBACK = 290
 
 EMA_PERIOD = 9                # used as ML feature only (not for entry/exit)
 RENKO_SMA_PERIOD = 12         # R.sg (Renko Smoothed Gradient) period
@@ -407,24 +413,16 @@ class SymbolState:
         self.mfi_oversold_dot = False
         self.mfi_overbought_dot = False
 
-        # 15-second candles for Bollinger Band confirmation
-        self.candle_interval = 15.0  # seconds
-        self._candle_start_time = 0.0
-        self._candle_open = None
-        self._candle_high = None
-        self._candle_low = None
-        self._candle_close = None
-        self.candle_closes = []       # 15-sec candle close history
-        self.bb_upper = None
-        self.bb_lower = None
-        self.bb_mid = None
-        # BB break state machine:
-        # Phase 1: MFI dot armed → watching for BB break on 15s candle
-        # Phase 2: BB broke → waiting for next candle color confirmation
-        self.bb_break_armed = None     # "LONG" or "SHORT" or None (waiting for color confirm)
-        self.last_candle_color = None  # "green" or "red" or None
+        # 5-minute candles for S/R channel detection
+        self._m5_start_time = 0.0
+        self._m5_open = None
+        self._m5_high = None
+        self._m5_low = None
+        self._m5_close = None
+        self.m5_candles = []  # list of (open, high, low, close)
+        self.sr_levels = []   # list of (hi, lo) tuples — current S/R zones
 
-        # Position state (scale-in up to MAX_CONTRACTS)
+        # Position state (fixed qty, no scale-in)
         self.position = 0           # 1 long, -1 short, 0 flat
         self.contracts_held = 0
         self.entry_price = 0.0      # weighted average entry
@@ -433,7 +431,7 @@ class SymbolState:
         self.live_pnl = 0.0
         self.MAX_CONTRACTS = 5
         self.TP_BASE_DOLLARS = 100.0
-        self.TP_INCREMENT_DOLLARS = 50.0
+        self.TP_INCREMENT_DOLLARS = 100.0
 
         # Connection / freshness tracking
         self.last_known_price = None
@@ -484,12 +482,9 @@ class SymbolState:
             "prev_mfi_value": self.prev_mfi_value,
             "mfi_oversold_dot": self.mfi_oversold_dot,
             "mfi_overbought_dot": self.mfi_overbought_dot,
-            # BB 15-sec candle state
-            "candle_closes": self.candle_closes[-100:],
-            "bb_upper": self.bb_upper,
-            "bb_lower": self.bb_lower,
-            "bb_mid": self.bb_mid,
-            "bb_break_armed": self.bb_break_armed,
+            # S/R channel state (5-min candles)
+            "m5_candles": self.m5_candles[-320:],
+            "sr_levels": self.sr_levels,
             "renko_last_close": self.renko.last_close,
             "renko_direction": self.renko.direction,
             "renko_brick_count": self.renko.brick_count,
@@ -530,12 +525,9 @@ class SymbolState:
         # because the customer wouldn't have seen the corresponding live bar.
         self.mfi_oversold_dot = False
         self.mfi_overbought_dot = False
-        # Restore BB 15-sec candle state
-        self.candle_closes = state.get("candle_closes", [])
-        self.bb_upper = state.get("bb_upper")
-        self.bb_lower = state.get("bb_lower")
-        self.bb_mid = state.get("bb_mid")
-        self.bb_break_armed = state.get("bb_break_armed")
+        # Restore S/R channel state
+        self.m5_candles = state.get("m5_candles", [])
+        self.sr_levels = [tuple(z) for z in state.get("sr_levels", [])]
         self.renko.last_close = state.get("renko_last_close")
         self.renko.direction = state.get("renko_direction", 0)
         self.renko.brick_count = state.get("renko_brick_count", 0)
@@ -610,52 +602,120 @@ class SymbolState:
 
         self.rsg_dosc_values.append(self.rsg_dosc)
 
-    def _update_bb_candle(self, price: float, now_ts: float):
-        """Build 15-second candles and compute BB(20,2). Returns completed candle
-        tuple (open, high, low, close) or None if candle not yet closed."""
-        if self._candle_open is None:
-            self._candle_start_time = now_ts
-            self._candle_open = price
-            self._candle_high = price
-            self._candle_low = price
-            self._candle_close = price
+    def _update_m5_candle(self, price: float, now_ts: float):
+        """Build 5-minute candles for S/R channel detection. Returns completed
+        candle tuple (open, high, low, close) or None."""
+        if self._m5_open is None:
+            self._m5_start_time = now_ts
+            self._m5_open = price
+            self._m5_high = price
+            self._m5_low = price
+            self._m5_close = price
             return None
 
-        self._candle_high = max(self._candle_high, price)
-        self._candle_low = min(self._candle_low, price)
-        self._candle_close = price
+        self._m5_high = max(self._m5_high, price)
+        self._m5_low = min(self._m5_low, price)
+        self._m5_close = price
 
-        if now_ts - self._candle_start_time >= self.candle_interval:
-            completed = (self._candle_open, self._candle_high,
-                         self._candle_low, self._candle_close)
-            self.candle_closes.append(self._candle_close)
-            if len(self.candle_closes) > 200:
-                self.candle_closes = self.candle_closes[-200:]
-
-            # Compute BB(20,2)
-            if len(self.candle_closes) >= BB_PERIOD:
-                recent = self.candle_closes[-BB_PERIOD:]
-                self.bb_mid = sum(recent) / BB_PERIOD
-                variance = sum((x - self.bb_mid) ** 2 for x in recent) / BB_PERIOD
-                std = variance ** 0.5
-                self.bb_upper = self.bb_mid + BB_STD * std
-                self.bb_lower = self.bb_mid - BB_STD * std
-
-            # Track candle color
-            if self._candle_close > self._candle_open:
-                self.last_candle_color = "green"
-            elif self._candle_close < self._candle_open:
-                self.last_candle_color = "red"
-            else:
-                self.last_candle_color = None  # doji
-
-            # Start new candle
-            self._candle_start_time = now_ts
-            self._candle_open = price
-            self._candle_high = price
-            self._candle_low = price
-            self._candle_close = price
+        if now_ts - self._m5_start_time >= 300.0:
+            completed = (self._m5_open, self._m5_high, self._m5_low, self._m5_close)
+            self.m5_candles.append(completed)
+            max_keep = SR_LOOPBACK + SR_PIVOT_PERIOD + 20
+            if len(self.m5_candles) > max_keep:
+                self.m5_candles = self.m5_candles[-max_keep:]
+            self._calc_sr_levels()
+            self._m5_start_time = now_ts
+            self._m5_open = price
+            self._m5_high = price
+            self._m5_low = price
+            self._m5_close = price
             return completed
+        return None
+
+    def _calc_sr_levels(self):
+        """Port of LonesomeTheBlue's Support Resistance Channels indicator.
+        Detects pivot highs/lows on 5-min candles, groups nearby pivots into
+        S/R zones, ranks by strength, keeps top SR_MAX_LEVELS."""
+        candles = self.m5_candles
+        n = len(candles)
+        prd = SR_PIVOT_PERIOD
+        if n < prd * 2 + 1:
+            return
+
+        lookback = min(n, SR_LOOPBACK)
+        start_idx = max(0, n - lookback)
+
+        pivots = []
+        for i in range(start_idx + prd, n - prd):
+            hi = candles[i][1]
+            is_ph = True
+            for j in range(1, prd + 1):
+                if candles[i - j][1] >= hi or candles[i + j][1] >= hi:
+                    is_ph = False
+                    break
+            if is_ph:
+                pivots.append(hi)
+
+            lo = candles[i][2]
+            is_pl = True
+            for j in range(1, prd + 1):
+                if candles[i - j][2] <= lo or candles[i + j][2] <= lo:
+                    is_pl = False
+                    break
+            if is_pl:
+                pivots.append(lo)
+
+        if not pivots:
+            self.sr_levels = []
+            return
+
+        ref_price = candles[-1][3]
+        if ref_price <= 0:
+            return
+        cwidth = ref_price * SR_CHANNEL_WIDTH_PCT / 100.0
+
+        pivots.sort()
+        groups = []
+        used = set()
+        for i in range(len(pivots)):
+            if i in used:
+                continue
+            grp = [pivots[i]]
+            used.add(i)
+            for j in range(i + 1, len(pivots)):
+                if j in used:
+                    continue
+                if pivots[j] - pivots[i] <= cwidth:
+                    grp.append(pivots[j])
+                    used.add(j)
+                else:
+                    break
+            groups.append(grp)
+
+        zones = []
+        for grp in groups:
+            zone_hi = max(grp)
+            zone_lo = min(grp)
+            strength = len(grp)
+            for i in range(start_idx, n):
+                if candles[i][2] <= zone_hi and candles[i][1] >= zone_lo:
+                    strength += 1
+            if strength >= SR_MIN_STRENGTH:
+                zones.append((zone_hi, zone_lo, strength))
+
+        zones.sort(key=lambda x: -x[2])
+        self.sr_levels = [(z[0], z[1]) for z in zones[:SR_MAX_LEVELS]]
+        if self.sr_levels:
+            print(f"  [{self.symbol} S/R] {len(self.sr_levels)} zones: "
+                  + ", ".join(f"{lo:.2f}-{hi:.2f}" for hi, lo in self.sr_levels))
+
+    def _price_at_sr(self, price: float):
+        """Check if price is within any S/R zone (with half-brick buffer).
+        Returns (hi, lo) tuple or None."""
+        buf = self.brick_size / 2.0
+        for hi, lo in self.sr_levels:
+            if (lo - buf) <= price <= (hi + buf):
+                return (hi, lo)
         return None
 
     def _calc_indicators(self):
@@ -699,13 +759,9 @@ class SymbolState:
                 if new_mfi <= MFI_OVERSOLD and self.prev_mfi_value > MFI_OVERSOLD:
                     self.mfi_oversold_dot = True
                     self.mfi_overbought_dot = False
-                    if self.bb_break_armed == "SHORT":
-                        self.bb_break_armed = None
                 elif new_mfi >= MFI_OVERBOUGHT and self.prev_mfi_value < MFI_OVERBOUGHT:
                     self.mfi_overbought_dot = True
                     self.mfi_oversold_dot = False
-                    if self.bb_break_armed == "LONG":
-                        self.bb_break_armed = None
 
             self.prev_mfi_value = self.mfi_value if self.mfi_value is not None else new_mfi
             self.mfi_value = new_mfi
@@ -779,9 +835,9 @@ class SymbolState:
         print(f"    Renko: {dir_str} | last_close={last_close_str} | bricks={self.renko.brick_count}")
         print(f"    R.sg SMA: {rma_str} | MFI: {mfi_str}")
         print(f"    Oversold dot: {os_str} | Overbought dot: {ob_str}")
-        bb_str = f"{self.bb_lower:.2f}/{self.bb_mid:.2f}/{self.bb_upper:.2f}" if self.bb_upper else "warming"
-        bb_armed = f" [ARMED {self.bb_break_armed}]" if self.bb_break_armed else ""
-        print(f"    BB(20,2): {bb_str}{bb_armed}")
+        sr_str = ", ".join(f"{lo:.2f}-{hi:.2f}" for hi, lo in self.sr_levels) if self.sr_levels else "none (warming)"
+        print(f"    S/R zones ({len(self.sr_levels)}): {sr_str}")
+        print(f"    5m candles: {len(self.m5_candles)}")
         tp_str = ""
         if self.contracts_held > 0:
             tp = self.TP_BASE_DOLLARS + self.TP_INCREMENT_DOLLARS * (self.contracts_held - 1)
@@ -826,9 +882,7 @@ class SymbolState:
             try:
                 p_cid = getattr(p, "contract_id", None) or getattr(p, "contractId", None)
                 if p_cid == cid:
-                    size = float(getattr(p, "size", 0) or getattr(p, "net_pos", 0) or 0)
-                    side = getattr(p, "side", 0)
-                    return int(size) if side == 0 else -int(size)
+                    return p.signed_size
             except Exception:
                 continue
         if len(positions) == 0 and self.position != 0:
@@ -968,44 +1022,34 @@ class SymbolState:
                 if self.mfi_value is None:
                     continue
 
-                # MFI dots just set flags — BB candle logic handles the rest
+                # MFI dot + S/R zone check: enter only if price is at a support/resistance level
+                if self.mfi_oversold_dot:
+                    zone = self._price_at_sr(price)
+                    if zone:
+                        print(f"[{now}] [{self.symbol} SR-ENTRY] LONG: MFI oversold "
+                              f"+ price {price:.2f} at S/R zone {zone[1]:.2f}-{zone[0]:.2f}")
+                        self.mfi_oversold_dot = False
+                        await self._handle_signal("LONG", price, now)
+                    else:
+                        sr_info = f" (zones: {len(self.sr_levels)})" if self.sr_levels else " (no zones)"
+                        print(f"[{now}] [{self.symbol} SR-SKIP] LONG: MFI oversold but "
+                              f"price {price:.2f} not at S/R{sr_info}")
+                        self.mfi_oversold_dot = False
+                elif self.mfi_overbought_dot:
+                    zone = self._price_at_sr(price)
+                    if zone:
+                        print(f"[{now}] [{self.symbol} SR-ENTRY] SHORT: MFI overbought "
+                              f"+ price {price:.2f} at S/R zone {zone[1]:.2f}-{zone[0]:.2f}")
+                        self.mfi_overbought_dot = False
+                        await self._handle_signal("SHORT", price, now)
+                    else:
+                        sr_info = f" (zones: {len(self.sr_levels)})" if self.sr_levels else " (no zones)"
+                        print(f"[{now}] [{self.symbol} SR-SKIP] SHORT: MFI overbought but "
+                              f"price {price:.2f} not at S/R{sr_info}")
+                        self.mfi_overbought_dot = False
 
-        # Update 15-second BB candles (every tick)
-        completed_candle = self._update_bb_candle(price, now_ts)
-
-        if completed_candle is not None:
-            c_open, c_high, c_low, c_close = completed_candle
-            c_color = "green" if c_close > c_open else "red" if c_close < c_open else None
-            bb_str = f"BB: {self.bb_lower:.2f}/{self.bb_mid:.2f}/{self.bb_upper:.2f}" if self.bb_upper else "BB: warming"
-
-            # Phase 2: BB break already confirmed, waiting for candle color
-            if self.bb_break_armed == "SHORT" and c_color == "red":
-                print(f"[{now}] [{self.symbol} BB-ENTRY] SHORT confirmed! "
-                      f"Red 15s candle @ {c_close:.2f} | {bb_str}")
-                self.bb_break_armed = None
-                await self._handle_signal("SHORT", price, now)
-            elif self.bb_break_armed == "LONG" and c_color == "green":
-                print(f"[{now}] [{self.symbol} BB-ENTRY] LONG confirmed! "
-                      f"Green 15s candle @ {c_close:.2f} | {bb_str}")
-                self.bb_break_armed = None
-                await self._handle_signal("LONG", price, now)
-            elif self.bb_break_armed is not None and c_color is not None:
-                # Wrong color candle — keep waiting (don't cancel)
-                print(f"[{now}] [{self.symbol} BB-WAIT] {self.bb_break_armed} still armed — "
-                      f"got {c_color} candle, waiting for {'red' if self.bb_break_armed == 'SHORT' else 'green'}")
-
-            # Phase 1: MFI dot armed → check for BB break
-            if self.bb_upper is not None:
-                if self.mfi_overbought_dot and c_close > self.bb_upper:
-                    print(f"[{now}] [{self.symbol} BB-BREAK] SHORT: 15s candle close {c_close:.2f} > "
-                          f"upper BB {self.bb_upper:.2f} | MFI overbought | waiting for red candle")
-                    self.mfi_overbought_dot = False
-                    self.bb_break_armed = "SHORT"
-                elif self.mfi_oversold_dot and c_close < self.bb_lower:
-                    print(f"[{now}] [{self.symbol} BB-BREAK] LONG: 15s candle close {c_close:.2f} < "
-                          f"lower BB {self.bb_lower:.2f} | MFI oversold | waiting for green candle")
-                    self.mfi_oversold_dot = False
-                    self.bb_break_armed = "LONG"
+        # Update 5-minute candles for S/R channel detection (every tick)
+        self._update_m5_candle(price, now_ts)
 
         # Take profit check (incrementing: $100 base + $50 per additional contract)
         if self.position != 0 and self.contracts_held > 0:
@@ -1040,25 +1084,11 @@ class SymbolState:
                       f"(<= {self.brick_size:.2f} pts)")
                 return
 
-        # If already in position, handle scale-in or flip
+        # If already in position, skip same-direction or flip opposite
         if self.position != 0:
             already_dir = "LONG" if self.position == 1 else "SHORT"
             if (direction == "LONG" and self.position == 1) or (direction == "SHORT" and self.position == -1):
-                if self.contracts_held >= self.MAX_CONTRACTS:
-                    print(f"[{now}] [{self.symbol}] {direction} signal: already {already_dir} x{self.contracts_held} (max)")
-                    return
-                old_qty = self.contracts_held
-                print(f"[{now}] [{self.symbol} SCALE-IN] {direction} #{old_qty + 1}")
-                side = 0 if direction == "LONG" else 1
-                success = await self._enter_addon(price, side=side)
-                if success:
-                    new_avg = (self.entry_price * old_qty + price) / (old_qty + 1)
-                    self.entry_price = new_avg
-                    threading.Thread(target=send_signals, args=(
-                        self.tg_token, self.tg_chat, self.tg_keys,
-                        direction, self.symbol, price, self.contracts_held),
-                        kwargs={"ntfy_topic": self.ntfy_topic,
-                                "tp_webhooks": self.tp_webhooks}, daemon=True).start()
+                print(f"[{now}] [{self.symbol}] {direction} signal: already {already_dir} x{self.contracts_held}, skipping")
                 return
 
             # Opposite-side flip
@@ -1163,6 +1193,11 @@ class SymbolState:
                 return "error"
 
         result = await asyncio.shield(_do_order())
+        if result == "error":
+            await self._cleanup_ghost_position()
+            print(f"[{self.symbol}] Retrying LONG order after error...")
+            await asyncio.sleep(1.0)
+            result = await asyncio.shield(_do_order())
         self.last_order_error = result if result != "ok" else None
 
         if result == "ok":
@@ -1214,6 +1249,11 @@ class SymbolState:
                 return "error"
 
         result = await asyncio.shield(_do_order())
+        if result == "error":
+            await self._cleanup_ghost_position()
+            print(f"[{self.symbol}] Retrying SHORT order after error...")
+            await asyncio.sleep(1.0)
+            result = await asyncio.shield(_do_order())
         self.last_order_error = result if result != "ok" else None
 
         if result == "ok":
@@ -1231,30 +1271,6 @@ class SymbolState:
         send_telegram(self.tg_token, self.tg_chat,
                       f"ALERT|{self.symbol} SHORT {result.upper()} @ {price:.2f}")
         return False
-
-    async def _enter_addon(self, price: float, side: int):
-        """Scale-in: add 1 contract to existing position."""
-        async def _do_order():
-            try:
-                response = await asyncio.wait_for(
-                    self.ctx.orders.place_market_order(
-                        contract_id=self.ctx.instrument_info.id,
-                        side=side, size=self.qty),
-                    timeout=15.0)
-                if response.success:
-                    self.contracts_held += 1
-                    print(f"[{self.symbol}] Scale-in filled #{self.contracts_held}. ID: {response.orderId}")
-                    return True
-                print(f"[{self.symbol}] Scale-in REJECTED: {response.errorMessage}")
-                return False
-            except asyncio.TimeoutError:
-                print(f"[{self.symbol}] Scale-in TIMEOUT")
-                return False
-            except Exception as ex:
-                print(f"[{self.symbol}] Scale-in ERROR: {ex}")
-                return False
-
-        return await asyncio.shield(_do_order())
 
     async def _flatten(self, price: float, reason: str = ""):
         """Close current position. Bookkeeping happens AFTER close confirms,
@@ -1367,8 +1383,8 @@ class RenkoBot:
         self.last_price_time = None
         self.connection_alive = True
         self.disconnect_alert_sent = False
-        self.STALE_THRESHOLD = 180
-        self.RECONNECT_THRESHOLD = 300
+        self.STALE_THRESHOLD = 120
+        self.RECONNECT_THRESHOLD = 120
 
         # Reconnect state with exponential backoff
         self.reconnecting = False
@@ -1395,6 +1411,8 @@ class RenkoBot:
         self.state_file = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "bot_state.json"
         )
+        self._watchdog_tick = time.time()
+        self.WATCHDOG_TIMEOUT = 300
 
     def _symbols_list(self):
         return list(self.states.keys())
@@ -1449,13 +1467,15 @@ class RenkoBot:
         from project_x_py import TradingSuite
 
         symbols = self._symbols_list()
-        print(f"[BOT] Renko MFI + BB Strategy - LIVE MODE")
+        print(f"[BOT] Renko MFI + S/R Channel Strategy - LIVE MODE")
         print(f"[BOT] Symbols: {', '.join(symbols)}")
         for sym, st in self.states.items():
             print(f"[BOT]   {sym}: brick={st.brick_size}, qty={st.qty}, "
                   f"pv=${st.point_value}/pt"
                   + (f", ntfy={st.ntfy_topic}" if st.ntfy_topic else ""))
-        print(f"[BOT] ENTRY: MFI dot ({MFI_OVERSOLD}/{MFI_OVERBOUGHT}) + 15s BB({BB_PERIOD},{BB_STD}) break + candle color")
+        print(f"[BOT] ENTRY: MFI dot ({MFI_OVERSOLD}/{MFI_OVERBOUGHT}) + S/R zone confirmation (5m candles)")
+        print(f"[BOT] S/R: pivot_prd={SR_PIVOT_PERIOD}, width={SR_CHANNEL_WIDTH_PCT}%, "
+              f"min_str={SR_MIN_STRENGTH}, max={SR_MAX_LEVELS}, lookback={SR_LOOPBACK}")
         print(f"[BOT] EXIT: opposite MFI signal flips position or TP hit")
         rsg_state = "ENABLED" if any(s.use_rsg_filter for s in self.states.values()) else "disabled"
         print(f"[BOT] R.sg distance filter: {rsg_state}")
@@ -1547,12 +1567,25 @@ class RenkoBot:
         for st in self.states.values():
             st.print_status()
         print(f"\n[BOT] Session active: {self.was_in_session}")
-        print(f"[BOT] Trading LIVE - MFI+BB strategy ({', '.join(symbols)})")
+        print(f"[BOT] Trading LIVE - MFI+SR strategy ({', '.join(symbols)})")
+        print(f"[BOT] Watchdog: {self.WATCHDOG_TIMEOUT}s timeout")
         print(f"[BOT] Press Ctrl+C to stop\n")
+
+        def _watchdog():
+            while self.running:
+                time.sleep(30)
+                elapsed = time.time() - self._watchdog_tick
+                if elapsed > self.WATCHDOG_TIMEOUT and in_session():
+                    print(f"[WATCHDOG] Main loop stuck for {int(elapsed)}s — killing process")
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    time.sleep(5)
+                    os._exit(1)
+        threading.Thread(target=_watchdog, daemon=True).start()
 
         try:
             while self.running:
                 try:
+                    self._watchdog_tick = time.time()
                     await self._tick()
                     await asyncio.sleep(0.5)
                 except asyncio.CancelledError:
@@ -1788,7 +1821,8 @@ class RenkoBot:
             if st.ctx is None:
                 continue
             try:
-                p = await st.ctx.data.get_current_price()
+                p = await asyncio.wait_for(
+                    st.ctx.data.get_current_price(), timeout=5.0)
             except Exception:
                 p = None
             if p is not None:
@@ -1968,20 +2002,11 @@ class RenkoBot:
 
     async def _shutdown(self):
         self.save_all_state()
-        print("\n[BOT] Shutdown (state saved)...")
+        print("\n[BOT] Shutdown (state saved, positions kept open)...")
         for sym, st in self.states.items():
-            if st.position != 0 and st.ctx:
-                try:
-                    price = await asyncio.wait_for(
-                        st.ctx.data.get_current_price(), timeout=3.0)
-                    if price:
-                        await asyncio.wait_for(
-                            st._flatten(price, reason="SHUTDOWN"), timeout=5.0)
-                        send_signals(self.tg_token, self.tg_chat, self.tg_keys,
-                                     "FLAT", sym, price, 0, ntfy_topic=st.ntfy_topic,
-                                     tp_webhooks=st.tp_webhooks)
-                except (asyncio.TimeoutError, asyncio.CancelledError, Exception) as e:
-                    print(f"  [{sym}] Shutdown flatten failed: {e}")
+            if st.position != 0:
+                dir_str = "LONG" if st.position == 1 else "SHORT"
+                print(f"  [{sym}] Keeping {dir_str} x{st.contracts_held} open (entry: {st.entry_price:.2f})")
 
         print(f"\n[BOT] === SESSION SUMMARY ===")
         for sym, st in self.states.items():
