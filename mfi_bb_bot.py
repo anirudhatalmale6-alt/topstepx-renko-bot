@@ -1,20 +1,19 @@
 """
-TopstepX Renko MFI + S/R Channel Bot (LIVE)
-=============================================
+TopstepX Renko MFI + MACD Cross Bot (LIVE)
+============================================
 Multi-symbol support: runs multiple instruments on one connection.
 
-Strategy: MFI + Support/Resistance Channel Filter (5-min candles)
+Strategy: MFI + MACD Cross on Renko bricks
 - MFI(14) on Renko bricks (volume = 1 per brick)
-- Oversold dot: MFI crosses BELOW 20 (prev > 20, new <= 20)
-- Overbought dot: MFI crosses ABOVE 80 (prev < 80, new >= 80)
-- S/R Channels: pivot-based support/resistance zones on 5-min candles
-- LONG  entry: oversold dot + price at S/R zone (support bounce)
-- SHORT entry: overbought dot + price at S/R zone (resistance bounce)
-- If not at any S/R zone → skip (fake signal)
+- MACD(12,26,9) on Renko brick closes
+- Oversold dot: MFI crosses BELOW 20 → arm for LONG
+- Overbought dot: MFI crosses ABOVE 80 → arm for SHORT
+- LONG  entry: MFI oversold armed + MACD line crosses ABOVE signal line
+- SHORT entry: MFI overbought armed + MACD line crosses BELOW signal line
 - EXIT: opposite MFI signal flips the position or TP hit.
 
 Usage:
-    python mfi_bb_bot.py --symbols "NQ:5:1:ntfy-topic" --tick-interval 1
+    python mfi_bb_bot.py --symbols "NQ:2:2:ntfy-topic" --tick-interval 1
 """
 
 import asyncio
@@ -196,12 +195,9 @@ BLACKOUT_END = dtime(16, 35, 0)
 MFI_PERIOD = 14
 MFI_OVERSOLD = 20.0
 MFI_OVERBOUGHT = 80.0
-# Support/Resistance channel settings (5-min candles)
-SR_PIVOT_PERIOD = 10
-SR_CHANNEL_WIDTH_PCT = 5
-SR_MIN_STRENGTH = 1
-SR_MAX_LEVELS = 6
-SR_LOOPBACK = 290
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
 
 EMA_PERIOD = 9                # used as ML feature only (not for entry/exit)
 RENKO_SMA_PERIOD = 12         # R.sg (Renko Smoothed Gradient) period
@@ -413,14 +409,14 @@ class SymbolState:
         self.mfi_oversold_dot = False
         self.mfi_overbought_dot = False
 
-        # 5-minute candles for S/R channel detection
-        self._m5_start_time = 0.0
-        self._m5_open = None
-        self._m5_high = None
-        self._m5_low = None
-        self._m5_close = None
-        self.m5_candles = []  # list of (open, high, low, close)
-        self.sr_levels = []   # list of (hi, lo) tuples — current S/R zones
+        # MACD(12,26,9) on Renko brick closes
+        self.macd_fast_ema = None
+        self.macd_slow_ema = None
+        self.macd_line = None
+        self.macd_signal_ema = None
+        self.prev_macd_line = None
+        self.prev_macd_signal = None
+        self.macd_cross_armed = None  # None | "LONG" | "SHORT"
 
         # Position state (fixed qty, no scale-in)
         self.position = 0           # 1 long, -1 short, 0 flat
@@ -482,9 +478,14 @@ class SymbolState:
             "prev_mfi_value": self.prev_mfi_value,
             "mfi_oversold_dot": self.mfi_oversold_dot,
             "mfi_overbought_dot": self.mfi_overbought_dot,
-            # S/R channel state (5-min candles)
-            "m5_candles": self.m5_candles[-320:],
-            "sr_levels": self.sr_levels,
+            # MACD state on Renko bricks
+            "macd_fast_ema": self.macd_fast_ema,
+            "macd_slow_ema": self.macd_slow_ema,
+            "macd_line": self.macd_line,
+            "macd_signal_ema": self.macd_signal_ema,
+            "prev_macd_line": self.prev_macd_line,
+            "prev_macd_signal": self.prev_macd_signal,
+            "macd_cross_armed": self.macd_cross_armed,
             "renko_last_close": self.renko.last_close,
             "renko_direction": self.renko.direction,
             "renko_brick_count": self.renko.brick_count,
@@ -525,9 +526,14 @@ class SymbolState:
         # because the customer wouldn't have seen the corresponding live bar.
         self.mfi_oversold_dot = False
         self.mfi_overbought_dot = False
-        # Restore S/R channel state
-        self.m5_candles = state.get("m5_candles", [])
-        self.sr_levels = [tuple(z) for z in state.get("sr_levels", [])]
+        # Restore MACD state
+        self.macd_fast_ema = state.get("macd_fast_ema")
+        self.macd_slow_ema = state.get("macd_slow_ema")
+        self.macd_line = state.get("macd_line")
+        self.macd_signal_ema = state.get("macd_signal_ema")
+        self.prev_macd_line = state.get("prev_macd_line")
+        self.prev_macd_signal = state.get("prev_macd_signal")
+        self.macd_cross_armed = None  # clear armed state on restore
         self.renko.last_close = state.get("renko_last_close")
         self.renko.direction = state.get("renko_direction", 0)
         self.renko.brick_count = state.get("renko_brick_count", 0)
@@ -602,122 +608,6 @@ class SymbolState:
 
         self.rsg_dosc_values.append(self.rsg_dosc)
 
-    def _update_m5_candle(self, price: float, now_ts: float):
-        """Build 5-minute candles for S/R channel detection. Returns completed
-        candle tuple (open, high, low, close) or None."""
-        if self._m5_open is None:
-            self._m5_start_time = now_ts
-            self._m5_open = price
-            self._m5_high = price
-            self._m5_low = price
-            self._m5_close = price
-            return None
-
-        self._m5_high = max(self._m5_high, price)
-        self._m5_low = min(self._m5_low, price)
-        self._m5_close = price
-
-        if now_ts - self._m5_start_time >= 300.0:
-            completed = (self._m5_open, self._m5_high, self._m5_low, self._m5_close)
-            self.m5_candles.append(completed)
-            max_keep = SR_LOOPBACK + SR_PIVOT_PERIOD + 20
-            if len(self.m5_candles) > max_keep:
-                self.m5_candles = self.m5_candles[-max_keep:]
-            self._calc_sr_levels()
-            self._m5_start_time = now_ts
-            self._m5_open = price
-            self._m5_high = price
-            self._m5_low = price
-            self._m5_close = price
-            return completed
-        return None
-
-    def _calc_sr_levels(self):
-        """Port of LonesomeTheBlue's Support Resistance Channels indicator.
-        Detects pivot highs/lows on 5-min candles, groups nearby pivots into
-        S/R zones, ranks by strength, keeps top SR_MAX_LEVELS."""
-        candles = self.m5_candles
-        n = len(candles)
-        prd = SR_PIVOT_PERIOD
-        if n < prd * 2 + 1:
-            return
-
-        lookback = min(n, SR_LOOPBACK)
-        start_idx = max(0, n - lookback)
-
-        pivots = []
-        for i in range(start_idx + prd, n - prd):
-            hi = candles[i][1]
-            is_ph = True
-            for j in range(1, prd + 1):
-                if candles[i - j][1] >= hi or candles[i + j][1] >= hi:
-                    is_ph = False
-                    break
-            if is_ph:
-                pivots.append(hi)
-
-            lo = candles[i][2]
-            is_pl = True
-            for j in range(1, prd + 1):
-                if candles[i - j][2] <= lo or candles[i + j][2] <= lo:
-                    is_pl = False
-                    break
-            if is_pl:
-                pivots.append(lo)
-
-        if not pivots:
-            self.sr_levels = []
-            return
-
-        ref_price = candles[-1][3]
-        if ref_price <= 0:
-            return
-        cwidth = ref_price * SR_CHANNEL_WIDTH_PCT / 100.0
-
-        pivots.sort()
-        groups = []
-        used = set()
-        for i in range(len(pivots)):
-            if i in used:
-                continue
-            grp = [pivots[i]]
-            used.add(i)
-            for j in range(i + 1, len(pivots)):
-                if j in used:
-                    continue
-                if pivots[j] - pivots[i] <= cwidth:
-                    grp.append(pivots[j])
-                    used.add(j)
-                else:
-                    break
-            groups.append(grp)
-
-        zones = []
-        for grp in groups:
-            zone_hi = max(grp)
-            zone_lo = min(grp)
-            strength = len(grp)
-            for i in range(start_idx, n):
-                if candles[i][2] <= zone_hi and candles[i][1] >= zone_lo:
-                    strength += 1
-            if strength >= SR_MIN_STRENGTH:
-                zones.append((zone_hi, zone_lo, strength))
-
-        zones.sort(key=lambda x: -x[2])
-        self.sr_levels = [(z[0], z[1]) for z in zones[:SR_MAX_LEVELS]]
-        if self.sr_levels:
-            print(f"  [{self.symbol} S/R] {len(self.sr_levels)} zones: "
-                  + ", ".join(f"{lo:.2f}-{hi:.2f}" for hi, lo in self.sr_levels))
-
-    def _price_at_sr(self, price: float):
-        """Check if price is within any S/R zone (with half-brick buffer).
-        Returns (hi, lo) tuple or None."""
-        buf = self.brick_size / 2.0
-        for hi, lo in self.sr_levels:
-            if (lo - buf) <= price <= (hi + buf):
-                return (hi, lo)
-        return None
-
     def _calc_indicators(self):
         """Recompute EMA, R.sg SMA, and MFI based on current brick history.
         Updates self.mfi_oversold_dot / mfi_overbought_dot on threshold cross."""
@@ -766,6 +656,26 @@ class SymbolState:
             self.prev_mfi_value = self.mfi_value if self.mfi_value is not None else new_mfi
             self.mfi_value = new_mfi
 
+        # MACD(12,26,9) on Renko brick closes
+        if n >= MACD_SLOW:
+            c = self.brick_closes[-1]
+            fast_k = 2.0 / (MACD_FAST + 1)
+            slow_k = 2.0 / (MACD_SLOW + 1)
+            sig_k = 2.0 / (MACD_SIGNAL + 1)
+            if self.macd_fast_ema is None:
+                self.macd_fast_ema = sum(self.brick_closes[-MACD_FAST:]) / MACD_FAST
+                self.macd_slow_ema = sum(self.brick_closes[-MACD_SLOW:]) / MACD_SLOW
+            else:
+                self.macd_fast_ema = c * fast_k + self.macd_fast_ema * (1 - fast_k)
+                self.macd_slow_ema = c * slow_k + self.macd_slow_ema * (1 - slow_k)
+            self.prev_macd_line = self.macd_line
+            self.prev_macd_signal = self.macd_signal_ema
+            self.macd_line = self.macd_fast_ema - self.macd_slow_ema
+            if self.macd_signal_ema is None:
+                self.macd_signal_ema = self.macd_line
+            else:
+                self.macd_signal_ema = self.macd_line * sig_k + self.macd_signal_ema * (1 - sig_k)
+
     # ----------------------------------------------------------------
     # Seeding from history
     # ----------------------------------------------------------------
@@ -797,6 +707,13 @@ class SymbolState:
         self.prev_mfi_value = None
         self.mfi_oversold_dot = False
         self.mfi_overbought_dot = False
+        self.macd_fast_ema = None
+        self.macd_slow_ema = None
+        self.macd_line = None
+        self.macd_signal_ema = None
+        self.prev_macd_line = None
+        self.prev_macd_signal = None
+        self.macd_cross_armed = None
 
         for row in rows:
             close = float(row["close"])
@@ -804,17 +721,18 @@ class SymbolState:
                 self._add_brick(brick[0], brick[1])
                 self._calc_indicators()
 
-        # Always clear dots after seed: never act on a "dot armed" state
-        # synthesized from historical data.
+        # Always clear dots/armed state after seed
         self.mfi_oversold_dot = False
         self.mfi_overbought_dot = False
+        self.macd_cross_armed = None
 
         dir_str = "BULLISH" if self.renko.direction == 1 else "BEARISH" if self.renko.direction == -1 else "NONE"
         rma_str = f"{self.renko_sma:.2f}" if self.renko_sma is not None else "N/A"
         mfi_str = f"{self.mfi_value:.2f}" if self.mfi_value is not None else "N/A"
+        macd_str = f"{self.macd_line:.4f}" if self.macd_line is not None else "N/A"
         last_close_str = f"{self.renko.last_close:.2f}" if self.renko.last_close is not None else "N/A"
         print(f"  [{self.symbol}] Renko: {self.renko.brick_count} bricks, {dir_str}, ref={last_close_str}")
-        print(f"  [{self.symbol}] R.sg SMA({RENKO_SMA_PERIOD}): {rma_str} | MFI({MFI_PERIOD}): {mfi_str}")
+        print(f"  [{self.symbol}] R.sg SMA({RENKO_SMA_PERIOD}): {rma_str} | MFI({MFI_PERIOD}): {mfi_str} | MACD: {macd_str}")
 
     # ----------------------------------------------------------------
     # Status / freshness helpers
@@ -835,9 +753,10 @@ class SymbolState:
         print(f"    Renko: {dir_str} | last_close={last_close_str} | bricks={self.renko.brick_count}")
         print(f"    R.sg SMA: {rma_str} | MFI: {mfi_str}")
         print(f"    Oversold dot: {os_str} | Overbought dot: {ob_str}")
-        sr_str = ", ".join(f"{lo:.2f}-{hi:.2f}" for hi, lo in self.sr_levels) if self.sr_levels else "none (warming)"
-        print(f"    S/R zones ({len(self.sr_levels)}): {sr_str}")
-        print(f"    5m candles: {len(self.m5_candles)}")
+        macd_str = f"{self.macd_line:.4f}" if self.macd_line is not None else "warming"
+        sig_str = f"{self.macd_signal_ema:.4f}" if self.macd_signal_ema is not None else "warming"
+        armed_str = f" [ARMED {self.macd_cross_armed}]" if self.macd_cross_armed else ""
+        print(f"    MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}): line={macd_str} signal={sig_str}{armed_str}")
         tp_str = ""
         if self.contracts_held > 0:
             tp = self.TP_BASE_DOLLARS + self.TP_INCREMENT_DOLLARS * (self.contracts_held - 1)
@@ -1022,34 +941,36 @@ class SymbolState:
                 if self.mfi_value is None:
                     continue
 
-                # MFI dot + S/R zone check: enter only if price is at a support/resistance level
+                # MFI dot arms for MACD cross entry
                 if self.mfi_oversold_dot:
-                    zone = self._price_at_sr(price)
-                    if zone:
-                        print(f"[{now}] [{self.symbol} SR-ENTRY] LONG: MFI oversold "
-                              f"+ price {price:.2f} at S/R zone {zone[1]:.2f}-{zone[0]:.2f}")
-                        self.mfi_oversold_dot = False
-                        await self._handle_signal("LONG", price, now)
-                    else:
-                        sr_info = f" (zones: {len(self.sr_levels)})" if self.sr_levels else " (no zones)"
-                        print(f"[{now}] [{self.symbol} SR-SKIP] LONG: MFI oversold but "
-                              f"price {price:.2f} not at S/R{sr_info}")
-                        self.mfi_oversold_dot = False
+                    self.macd_cross_armed = "LONG"
+                    self.mfi_oversold_dot = False
+                    macd_str = f"MACD: {self.macd_line:.4f}/{self.macd_signal_ema:.4f}" if self.macd_line is not None else "MACD: warming"
+                    print(f"[{now}] [{self.symbol} MFI-ARM] LONG armed: MFI oversold ({self.mfi_value:.1f}), "
+                          f"waiting for MACD bullish cross | {macd_str}")
                 elif self.mfi_overbought_dot:
-                    zone = self._price_at_sr(price)
-                    if zone:
-                        print(f"[{now}] [{self.symbol} SR-ENTRY] SHORT: MFI overbought "
-                              f"+ price {price:.2f} at S/R zone {zone[1]:.2f}-{zone[0]:.2f}")
-                        self.mfi_overbought_dot = False
-                        await self._handle_signal("SHORT", price, now)
-                    else:
-                        sr_info = f" (zones: {len(self.sr_levels)})" if self.sr_levels else " (no zones)"
-                        print(f"[{now}] [{self.symbol} SR-SKIP] SHORT: MFI overbought but "
-                              f"price {price:.2f} not at S/R{sr_info}")
-                        self.mfi_overbought_dot = False
+                    self.macd_cross_armed = "SHORT"
+                    self.mfi_overbought_dot = False
+                    macd_str = f"MACD: {self.macd_line:.4f}/{self.macd_signal_ema:.4f}" if self.macd_line is not None else "MACD: warming"
+                    print(f"[{now}] [{self.symbol} MFI-ARM] SHORT armed: MFI overbought ({self.mfi_value:.1f}), "
+                          f"waiting for MACD bearish cross | {macd_str}")
 
-        # Update 5-minute candles for S/R channel detection (every tick)
-        self._update_m5_candle(price, now_ts)
+                # MACD cross detection (on same or subsequent brick)
+                if (self.macd_cross_armed is not None
+                        and self.macd_line is not None and self.prev_macd_line is not None
+                        and self.macd_signal_ema is not None and self.prev_macd_signal is not None):
+                    if self.macd_cross_armed == "LONG":
+                        if self.prev_macd_line <= self.prev_macd_signal and self.macd_line > self.macd_signal_ema:
+                            print(f"[{now}] [{self.symbol} MACD-CROSS] LONG: blue {self.macd_line:.4f} "
+                                  f"crossed above orange {self.macd_signal_ema:.4f}")
+                            self.macd_cross_armed = None
+                            await self._handle_signal("LONG", price, now)
+                    elif self.macd_cross_armed == "SHORT":
+                        if self.prev_macd_line >= self.prev_macd_signal and self.macd_line < self.macd_signal_ema:
+                            print(f"[{now}] [{self.symbol} MACD-CROSS] SHORT: blue {self.macd_line:.4f} "
+                                  f"crossed below orange {self.macd_signal_ema:.4f}")
+                            self.macd_cross_armed = None
+                            await self._handle_signal("SHORT", price, now)
 
         # Take profit check (incrementing: $100 base + $50 per additional contract)
         if self.position != 0 and self.contracts_held > 0:
@@ -1467,15 +1388,14 @@ class RenkoBot:
         from project_x_py import TradingSuite
 
         symbols = self._symbols_list()
-        print(f"[BOT] Renko MFI + S/R Channel Strategy - LIVE MODE")
+        print(f"[BOT] Renko MFI + MACD Cross Strategy - LIVE MODE")
         print(f"[BOT] Symbols: {', '.join(symbols)}")
         for sym, st in self.states.items():
             print(f"[BOT]   {sym}: brick={st.brick_size}, qty={st.qty}, "
                   f"pv=${st.point_value}/pt"
                   + (f", ntfy={st.ntfy_topic}" if st.ntfy_topic else ""))
-        print(f"[BOT] ENTRY: MFI dot ({MFI_OVERSOLD}/{MFI_OVERBOUGHT}) + S/R zone confirmation (5m candles)")
-        print(f"[BOT] S/R: pivot_prd={SR_PIVOT_PERIOD}, width={SR_CHANNEL_WIDTH_PCT}%, "
-              f"min_str={SR_MIN_STRENGTH}, max={SR_MAX_LEVELS}, lookback={SR_LOOPBACK}")
+        print(f"[BOT] ENTRY: MFI dot ({MFI_OVERSOLD}/{MFI_OVERBOUGHT}) → arm → "
+              f"MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) cross on Renko bricks → enter")
         print(f"[BOT] EXIT: opposite MFI signal flips position or TP hit")
         rsg_state = "ENABLED" if any(s.use_rsg_filter for s in self.states.values()) else "disabled"
         print(f"[BOT] R.sg distance filter: {rsg_state}")
@@ -1567,7 +1487,7 @@ class RenkoBot:
         for st in self.states.values():
             st.print_status()
         print(f"\n[BOT] Session active: {self.was_in_session}")
-        print(f"[BOT] Trading LIVE - MFI+SR strategy ({', '.join(symbols)})")
+        print(f"[BOT] Trading LIVE - MFI+MACD cross strategy ({', '.join(symbols)})")
         print(f"[BOT] Watchdog: {self.WATCHDOG_TIMEOUT}s timeout")
         print(f"[BOT] Press Ctrl+C to stop\n")
 
