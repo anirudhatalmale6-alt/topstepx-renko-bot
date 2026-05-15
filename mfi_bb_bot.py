@@ -243,12 +243,16 @@ def in_blackout() -> bool:
 # ============================================================
 
 RL_WARMUP_TRADES = 20
-RL_ALPHA = 0.15          # learning rate
+RL_ALPHA = 0.15          # baseline learning rate
+RL_ALPHA_REGIME = 0.30   # boosted alpha during regime shift
 RL_GAMMA = 0.95          # discount factor
 RL_EPSILON_START = 0.90  # initial exploration rate
 RL_EPSILON_MIN = 0.10    # minimum exploration (always explore 10%)
 RL_EPSILON_DECAY = 0.985 # decay per trade
 RL_PNL_SCALE = 500.0     # normalize PnL rewards to ~[-1, 1] range
+RL_Q_DECAY = 0.998       # per-trade decay toward zero (old knowledge fades)
+RL_REGIME_WINDOW = 15    # recent trades to check for regime shift
+RL_REGIME_THRESHOLD = 0.20  # if recent WR drops >20% vs overall, regime shift detected
 
 import random
 
@@ -266,7 +270,8 @@ class TradeML:
         self.trades = []        # full trade history for stats
         self.epsilon = RL_EPSILON_START
         self.total_trades = 0
-        self.recent_outcomes = []  # last 10 PnLs for streak tracking
+        self.recent_outcomes = []  # last 20 PnLs for streak/regime tracking
+        self.regime_shift = False   # True when recent performance diverges from historical
         self._load()
 
     def _state_key(self, features: dict) -> str:
@@ -339,6 +344,7 @@ class TradeML:
                 self.epsilon = data.get("epsilon", RL_EPSILON_START)
                 self.total_trades = data.get("total_trades", len(self.trades))
                 self.recent_outcomes = data.get("recent_outcomes", [])
+                self.regime_shift = data.get("regime_shift", False)
                 states_explored = len(self.q_table)
                 print(f"[RL] Loaded: {self.total_trades} trades, {states_explored} states, "
                       f"epsilon={self.epsilon:.3f}")
@@ -353,6 +359,7 @@ class TradeML:
                 "epsilon": self.epsilon,
                 "total_trades": self.total_trades,
                 "recent_outcomes": self.recent_outcomes[-20:],
+                "regime_shift": self.regime_shift,
             }
             tmp = self.data_file + ".tmp"
             with open(tmp, "w") as f:
@@ -402,9 +409,27 @@ class TradeML:
             choice = "exploit"
 
         skip = (action == self.ACTION_SKIP)
+        regime_tag = "|REGIME" if self.regime_shift else ""
         reason = (f"RL|{state}|Q(enter)={q_enter:+.2f} Q(skip)={q_skip:+.2f}|"
-                  f"eps={self.epsilon:.2f}|{choice}")
+                  f"eps={self.epsilon:.2f}|{choice}{regime_tag}")
         return skip, q_skip - q_enter, reason
+
+    def _detect_regime_shift(self) -> bool:
+        """Compare recent win rate vs overall. Large divergence = regime shift."""
+        total = len(self.trades)
+        if total < RL_REGIME_WINDOW + 10:
+            return False
+        overall_wr = sum(1 for t in self.trades if t["win"] == 1) / total
+        recent = self.trades[-RL_REGIME_WINDOW:]
+        recent_wr = sum(1 for t in recent if t["win"] == 1) / len(recent)
+        drop = overall_wr - recent_wr
+        return drop >= RL_REGIME_THRESHOLD
+
+    def _decay_q_table(self):
+        """Gradually decay all Q-values toward zero. Old knowledge fades."""
+        for key in self.q_table:
+            self.q_table[key][0] *= RL_Q_DECAY
+            self.q_table[key][1] *= RL_Q_DECAY
 
     def record_trade(self, features: dict, pnl: float, source: str = "live"):
         if features is None:
@@ -413,27 +438,37 @@ class TradeML:
         state = self._state_key(features)
         reward = pnl / RL_PNL_SCALE
 
-        # Update Q(enter) for this state — we entered and got this reward
+        # Detect regime shift and pick alpha
+        self.regime_shift = self._detect_regime_shift()
+        alpha = RL_ALPHA_REGIME if self.regime_shift else RL_ALPHA
+
+        # Decay all Q-values (old knowledge fades naturally)
+        self._decay_q_table()
+
+        # Update Q(enter) for this state
         q_vals = self._get_q(state)
         old_q = q_vals[self.ACTION_ENTER]
-        q_vals[self.ACTION_ENTER] = old_q + RL_ALPHA * (reward - old_q)
+        q_vals[self.ACTION_ENTER] = old_q + alpha * (reward - old_q)
 
         # If trade was a loser, also boost Q(skip) slightly
         if pnl < 0:
             old_skip_q = q_vals[self.ACTION_SKIP]
             skip_reward = abs(reward) * 0.3
-            q_vals[self.ACTION_SKIP] = old_skip_q + RL_ALPHA * (skip_reward - old_skip_q)
+            q_vals[self.ACTION_SKIP] = old_skip_q + alpha * (skip_reward - old_skip_q)
 
         self.recent_outcomes.append(pnl)
         if len(self.recent_outcomes) > 20:
             self.recent_outcomes = self.recent_outcomes[-20:]
 
+        regime_tag = " REGIME-SHIFT" if self.regime_shift else ""
         trade = {
             "features": features,
             "state": state,
             "pnl": pnl,
             "win": 1 if pnl > 0 else 0,
             "q_after": list(q_vals),
+            "alpha_used": alpha,
+            "regime_shift": self.regime_shift,
             "epsilon": self.epsilon,
             "source": source,
             "timestamp": datetime.now(ET).isoformat(),
@@ -441,8 +476,11 @@ class TradeML:
         self.trades.append(trade)
         self.total_trades += 1
 
-        # Decay epsilon
-        self.epsilon = max(RL_EPSILON_MIN, self.epsilon * RL_EPSILON_DECAY)
+        # Decay epsilon (boost exploration during regime shift)
+        if self.regime_shift:
+            self.epsilon = min(0.50, self.epsilon + 0.05)
+        else:
+            self.epsilon = max(RL_EPSILON_MIN, self.epsilon * RL_EPSILON_DECAY)
 
         self._save()
 
@@ -450,8 +488,8 @@ class TradeML:
         total = len(self.trades)
         print(f"[RL] Trade recorded: PnL=${pnl:.2f} | state={state} | "
               f"Q(enter)={q_vals[0]:+.3f} Q(skip)={q_vals[1]:+.3f} | "
-              f"eps={self.epsilon:.3f} | {total} trades, "
-              f"{wins} wins ({100 * wins / total:.0f}%)")
+              f"alpha={alpha:.2f} | eps={self.epsilon:.3f} | {total} trades, "
+              f"{wins} wins ({100 * wins / total:.0f}%){regime_tag}")
 
     def stats(self) -> str:
         if not self.trades:
@@ -461,9 +499,10 @@ class TradeML:
         losses = total - wins
         total_pnl = sum(t["pnl"] for t in self.trades)
         states = len(self.q_table)
+        regime = " | REGIME-SHIFT" if self.regime_shift else ""
         return (f"RL: {total} trades | W:{wins} L:{losses} | "
                 f"Win%: {100 * wins / total:.0f}% | PnL: ${total_pnl:.2f} | "
-                f"{states} states | eps={self.epsilon:.3f}")
+                f"{states} states | eps={self.epsilon:.3f}{regime}")
 
 
 # ============================================================
