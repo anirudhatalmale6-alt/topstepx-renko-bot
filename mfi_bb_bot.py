@@ -1,15 +1,14 @@
 """
-TopstepX Renko MFI + MACD Cross Bot (LIVE)
-============================================
+TopstepX Renko MFI + Vortex Bot (LIVE)
+========================================
 Multi-symbol support: runs multiple instruments on one connection.
 
-Strategy: MFI + MACD Cross on Renko bricks
+Strategy: MFI + Vortex Indicator gap on Renko bricks
 - MFI(14) on Renko bricks (volume = 1 per brick)
-- MACD(12,26,9) on Renko brick closes
-- Oversold dot: MFI crosses BELOW 20 → arm for LONG
-- Overbought dot: MFI crosses ABOVE 80 → arm for SHORT
-- LONG  entry: MFI oversold armed + MACD line crosses ABOVE signal line
-- SHORT entry: MFI overbought armed + MACD line crosses BELOW signal line
+- Vortex Indicator(14) on Renko bricks (VI+ and VI-)
+- LONG:  MFI oversold + VI- >> VI+ (bearish exhaustion) → enter immediately
+- SHORT: MFI overbought + VI+ >> VI- (bullish exhaustion) → enter immediately
+- If Vortex gap too small → skip (weak signal)
 - EXIT: opposite MFI signal flips the position or TP hit.
 
 Usage:
@@ -195,9 +194,8 @@ BLACKOUT_END = dtime(16, 35, 0)
 MFI_PERIOD = 14
 MFI_OVERSOLD = 20.0
 MFI_OVERBOUGHT = 80.0
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
+VORTEX_PERIOD = 14
+VORTEX_GAP_THRESHOLD = 0.50
 
 EMA_PERIOD = 9                # used as ML feature only (not for entry/exit)
 RENKO_SMA_PERIOD = 12         # R.sg (Renko Smoothed Gradient) period
@@ -409,14 +407,9 @@ class SymbolState:
         self.mfi_oversold_dot = False
         self.mfi_overbought_dot = False
 
-        # MACD(12,26,9) on Renko brick closes
-        self.macd_fast_ema = None
-        self.macd_slow_ema = None
-        self.macd_line = None
-        self.macd_signal_ema = None
-        self.prev_macd_line = None
-        self.prev_macd_signal = None
-        self.macd_cross_armed = None  # None | "LONG" | "SHORT"
+        # Vortex Indicator(14) on Renko bricks
+        self.vi_plus = None
+        self.vi_minus = None
 
         # Position state (fixed qty, no scale-in)
         self.position = 0           # 1 long, -1 short, 0 flat
@@ -478,14 +471,9 @@ class SymbolState:
             "prev_mfi_value": self.prev_mfi_value,
             "mfi_oversold_dot": self.mfi_oversold_dot,
             "mfi_overbought_dot": self.mfi_overbought_dot,
-            # MACD state on Renko bricks
-            "macd_fast_ema": self.macd_fast_ema,
-            "macd_slow_ema": self.macd_slow_ema,
-            "macd_line": self.macd_line,
-            "macd_signal_ema": self.macd_signal_ema,
-            "prev_macd_line": self.prev_macd_line,
-            "prev_macd_signal": self.prev_macd_signal,
-            "macd_cross_armed": self.macd_cross_armed,
+            # Vortex state
+            "vi_plus": self.vi_plus,
+            "vi_minus": self.vi_minus,
             "renko_last_close": self.renko.last_close,
             "renko_direction": self.renko.direction,
             "renko_brick_count": self.renko.brick_count,
@@ -526,14 +514,9 @@ class SymbolState:
         # because the customer wouldn't have seen the corresponding live bar.
         self.mfi_oversold_dot = False
         self.mfi_overbought_dot = False
-        # Restore MACD state
-        self.macd_fast_ema = state.get("macd_fast_ema")
-        self.macd_slow_ema = state.get("macd_slow_ema")
-        self.macd_line = state.get("macd_line")
-        self.macd_signal_ema = state.get("macd_signal_ema")
-        self.prev_macd_line = state.get("prev_macd_line")
-        self.prev_macd_signal = state.get("prev_macd_signal")
-        self.macd_cross_armed = None  # clear armed state on restore
+        # Restore Vortex state
+        self.vi_plus = state.get("vi_plus")
+        self.vi_minus = state.get("vi_minus")
         self.renko.last_close = state.get("renko_last_close")
         self.renko.direction = state.get("renko_direction", 0)
         self.renko.brick_count = state.get("renko_brick_count", 0)
@@ -656,25 +639,24 @@ class SymbolState:
             self.prev_mfi_value = self.mfi_value if self.mfi_value is not None else new_mfi
             self.mfi_value = new_mfi
 
-        # MACD(12,26,9) on Renko brick closes
-        if n >= MACD_SLOW:
-            c = self.brick_closes[-1]
-            fast_k = 2.0 / (MACD_FAST + 1)
-            slow_k = 2.0 / (MACD_SLOW + 1)
-            sig_k = 2.0 / (MACD_SIGNAL + 1)
-            if self.macd_fast_ema is None:
-                self.macd_fast_ema = sum(self.brick_closes[-MACD_FAST:]) / MACD_FAST
-                self.macd_slow_ema = sum(self.brick_closes[-MACD_SLOW:]) / MACD_SLOW
-            else:
-                self.macd_fast_ema = c * fast_k + self.macd_fast_ema * (1 - fast_k)
-                self.macd_slow_ema = c * slow_k + self.macd_slow_ema * (1 - slow_k)
-            self.prev_macd_line = self.macd_line
-            self.prev_macd_signal = self.macd_signal_ema
-            self.macd_line = self.macd_fast_ema - self.macd_slow_ema
-            if self.macd_signal_ema is None:
-                self.macd_signal_ema = self.macd_line
-            else:
-                self.macd_signal_ema = self.macd_line * sig_k + self.macd_signal_ema * (1 - sig_k)
+        # Vortex Indicator(14) on Renko bricks
+        if n >= VORTEX_PERIOD + 1:
+            vmp = 0.0
+            vmm = 0.0
+            str_sum = 0.0
+            for i in range(n - VORTEX_PERIOD, n):
+                hi = max(self.brick_opens[i], self.brick_closes[i])
+                lo = min(self.brick_opens[i], self.brick_closes[i])
+                prev_hi = max(self.brick_opens[i - 1], self.brick_closes[i - 1])
+                prev_lo = min(self.brick_opens[i - 1], self.brick_closes[i - 1])
+                prev_c = self.brick_closes[i - 1]
+                vmp += abs(hi - prev_lo)
+                vmm += abs(lo - prev_hi)
+                tr = max(hi - lo, abs(hi - prev_c), abs(lo - prev_c))
+                str_sum += tr
+            if str_sum > 0:
+                self.vi_plus = vmp / str_sum
+                self.vi_minus = vmm / str_sum
 
     # ----------------------------------------------------------------
     # Seeding from history
@@ -707,13 +689,8 @@ class SymbolState:
         self.prev_mfi_value = None
         self.mfi_oversold_dot = False
         self.mfi_overbought_dot = False
-        self.macd_fast_ema = None
-        self.macd_slow_ema = None
-        self.macd_line = None
-        self.macd_signal_ema = None
-        self.prev_macd_line = None
-        self.prev_macd_signal = None
-        self.macd_cross_armed = None
+        self.vi_plus = None
+        self.vi_minus = None
 
         for row in rows:
             close = float(row["close"])
@@ -721,18 +698,16 @@ class SymbolState:
                 self._add_brick(brick[0], brick[1])
                 self._calc_indicators()
 
-        # Always clear dots/armed state after seed
         self.mfi_oversold_dot = False
         self.mfi_overbought_dot = False
-        self.macd_cross_armed = None
 
         dir_str = "BULLISH" if self.renko.direction == 1 else "BEARISH" if self.renko.direction == -1 else "NONE"
         rma_str = f"{self.renko_sma:.2f}" if self.renko_sma is not None else "N/A"
         mfi_str = f"{self.mfi_value:.2f}" if self.mfi_value is not None else "N/A"
-        macd_str = f"{self.macd_line:.4f}" if self.macd_line is not None else "N/A"
+        vi_str = f"VI+={self.vi_plus:.4f} VI-={self.vi_minus:.4f}" if self.vi_plus is not None else "VI: N/A"
         last_close_str = f"{self.renko.last_close:.2f}" if self.renko.last_close is not None else "N/A"
         print(f"  [{self.symbol}] Renko: {self.renko.brick_count} bricks, {dir_str}, ref={last_close_str}")
-        print(f"  [{self.symbol}] R.sg SMA({RENKO_SMA_PERIOD}): {rma_str} | MFI({MFI_PERIOD}): {mfi_str} | MACD: {macd_str}")
+        print(f"  [{self.symbol}] R.sg SMA({RENKO_SMA_PERIOD}): {rma_str} | MFI({MFI_PERIOD}): {mfi_str} | {vi_str}")
 
     # ----------------------------------------------------------------
     # Status / freshness helpers
@@ -753,10 +728,13 @@ class SymbolState:
         print(f"    Renko: {dir_str} | last_close={last_close_str} | bricks={self.renko.brick_count}")
         print(f"    R.sg SMA: {rma_str} | MFI: {mfi_str}")
         print(f"    Oversold dot: {os_str} | Overbought dot: {ob_str}")
-        macd_str = f"{self.macd_line:.4f}" if self.macd_line is not None else "warming"
-        sig_str = f"{self.macd_signal_ema:.4f}" if self.macd_signal_ema is not None else "warming"
-        armed_str = f" [ARMED {self.macd_cross_armed}]" if self.macd_cross_armed else ""
-        print(f"    MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}): line={macd_str} signal={sig_str}{armed_str}")
+        if self.vi_plus is not None:
+            gap = abs(self.vi_plus - self.vi_minus)
+            dom = "VI+>VI-" if self.vi_plus > self.vi_minus else "VI->VI+"
+            print(f"    Vortex({VORTEX_PERIOD}): VI+={self.vi_plus:.4f} VI-={self.vi_minus:.4f} | "
+                  f"gap={gap:.4f} ({dom}) | threshold={VORTEX_GAP_THRESHOLD}")
+        else:
+            print(f"    Vortex({VORTEX_PERIOD}): warming")
         tp_str = ""
         if self.contracts_held > 0:
             tp = self.TP_BASE_DOLLARS + self.TP_INCREMENT_DOLLARS * (self.contracts_held - 1)
@@ -941,36 +919,35 @@ class SymbolState:
                 if self.mfi_value is None:
                     continue
 
-                # MFI dot arms for MACD cross entry
+                # MFI dot + Vortex gap = immediate entry
                 if self.mfi_oversold_dot:
-                    self.macd_cross_armed = "LONG"
                     self.mfi_oversold_dot = False
-                    macd_str = f"MACD: {self.macd_line:.4f}/{self.macd_signal_ema:.4f}" if self.macd_line is not None else "MACD: warming"
-                    print(f"[{now}] [{self.symbol} MFI-ARM] LONG armed: MFI oversold ({self.mfi_value:.1f}), "
-                          f"waiting for MACD bullish cross | {macd_str}")
-                elif self.mfi_overbought_dot:
-                    self.macd_cross_armed = "SHORT"
-                    self.mfi_overbought_dot = False
-                    macd_str = f"MACD: {self.macd_line:.4f}/{self.macd_signal_ema:.4f}" if self.macd_line is not None else "MACD: warming"
-                    print(f"[{now}] [{self.symbol} MFI-ARM] SHORT armed: MFI overbought ({self.mfi_value:.1f}), "
-                          f"waiting for MACD bearish cross | {macd_str}")
-
-                # MACD cross detection (on same or subsequent brick)
-                if (self.macd_cross_armed is not None
-                        and self.macd_line is not None and self.prev_macd_line is not None
-                        and self.macd_signal_ema is not None and self.prev_macd_signal is not None):
-                    if self.macd_cross_armed == "LONG":
-                        if self.prev_macd_line <= self.prev_macd_signal and self.macd_line > self.macd_signal_ema:
-                            print(f"[{now}] [{self.symbol} MACD-CROSS] LONG: blue {self.macd_line:.4f} "
-                                  f"crossed above orange {self.macd_signal_ema:.4f}")
-                            self.macd_cross_armed = None
+                    if self.vi_plus is not None and self.vi_minus is not None:
+                        gap = self.vi_minus - self.vi_plus
+                        if gap >= VORTEX_GAP_THRESHOLD:
+                            print(f"[{now}] [{self.symbol} ENTRY] LONG: MFI oversold ({self.mfi_value:.1f}) "
+                                  f"+ Vortex gap {gap:.4f} >= {VORTEX_GAP_THRESHOLD} "
+                                  f"(VI+={self.vi_plus:.4f} VI-={self.vi_minus:.4f})")
                             await self._handle_signal("LONG", price, now)
-                    elif self.macd_cross_armed == "SHORT":
-                        if self.prev_macd_line >= self.prev_macd_signal and self.macd_line < self.macd_signal_ema:
-                            print(f"[{now}] [{self.symbol} MACD-CROSS] SHORT: blue {self.macd_line:.4f} "
-                                  f"crossed below orange {self.macd_signal_ema:.4f}")
-                            self.macd_cross_armed = None
+                        else:
+                            print(f"[{now}] [{self.symbol} SKIP] LONG: MFI oversold but "
+                                  f"Vortex gap {gap:.4f} < {VORTEX_GAP_THRESHOLD}")
+                    else:
+                        print(f"[{now}] [{self.symbol} SKIP] LONG: MFI oversold but Vortex warming")
+                elif self.mfi_overbought_dot:
+                    self.mfi_overbought_dot = False
+                    if self.vi_plus is not None and self.vi_minus is not None:
+                        gap = self.vi_plus - self.vi_minus
+                        if gap >= VORTEX_GAP_THRESHOLD:
+                            print(f"[{now}] [{self.symbol} ENTRY] SHORT: MFI overbought ({self.mfi_value:.1f}) "
+                                  f"+ Vortex gap {gap:.4f} >= {VORTEX_GAP_THRESHOLD} "
+                                  f"(VI+={self.vi_plus:.4f} VI-={self.vi_minus:.4f})")
                             await self._handle_signal("SHORT", price, now)
+                        else:
+                            print(f"[{now}] [{self.symbol} SKIP] SHORT: MFI overbought but "
+                                  f"Vortex gap {gap:.4f} < {VORTEX_GAP_THRESHOLD}")
+                    else:
+                        print(f"[{now}] [{self.symbol} SKIP] SHORT: MFI overbought but Vortex warming")
 
         # Take profit check (incrementing: $100 base + $50 per additional contract)
         if self.position != 0 and self.contracts_held > 0:
@@ -1388,14 +1365,14 @@ class RenkoBot:
         from project_x_py import TradingSuite
 
         symbols = self._symbols_list()
-        print(f"[BOT] Renko MFI + MACD Cross Strategy - LIVE MODE")
+        print(f"[BOT] Renko MFI + Vortex Gap Strategy - LIVE MODE")
         print(f"[BOT] Symbols: {', '.join(symbols)}")
         for sym, st in self.states.items():
             print(f"[BOT]   {sym}: brick={st.brick_size}, qty={st.qty}, "
                   f"pv=${st.point_value}/pt"
                   + (f", ntfy={st.ntfy_topic}" if st.ntfy_topic else ""))
-        print(f"[BOT] ENTRY: MFI dot ({MFI_OVERSOLD}/{MFI_OVERBOUGHT}) → arm → "
-              f"MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) cross on Renko bricks → enter")
+        print(f"[BOT] ENTRY: MFI dot ({MFI_OVERSOLD}/{MFI_OVERBOUGHT}) + "
+              f"Vortex({VORTEX_PERIOD}) gap >= {VORTEX_GAP_THRESHOLD} → enter immediately")
         print(f"[BOT] EXIT: opposite MFI signal flips position or TP hit")
         rsg_state = "ENABLED" if any(s.use_rsg_filter for s in self.states.values()) else "disabled"
         print(f"[BOT] R.sg distance filter: {rsg_state}")
@@ -1487,7 +1464,7 @@ class RenkoBot:
         for st in self.states.values():
             st.print_status()
         print(f"\n[BOT] Session active: {self.was_in_session}")
-        print(f"[BOT] Trading LIVE - MFI+MACD cross strategy ({', '.join(symbols)})")
+        print(f"[BOT] Trading LIVE - MFI+Vortex strategy ({', '.join(symbols)})")
         print(f"[BOT] Watchdog: {self.WATCHDOG_TIMEOUT}s timeout")
         print(f"[BOT] Press Ctrl+C to stop\n")
 
