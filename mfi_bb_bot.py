@@ -420,7 +420,7 @@ class SymbolState:
         self.entry_time = None
         self.entry_features = None  # snapshot for ML
         self.live_pnl = 0.0
-        self.MAX_CONTRACTS = 2
+        self.MAX_CONTRACTS = 3
         self.TP_BASE_DOLLARS = 200.0
         self.TP_INCREMENT_DOLLARS = 0.0
 
@@ -1088,11 +1088,11 @@ class SymbolState:
                 response = await asyncio.wait_for(
                     self.ctx.orders.place_market_order(
                         contract_id=self.ctx.instrument_info.id,
-                        side=0, size=1),
+                        side=0, size=self.qty),
                     timeout=15.0)
                 if response.success:
                     self.position = 1
-                    self.contracts_held = 1
+                    self.contracts_held = self.qty
                     self.entry_price = price
                     self.entry_time = datetime.now(ET)
                     print(f"[{self.symbol}] Order filled. ID: {response.orderId}")
@@ -1144,11 +1144,11 @@ class SymbolState:
                 response = await asyncio.wait_for(
                     self.ctx.orders.place_market_order(
                         contract_id=self.ctx.instrument_info.id,
-                        side=1, size=1),
+                        side=1, size=self.qty),
                     timeout=15.0)
                 if response.success:
                     self.position = -1
-                    self.contracts_held = 1
+                    self.contracts_held = self.qty
                     self.entry_price = price
                     self.entry_time = datetime.now(ET)
                     print(f"[{self.symbol}] Order filled. ID: {response.orderId}")
