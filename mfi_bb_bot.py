@@ -239,69 +239,131 @@ def in_blackout() -> bool:
 
 
 # ============================================================
-# ML Trade Filter (KNN-based pattern matching)
+# Reinforcement Learning Trade Filter (Q-Learning)
 # ============================================================
 
-ML_WARMUP_TRADES = 30
-ML_K_NEIGHBORS = 7
-ML_SKIP_THRESHOLD = 0.65
+RL_WARMUP_TRADES = 20
+RL_ALPHA = 0.15          # learning rate
+RL_GAMMA = 0.95          # discount factor
+RL_EPSILON_START = 0.90  # initial exploration rate
+RL_EPSILON_MIN = 0.10    # minimum exploration (always explore 10%)
+RL_EPSILON_DECAY = 0.985 # decay per trade
+RL_PNL_SCALE = 500.0     # normalize PnL rewards to ~[-1, 1] range
+
+import random
 
 
 class TradeML:
-    # Feature set tuned for MFI strategy
-    FEATURE_NAMES = [
-        "direction",         # 1=long, -1=short
-        "mfi_value",         # MFI at entry
-        "mfi_velocity",      # MFI(now) - MFI(prev)
-        "rsg_distance",      # (price - R.sg_line) / brick_size
-        "ema_distance",      # (price - EMA) / brick_size (general trend feature)
-        "hour",              # ET hour 0-23
-        "volatility",        # std of last 10 brick closes / brick_size
-    ]
+    """Q-learning RL filter. Discretizes market state, learns which
+    states are profitable to enter vs skip. Same interface as old KNN."""
+
+    ACTION_ENTER = 0
+    ACTION_SKIP = 1
 
     def __init__(self, data_file: str):
         self.data_file = data_file
-        self.trades = []
+        self.q_table = {}       # state_key -> [Q(enter), Q(skip)]
+        self.trades = []        # full trade history for stats
+        self.epsilon = RL_EPSILON_START
+        self.total_trades = 0
+        self.recent_outcomes = []  # last 10 PnLs for streak tracking
         self._load()
+
+    def _state_key(self, features: dict) -> str:
+        """Discretize continuous features into a hashable state."""
+        mfi = features.get("mfi_value", 50.0)
+        if mfi <= 25:
+            mfi_zone = "oversold"
+        elif mfi >= 75:
+            mfi_zone = "overbought"
+        elif mfi <= 40:
+            mfi_zone = "low"
+        elif mfi >= 60:
+            mfi_zone = "high"
+        else:
+            mfi_zone = "mid"
+
+        mfi_vel = features.get("mfi_velocity", 0.0)
+        vel_zone = "rising" if mfi_vel > 2.0 else "falling" if mfi_vel < -2.0 else "flat"
+
+        vortex_gap = features.get("vortex_gap", 0.0)
+        if vortex_gap >= 1.0:
+            gap_zone = "huge"
+        elif vortex_gap >= 0.7:
+            gap_zone = "large"
+        elif vortex_gap >= 0.5:
+            gap_zone = "medium"
+        else:
+            gap_zone = "small"
+
+        hour = features.get("hour", 12)
+        if hour < 10:
+            time_zone = "early"
+        elif hour < 12:
+            time_zone = "morning"
+        elif hour < 14:
+            time_zone = "midday"
+        else:
+            time_zone = "afternoon"
+
+        vol = features.get("volatility", 0.0)
+        vol_zone = "high" if vol > 3.0 else "low" if vol < 1.0 else "mid"
+
+        direction = "long" if features.get("direction", 1) == 1 else "short"
+
+        recent_wins = sum(1 for p in self.recent_outcomes[-5:] if p > 0)
+        recent_total = min(len(self.recent_outcomes), 5)
+        if recent_total < 3:
+            streak = "new"
+        elif recent_wins >= 4:
+            streak = "hot"
+        elif recent_wins <= 1:
+            streak = "cold"
+        else:
+            streak = "mixed"
+
+        return f"{direction}|{mfi_zone}|{vel_zone}|{gap_zone}|{time_zone}|{vol_zone}|{streak}"
+
+    def _get_q(self, state_key: str) -> list:
+        if state_key not in self.q_table:
+            self.q_table[state_key] = [0.0, 0.0]
+        return self.q_table[state_key]
 
     def _load(self):
         if os.path.exists(self.data_file):
             try:
                 with open(self.data_file, "r") as f:
-                    self.trades = json.load(f)
-                print(f"[ML] Loaded {len(self.trades)} historical trades")
+                    data = json.load(f)
+                self.q_table = data.get("q_table", {})
+                self.trades = data.get("trades", [])
+                self.epsilon = data.get("epsilon", RL_EPSILON_START)
+                self.total_trades = data.get("total_trades", len(self.trades))
+                self.recent_outcomes = data.get("recent_outcomes", [])
+                states_explored = len(self.q_table)
+                print(f"[RL] Loaded: {self.total_trades} trades, {states_explored} states, "
+                      f"epsilon={self.epsilon:.3f}")
             except Exception as e:
-                print(f"[ML] Load error: {e}")
-                self.trades = []
+                print(f"[RL] Load error: {e}")
 
     def _save(self):
         try:
-            with open(self.data_file, "w") as f:
-                json.dump(self.trades, f, indent=1)
+            data = {
+                "q_table": self.q_table,
+                "trades": self.trades[-500:],
+                "epsilon": self.epsilon,
+                "total_trades": self.total_trades,
+                "recent_outcomes": self.recent_outcomes[-20:],
+            }
+            tmp = self.data_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.data_file)
         except Exception as e:
-            print(f"[ML] Save error: {e}")
-
-    def record_trade(self, features: dict, pnl: float, source: str = "live"):
-        if features is None:
-            return
-        trade = {
-            "features": features,
-            "pnl": pnl,
-            "win": 1 if pnl > 0 else 0,
-            "source": source,
-            "timestamp": datetime.now(ET).isoformat(),
-        }
-        self.trades.append(trade)
-        self._save()
-        wins = sum(1 for t in self.trades if t["win"] == 1)
-        total = len(self.trades)
-        print(f"[ML] Trade recorded: PnL=${pnl:.2f} | Total: {total} trades, "
-              f"{wins} wins ({100 * wins / total:.0f}%)")
+            print(f"[RL] Save error: {e}")
 
     def extract_features(self, direction: int, mfi_value, mfi_velocity,
                          price: float, ema, rsg, brick_size: float,
-                         brick_closes: list) -> dict:
-        # Defensive: any of these may be None if called before warmup.
+                         brick_closes: list, vortex_gap: float = 0.0) -> dict:
         mfi_v = float(mfi_value) if mfi_value is not None else 50.0
         mfi_vel = float(mfi_velocity) if mfi_velocity is not None else 0.0
         ema_distance = ((price - ema) / brick_size) if (ema is not None and brick_size > 0) else 0.0
@@ -320,36 +382,76 @@ class TradeML:
             "ema_distance": round(ema_distance, 4),
             "hour": hour,
             "volatility": round(vol, 4),
+            "vortex_gap": round(vortex_gap, 4),
         }
 
     def should_skip(self, features: dict) -> tuple:
+        if self.total_trades < RL_WARMUP_TRADES:
+            return False, 0.0, f"RL warmup ({self.total_trades}/{RL_WARMUP_TRADES})"
+
+        state = self._state_key(features)
+        q_vals = self._get_q(state)
+        q_enter, q_skip = q_vals[0], q_vals[1]
+
+        # Epsilon-greedy: explore or exploit
+        if random.random() < self.epsilon:
+            action = random.choice([self.ACTION_ENTER, self.ACTION_SKIP])
+            choice = "explore"
+        else:
+            action = self.ACTION_ENTER if q_enter >= q_skip else self.ACTION_SKIP
+            choice = "exploit"
+
+        skip = (action == self.ACTION_SKIP)
+        reason = (f"RL|{state}|Q(enter)={q_enter:+.2f} Q(skip)={q_skip:+.2f}|"
+                  f"eps={self.epsilon:.2f}|{choice}")
+        return skip, q_skip - q_enter, reason
+
+    def record_trade(self, features: dict, pnl: float, source: str = "live"):
+        if features is None:
+            return
+
+        state = self._state_key(features)
+        reward = pnl / RL_PNL_SCALE
+
+        # Update Q(enter) for this state — we entered and got this reward
+        q_vals = self._get_q(state)
+        old_q = q_vals[self.ACTION_ENTER]
+        q_vals[self.ACTION_ENTER] = old_q + RL_ALPHA * (reward - old_q)
+
+        # If trade was a loser, also boost Q(skip) slightly
+        if pnl < 0:
+            old_skip_q = q_vals[self.ACTION_SKIP]
+            skip_reward = abs(reward) * 0.3
+            q_vals[self.ACTION_SKIP] = old_skip_q + RL_ALPHA * (skip_reward - old_skip_q)
+
+        self.recent_outcomes.append(pnl)
+        if len(self.recent_outcomes) > 20:
+            self.recent_outcomes = self.recent_outcomes[-20:]
+
+        trade = {
+            "features": features,
+            "state": state,
+            "pnl": pnl,
+            "win": 1 if pnl > 0 else 0,
+            "q_after": list(q_vals),
+            "epsilon": self.epsilon,
+            "source": source,
+            "timestamp": datetime.now(ET).isoformat(),
+        }
+        self.trades.append(trade)
+        self.total_trades += 1
+
+        # Decay epsilon
+        self.epsilon = max(RL_EPSILON_MIN, self.epsilon * RL_EPSILON_DECAY)
+
+        self._save()
+
+        wins = sum(1 for t in self.trades if t["win"] == 1)
         total = len(self.trades)
-        if total < ML_WARMUP_TRADES:
-            return False, 0.0, f"warmup ({total}/{ML_WARMUP_TRADES})"
-
-        feat_vec = self._to_vector(features)
-        all_vecs = np.array([self._to_vector(t["features"]) for t in self.trades])
-        all_wins = np.array([t["win"] for t in self.trades])
-
-        means = all_vecs.mean(axis=0)
-        stds = all_vecs.std(axis=0)
-        stds[stds < 1e-8] = 1.0
-
-        norm_feat = (feat_vec - means) / stds
-        norm_all = (all_vecs - means) / stds
-
-        distances = np.sqrt(np.sum((norm_all - norm_feat) ** 2, axis=1))
-        k = min(ML_K_NEIGHBORS, total)
-        nearest_idx = np.argpartition(distances, k - 1)[:k]
-        nearest_wins = all_wins[nearest_idx]
-
-        loss_ratio = 1.0 - nearest_wins.mean()
-        skip = loss_ratio >= ML_SKIP_THRESHOLD
-        reason = f"KNN({k}): {int(nearest_wins.sum())}/{k} wins, loss_ratio={loss_ratio:.2f}"
-        return skip, loss_ratio, reason
-
-    def _to_vector(self, features: dict) -> np.ndarray:
-        return np.array([features.get(name, 0.0) for name in self.FEATURE_NAMES], dtype=float)
+        print(f"[RL] Trade recorded: PnL=${pnl:.2f} | state={state} | "
+              f"Q(enter)={q_vals[0]:+.3f} Q(skip)={q_vals[1]:+.3f} | "
+              f"eps={self.epsilon:.3f} | {total} trades, "
+              f"{wins} wins ({100 * wins / total:.0f}%)")
 
     def stats(self) -> str:
         if not self.trades:
@@ -358,8 +460,10 @@ class TradeML:
         wins = sum(1 for t in self.trades if t["win"] == 1)
         losses = total - wins
         total_pnl = sum(t["pnl"] for t in self.trades)
-        return (f"Total: {total} | Wins: {wins} | Losses: {losses} | "
-                f"Win%: {100 * wins / total:.0f}% | PnL: ${total_pnl:.2f}")
+        states = len(self.q_table)
+        return (f"RL: {total} trades | W:{wins} L:{losses} | "
+                f"Win%: {100 * wins / total:.0f}% | PnL: ${total_pnl:.2f} | "
+                f"{states} states | eps={self.epsilon:.3f}")
 
 
 # ============================================================
@@ -939,7 +1043,7 @@ class SymbolState:
                             print(f"[{now}] [{self.symbol} ENTRY] SHORT: MFI oversold ({self.mfi_value:.1f}) "
                                   f"+ Vortex gap {gap:.4f} >= {VORTEX_GAP_THRESHOLD} "
                                   f"(VI+={self.vi_plus:.4f} VI-={self.vi_minus:.4f}) [FLIPPED]")
-                            await self._handle_signal("SHORT", price, now)
+                            await self._handle_signal("SHORT", price, now, vortex_gap=gap)
                         else:
                             print(f"[{now}] [{self.symbol} SKIP] SHORT: MFI oversold but "
                                   f"Vortex gap {gap:.4f} < {VORTEX_GAP_THRESHOLD}")
@@ -953,7 +1057,7 @@ class SymbolState:
                             print(f"[{now}] [{self.symbol} ENTRY] LONG: MFI overbought ({self.mfi_value:.1f}) "
                                   f"+ Vortex gap {gap:.4f} >= {VORTEX_GAP_THRESHOLD} "
                                   f"(VI+={self.vi_plus:.4f} VI-={self.vi_minus:.4f}) [FLIPPED]")
-                            await self._handle_signal("LONG", price, now)
+                            await self._handle_signal("LONG", price, now, vortex_gap=gap)
                         else:
                             print(f"[{now}] [{self.symbol} SKIP] LONG: MFI overbought but "
                                   f"Vortex gap {gap:.4f} < {VORTEX_GAP_THRESHOLD}")
@@ -1006,7 +1110,7 @@ class SymbolState:
 
         return True
 
-    async def _handle_signal(self, direction: str, price: float, now: str):
+    async def _handle_signal(self, direction: str, price: float, now: str, vortex_gap: float = 0.0):
         """Fire entry/flip logic for a confirmed MFI+brick signal."""
         # R.sg distance filter (optional)
         if self.use_rsg_filter and self.renko_sma is not None:
@@ -1036,7 +1140,7 @@ class SymbolState:
                 print(f"[{now}] [{self.symbol}] flatten failed, aborting flip")
                 return
 
-        # Build ML features and ask filter
+        # Build RL features and ask filter
         mfi_velocity = (self.mfi_value - self.prev_mfi_value) if self.prev_mfi_value is not None else 0.0
         features = self.ml.extract_features(
             direction=1 if direction == "LONG" else -1,
@@ -1047,16 +1151,17 @@ class SymbolState:
             rsg=self.renko_sma,
             brick_size=self.brick_size,
             brick_closes=self.brick_closes,
+            vortex_gap=vortex_gap,
         ) if self.ml else None
 
         if features and self.ml:
             skip, _, reason = self.ml.should_skip(features)
             if skip:
-                print(f"[{now}] [{self.symbol} ML-SKIP] {direction} skipped | {reason}")
+                print(f"[{now}] [{self.symbol} RL-SKIP] {direction} skipped | {reason}")
                 send_telegram(self.tg_token, self.tg_chat,
-                              f"ML-SKIP|{self.symbol} {direction} @ {price:.2f} | {reason}")
+                              f"RL-SKIP|{self.symbol} {direction} @ {price:.2f} | {reason}")
                 return
-            print(f"[{now}] [{self.symbol} ML-OK] {direction} approved | {reason}")
+            print(f"[{now}] [{self.symbol} RL-OK] {direction} approved | {reason}")
         self.entry_features = features
 
         # Place the entry
@@ -1352,7 +1457,7 @@ class RenkoBot:
         self.tp_webhooks = tp_webhooks or []
         self.tick_interval = tick_interval
 
-        ml_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ml_trades.json")
+        ml_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rl_state.json")
         self.ml = TradeML(ml_file)
 
         self.states = {}
@@ -1479,11 +1584,11 @@ class RenkoBot:
         if self.tg_token and self.tg_chat and self.tg_keys:
             print(f"[BOT] Telegram signals: ENABLED ({len(self.tg_keys)} keys)")
         if self.ml:
-            print(f"[BOT] ML filter: {self.ml.stats()}")
-            print(f"[BOT] ML settings: warmup={ML_WARMUP_TRADES}, K={ML_K_NEIGHBORS}, "
-                  f"skip_threshold={ML_SKIP_THRESHOLD}")
+            print(f"[BOT] RL filter: {self.ml.stats()}")
+            print(f"[BOT] RL settings: warmup={RL_WARMUP_TRADES}, alpha={RL_ALPHA}, "
+                  f"gamma={RL_GAMMA}, eps_start={RL_EPSILON_START}, eps_min={RL_EPSILON_MIN}")
         else:
-            print("[BOT] ML filter: DISABLED")
+            print("[BOT] RL filter: DISABLED")
         if self.tp_webhooks:
             print(f"[BOT] TradersPost webhooks: {len(self.tp_webhooks)} configured")
         print()
