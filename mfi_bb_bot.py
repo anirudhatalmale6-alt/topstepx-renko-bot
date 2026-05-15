@@ -9,6 +9,7 @@ Strategy: MFI + Vortex Indicator gap on Renko bricks
 - LONG:  MFI oversold + VI- >> VI+ (bearish exhaustion) → enter immediately
 - SHORT: MFI overbought + VI+ >> VI- (bullish exhaustion) → enter immediately
 - If Vortex gap too small → skip (weak signal)
+- ADDON: if unrealized <= -$800, add 1 contract (max 2 total), average entry
 - EXIT: opposite MFI signal flips the position or TP hit.
 
 Usage:
@@ -196,6 +197,7 @@ MFI_OVERSOLD = 20.0
 MFI_OVERBOUGHT = 80.0
 VORTEX_PERIOD = 14
 VORTEX_GAP_THRESHOLD = 0.50
+ADDON_THRESHOLD_DOLLARS = -800.0
 
 EMA_PERIOD = 9                # used as ML feature only (not for entry/exit)
 RENKO_SMA_PERIOD = 12         # R.sg (Renko Smoothed Gradient) period
@@ -418,7 +420,7 @@ class SymbolState:
         self.entry_time = None
         self.entry_features = None  # snapshot for ML
         self.live_pnl = 0.0
-        self.MAX_CONTRACTS = 5
+        self.MAX_CONTRACTS = 2
         self.TP_BASE_DOLLARS = 100.0
         self.TP_INCREMENT_DOLLARS = 100.0
 
@@ -919,37 +921,37 @@ class SymbolState:
                 if self.mfi_value is None:
                     continue
 
-                # MFI dot + Vortex gap = immediate entry
+                # MFI dot + Vortex gap = immediate entry (FLIPPED: oversold=SHORT, overbought=LONG)
                 if self.mfi_oversold_dot:
                     self.mfi_oversold_dot = False
                     if self.vi_plus is not None and self.vi_minus is not None:
                         gap = self.vi_minus - self.vi_plus
                         if gap >= VORTEX_GAP_THRESHOLD:
-                            print(f"[{now}] [{self.symbol} ENTRY] LONG: MFI oversold ({self.mfi_value:.1f}) "
+                            print(f"[{now}] [{self.symbol} ENTRY] SHORT: MFI oversold ({self.mfi_value:.1f}) "
                                   f"+ Vortex gap {gap:.4f} >= {VORTEX_GAP_THRESHOLD} "
-                                  f"(VI+={self.vi_plus:.4f} VI-={self.vi_minus:.4f})")
-                            await self._handle_signal("LONG", price, now)
+                                  f"(VI+={self.vi_plus:.4f} VI-={self.vi_minus:.4f}) [FLIPPED]")
+                            await self._handle_signal("SHORT", price, now)
                         else:
-                            print(f"[{now}] [{self.symbol} SKIP] LONG: MFI oversold but "
+                            print(f"[{now}] [{self.symbol} SKIP] SHORT: MFI oversold but "
                                   f"Vortex gap {gap:.4f} < {VORTEX_GAP_THRESHOLD}")
                     else:
-                        print(f"[{now}] [{self.symbol} SKIP] LONG: MFI oversold but Vortex warming")
+                        print(f"[{now}] [{self.symbol} SKIP] SHORT: MFI oversold but Vortex warming")
                 elif self.mfi_overbought_dot:
                     self.mfi_overbought_dot = False
                     if self.vi_plus is not None and self.vi_minus is not None:
                         gap = self.vi_plus - self.vi_minus
                         if gap >= VORTEX_GAP_THRESHOLD:
-                            print(f"[{now}] [{self.symbol} ENTRY] SHORT: MFI overbought ({self.mfi_value:.1f}) "
+                            print(f"[{now}] [{self.symbol} ENTRY] LONG: MFI overbought ({self.mfi_value:.1f}) "
                                   f"+ Vortex gap {gap:.4f} >= {VORTEX_GAP_THRESHOLD} "
-                                  f"(VI+={self.vi_plus:.4f} VI-={self.vi_minus:.4f})")
-                            await self._handle_signal("SHORT", price, now)
+                                  f"(VI+={self.vi_plus:.4f} VI-={self.vi_minus:.4f}) [FLIPPED]")
+                            await self._handle_signal("LONG", price, now)
                         else:
-                            print(f"[{now}] [{self.symbol} SKIP] SHORT: MFI overbought but "
+                            print(f"[{now}] [{self.symbol} SKIP] LONG: MFI overbought but "
                                   f"Vortex gap {gap:.4f} < {VORTEX_GAP_THRESHOLD}")
                     else:
-                        print(f"[{now}] [{self.symbol} SKIP] SHORT: MFI overbought but Vortex warming")
+                        print(f"[{now}] [{self.symbol} SKIP] LONG: MFI overbought but Vortex warming")
 
-        # Take profit check (incrementing: $100 base + $50 per additional contract)
+        # Take profit check (incrementing: $100 base + $100 per additional contract)
         if self.position != 0 and self.contracts_held > 0:
             contracts = self.contracts_held
             tp_target = self.TP_BASE_DOLLARS + self.TP_INCREMENT_DOLLARS * (contracts - 1)
@@ -968,6 +970,20 @@ class SymbolState:
                     "FLAT", self.symbol, price, 0),
                     kwargs={"ntfy_topic": self.ntfy_topic,
                             "tp_webhooks": self.tp_webhooks}, daemon=True).start()
+
+        # Drawdown addon: add 1 contract if unrealized <= -$800 and under max
+        if self.position != 0 and self.contracts_held > 0 and self.contracts_held < self.MAX_CONTRACTS:
+            contracts = self.contracts_held
+            if self.position == 1:
+                unrealized = (price - self.entry_price) * self.point_value * contracts
+            else:
+                unrealized = (self.entry_price - price) * self.point_value * contracts
+            if unrealized <= ADDON_THRESHOLD_DOLLARS:
+                direction = "LONG" if self.position == 1 else "SHORT"
+                now = datetime.now(ET).strftime("%H:%M:%S")
+                print(f"[{now}] [{self.symbol} ADDON] {direction} unrealized ${unrealized:.2f} "
+                      f"<= ${ADDON_THRESHOLD_DOLLARS:.0f} — adding contract")
+                await self._enter_addon(price)
 
         return True
 
@@ -1072,7 +1088,7 @@ class SymbolState:
                 response = await asyncio.wait_for(
                     self.ctx.orders.place_market_order(
                         contract_id=self.ctx.instrument_info.id,
-                        side=0, size=self.qty),
+                        side=0, size=1),
                     timeout=15.0)
                 if response.success:
                     self.position = 1
@@ -1128,7 +1144,7 @@ class SymbolState:
                 response = await asyncio.wait_for(
                     self.ctx.orders.place_market_order(
                         contract_id=self.ctx.instrument_info.id,
-                        side=1, size=self.qty),
+                        side=1, size=1),
                     timeout=15.0)
                 if response.success:
                     self.position = -1
@@ -1168,6 +1184,52 @@ class SymbolState:
         await self._cleanup_ghost_position()
         send_telegram(self.tg_token, self.tg_chat,
                       f"ALERT|{self.symbol} SHORT {result.upper()} @ {price:.2f}")
+        return False
+
+    async def _enter_addon(self, price: float):
+        """Add 1 contract to existing position (drawdown averaging)."""
+        if self.position == 0 or self.contracts_held >= self.MAX_CONTRACTS:
+            return False
+        side = 0 if self.position == 1 else 1
+        direction = "LONG" if self.position == 1 else "SHORT"
+        now = datetime.now(ET).strftime("%H:%M:%S")
+        print(f"\n[{now}] [{self.symbol}] >>> ADDON {direction} @ {price:.2f} | "
+              f"contracts {self.contracts_held} -> {self.contracts_held + 1}")
+
+        async def _do_order():
+            try:
+                response = await asyncio.wait_for(
+                    self.ctx.orders.place_market_order(
+                        contract_id=self.ctx.instrument_info.id,
+                        side=side, size=1),
+                    timeout=15.0)
+                if response.success:
+                    old_contracts = self.contracts_held
+                    old_entry = self.entry_price
+                    self.contracts_held += 1
+                    self.entry_price = (old_entry * old_contracts + price) / self.contracts_held
+                    print(f"[{self.symbol}] Addon filled. Avg entry: {self.entry_price:.2f} "
+                          f"x{self.contracts_held}")
+                    return "ok"
+                print(f"[{self.symbol}] Addon REJECTED: {response.errorMessage}")
+                return "rejected"
+            except asyncio.TimeoutError:
+                print(f"[{self.symbol}] Addon TIMEOUT (15s)")
+                return "timeout"
+            except Exception as ex:
+                print(f"[{self.symbol}] Addon ERROR: {ex}")
+                return "error"
+
+        result = await asyncio.shield(_do_order())
+        if result == "ok":
+            tp = self.TP_BASE_DOLLARS + self.TP_INCREMENT_DOLLARS * (self.contracts_held - 1)
+            msg = (f"ADDON|{self.symbol} {direction} +1 @ {price:.2f} | "
+                   f"avg={self.entry_price:.2f} x{self.contracts_held} | TP=${tp:.0f}")
+            threading.Thread(target=send_telegram, args=(
+                self.tg_token, self.tg_chat, msg), daemon=True).start()
+            threading.Thread(target=send_ntfy, args=(
+                self.ntfy_topic, msg), daemon=True).start()
+            return True
         return False
 
     async def _flatten(self, price: float, reason: str = ""):
