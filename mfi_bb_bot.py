@@ -199,6 +199,11 @@ VORTEX_PERIOD = 14
 VORTEX_GAP_THRESHOLD = 0.50
 ADDON_THRESHOLD_DOLLARS = -800.0
 
+# Smart early exit: cut losses when trade MAE exceeds what winners typically see
+EARLY_EXIT_MULTIPLIER = 1.5   # exit if current MAE > avg winning MAE * this
+EARLY_EXIT_MIN_SAMPLES = 3    # need this many winning trades per state to activate
+EARLY_EXIT_COOLDOWN = 60      # seconds after entry before early exit can trigger
+
 EMA_PERIOD = 9                # used as ML feature only (not for entry/exit)
 RENKO_SMA_PERIOD = 12         # R.sg (Renko Smoothed Gradient) period
 
@@ -278,6 +283,7 @@ class TradeML:
         self.total_trades = 0
         self.recent_outcomes = []  # last 20 PnLs for streak/regime tracking
         self.regime_shift = False   # True when recent performance diverges from historical
+        self.state_mae = {}     # state_key -> {"win_mae": [...], "lose_mae": [...]}
         self._load()
 
     def _state_key(self, features: dict) -> str:
@@ -355,14 +361,21 @@ class TradeML:
                 self.total_trades = data.get("total_trades", len(self.trades))
                 self.recent_outcomes = data.get("recent_outcomes", [])
                 self.regime_shift = data.get("regime_shift", False)
+                self.state_mae = data.get("state_mae", {})
                 states_explored = len(self.q_table)
                 print(f"[RL] Loaded: {self.total_trades} trades, {states_explored} states, "
-                      f"epsilon={self.epsilon:.3f}")
+                      f"epsilon={self.epsilon:.3f}, {len(self.state_mae)} mae-states")
             except Exception as e:
                 print(f"[RL] Load error: {e}")
 
     def _save(self):
         try:
+            trimmed_mae = {}
+            for k, v in self.state_mae.items():
+                trimmed_mae[k] = {
+                    "win_mae": v.get("win_mae", [])[-50:],
+                    "lose_mae": v.get("lose_mae", [])[-50:],
+                }
             data = {
                 "q_table": self.q_table,
                 "trades": self.trades[-500:],
@@ -370,6 +383,7 @@ class TradeML:
                 "total_trades": self.total_trades,
                 "recent_outcomes": self.recent_outcomes[-20:],
                 "regime_shift": self.regime_shift,
+                "state_mae": trimmed_mae,
             }
             tmp = self.data_file + ".tmp"
             with open(tmp, "w") as f:
@@ -453,12 +467,20 @@ class TradeML:
                 self.q_table[key][i] *= RL_Q_DECAY
 
     def record_trade(self, features: dict, pnl: float, source: str = "live",
-                     entry_action: str = "enter"):
+                     entry_action: str = "enter", mae: float = 0.0):
         if features is None:
             return
 
         state = self._state_key(features)
         reward = pnl / RL_PNL_SCALE
+
+        # Store MAE per state for smart early exit
+        if state not in self.state_mae:
+            self.state_mae[state] = {"win_mae": [], "lose_mae": []}
+        bucket = "win_mae" if pnl > 0 else "lose_mae"
+        self.state_mae[state][bucket].append(mae)
+        if len(self.state_mae[state][bucket]) > 50:
+            self.state_mae[state][bucket] = self.state_mae[state][bucket][-50:]
 
         # Detect regime shift and pick alpha
         self.regime_shift = self._detect_regime_shift()
@@ -534,6 +556,26 @@ class TradeML:
                 f"Win%: {100 * wins / total:.0f}% | PnL: ${total_pnl:.2f} | "
                 f"{states} states | eps={self.epsilon:.3f}{regime}")
 
+    def should_early_exit(self, features: dict, current_mae: float) -> tuple:
+        """Check if current trade MAE exceeds what winners typically see in this state.
+        Returns (should_exit: bool, reason: str, avg_win_mae: float)."""
+        if features is None:
+            return False, "", 0.0
+        state = self._state_key(features)
+        mae_data = self.state_mae.get(state)
+        if not mae_data:
+            return False, "", 0.0
+        win_maes = mae_data.get("win_mae", [])
+        if len(win_maes) < EARLY_EXIT_MIN_SAMPLES:
+            return False, "", 0.0
+        avg_win_mae = sum(win_maes) / len(win_maes)
+        threshold = avg_win_mae * EARLY_EXIT_MULTIPLIER
+        if current_mae < threshold:
+            return True, (f"MAE ${current_mae:.0f} < threshold ${threshold:.0f} "
+                          f"(avg winner MAE ${avg_win_mae:.0f} x {EARLY_EXIT_MULTIPLIER}) | "
+                          f"state={state} ({len(win_maes)} samples)"), avg_win_mae
+        return False, "", avg_win_mae
+
 
 # ============================================================
 # Per-Symbol Strategy State
@@ -606,6 +648,7 @@ class SymbolState:
         self.pending_time = 0.0         # timestamp when pending started
         self.pending_features = None    # RL features snapshot
         self.entry_action = "enter"     # track which RL action was used
+        self.early_exit_triggered = False  # prevent re-triggering
 
         # Connection / freshness tracking
         self.last_known_price = None
@@ -671,6 +714,7 @@ class SymbolState:
             "live_pnl": self.live_pnl,
             "trade_mae": self.trade_mae,
             "mae_history": self.mae_history[-100:],
+            "early_exit_triggered": self.early_exit_triggered,
         }
 
     def restore_state(self, state: dict, position_ttl: int = 600) -> bool:
@@ -738,6 +782,7 @@ class SymbolState:
         self.live_pnl = state.get("live_pnl", 0.0)
         self.trade_mae = state.get("trade_mae", 0.0)
         self.mae_history = state.get("mae_history", [])
+        self.early_exit_triggered = state.get("early_exit_triggered", False)
         return True
 
     # ----------------------------------------------------------------
@@ -1041,7 +1086,7 @@ class SymbolState:
 
                 if self.ml and self.entry_features:
                     self.ml.record_trade(self.entry_features, pnl_est, source="platform_close",
-                                         entry_action=self.entry_action)
+                                         entry_action=self.entry_action, mae=self.trade_mae)
                 self.entry_features = None
                 self.live_pnl += pnl_est
                 self._log_trade(direction, self.entry_price, price, pnl_est,
@@ -1203,6 +1248,34 @@ class SymbolState:
             if unrealized < self.trade_mae:
                 self.trade_mae = unrealized
 
+        # Smart early exit: cut trade if MAE exceeds what winners typically see
+        if (self.position != 0 and self.contracts_held > 0
+                and not self.early_exit_triggered and self.ml
+                and self.entry_features and self.entry_time):
+            time_in_trade = (datetime.now(ET) - self.entry_time).total_seconds()
+            if time_in_trade >= EARLY_EXIT_COOLDOWN:
+                should_exit, exit_reason, avg_win = self.ml.should_early_exit(
+                    self.entry_features, self.trade_mae)
+                if should_exit:
+                    self.early_exit_triggered = True
+                    direction = "LONG" if self.position == 1 else "SHORT"
+                    contracts = self.contracts_held
+                    trade_pnl = ((price - self.entry_price) * self.position
+                                 * self.point_value * contracts)
+                    now = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now}] [{self.symbol} EARLY-EXIT] {direction} pattern failed! "
+                          f"{exit_reason} | PnL: ${trade_pnl:+.2f}")
+                    if self.ml and self.entry_features:
+                        self.ml.record_trade(self.entry_features, trade_pnl,
+                                             source="early_exit",
+                                             entry_action=self.entry_action,
+                                             mae=self.trade_mae)
+                        self.entry_features = None
+                    await self._flatten(price, reason="EARLY_EXIT")
+                    send_telegram(self.tg_token, self.tg_chat,
+                                  f"EARLY-EXIT|{self.symbol} {direction} cut @ {price:.2f} | "
+                                  f"PnL ${trade_pnl:+.0f} | pattern failed")
+
         # Take profit check
         if self.position != 0 and self.contracts_held > 0:
             contracts = self.contracts_held
@@ -1216,6 +1289,10 @@ class SymbolState:
                 now = datetime.now(ET).strftime("%H:%M:%S")
                 print(f"[{now}] [{self.symbol} TP] ${tp_target:.0f} target hit! "
                       f"{direction} x{contracts} | Unrealized: ${unrealized:.2f}")
+                if self.ml and self.entry_features:
+                    self.ml.record_trade(self.entry_features, unrealized, source="tp_hit",
+                                         entry_action=self.entry_action, mae=self.trade_mae)
+                    self.entry_features = None
                 await self._flatten(price, reason="TP_HIT")
                 threading.Thread(target=send_signals, args=(
                     self.tg_token, self.tg_chat, self.tg_keys,
@@ -1263,7 +1340,7 @@ class SymbolState:
                          * self.point_value * self.contracts_held)
             if self.ml and self.entry_features:
                 self.ml.record_trade(self.entry_features, trade_pnl, source="signal_flip",
-                                     entry_action=self.entry_action)
+                                     entry_action=self.entry_action, mae=self.trade_mae)
                 self.entry_features = None
             await self._flatten(price, reason="SIGNAL_FLIP")
             if self.position != 0:
@@ -1368,6 +1445,7 @@ class SymbolState:
                     self.entry_price = price
                     self.entry_time = datetime.now(ET)
                     self.trade_mae = 0.0
+                    self.early_exit_triggered = False
                     print(f"[{self.symbol}] Order filled. ID: {response.orderId}")
                     return "ok"
                 print(f"[{self.symbol}] Order REJECTED: {response.errorMessage}")
@@ -1425,6 +1503,7 @@ class SymbolState:
                     self.entry_price = price
                     self.entry_time = datetime.now(ET)
                     self.trade_mae = 0.0
+                    self.early_exit_triggered = False
                     print(f"[{self.symbol}] Order filled. ID: {response.orderId}")
                     return "ok"
                 print(f"[{self.symbol}] Order REJECTED: {response.errorMessage}")
@@ -1921,7 +2000,8 @@ class RenkoBot:
                         if st.ml and st.entry_features:
                             st.ml.record_trade(st.entry_features, pnl_est,
                                                source="ws_platform_close",
-                                               entry_action=st.entry_action)
+                                               entry_action=st.entry_action,
+                                               mae=st.trade_mae)
                         st.entry_features = None
                         st.live_pnl += pnl_est
                         st._log_trade(direction, st.entry_price, price, pnl_est,
