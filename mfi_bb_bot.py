@@ -253,7 +253,10 @@ RL_PNL_SCALE = 500.0     # normalize PnL rewards to ~[-1, 1] range
 RL_Q_DECAY = 0.998       # per-trade decay toward zero (old knowledge fades)
 RL_REGIME_WINDOW = 15    # recent trades to check for regime shift
 RL_REGIME_THRESHOLD = 0.20  # if recent WR drops >20% vs overall, regime shift detected
-PULLBACK_POINTS = 2.0    # points to wait for better entry
+PULLBACK_DEFAULT = 2.0   # default pullback pts before enough MAE data
+PULLBACK_MAE_RATIO = 0.35  # use 35% of avg MAE as pullback target
+PULLBACK_MIN = 1.0       # never wait for less than 1 pt
+PULLBACK_MAX = 8.0       # never wait for more than 8 pts
 PULLBACK_TIMEOUT = 30    # seconds to wait for pullback before cancelling
 
 import random
@@ -931,6 +934,16 @@ class SymbolState:
         print(f"    Position: {pos_str} x{self.contracts_held} | P&L: ${self.live_pnl:.2f} | "
               f"PV=${self.point_value}/pt{tp_str}{avg_mae_str}")
 
+    def _adaptive_pullback(self) -> float:
+        """Compute pullback points from MAE history. Returns pts to wait."""
+        if len(self.mae_history) < 5:
+            return PULLBACK_DEFAULT
+        avg_mae_dollars = abs(sum(self.mae_history) / len(self.mae_history))
+        avg_mae_pts = avg_mae_dollars / (self.point_value * max(self.contracts_held, 1))
+        pullback = avg_mae_pts * PULLBACK_MAE_RATIO
+        pullback = max(PULLBACK_MIN, min(PULLBACK_MAX, pullback))
+        return round(pullback * 4) / 4  # round to nearest 0.25 (NQ tick)
+
     def is_data_stale(self, threshold: int = 300) -> bool:
         if self.last_new_bar_time is None:
             return False
@@ -1279,18 +1292,19 @@ class SymbolState:
                               f"RL-SKIP|{self.symbol} {direction} @ {price:.2f} | {reason}")
                 return
             if action_str == "wait":
-                # Set pending pullback entry
+                # Set pending pullback entry (adaptive from MAE)
+                pb_pts = self._adaptive_pullback()
                 if direction == "LONG":
-                    target = price - PULLBACK_POINTS
+                    target = price - pb_pts
                 else:
-                    target = price + PULLBACK_POINTS
+                    target = price + pb_pts
                 self.pending_direction = direction
                 self.pending_signal_price = price
                 self.pending_target_price = target
                 self.pending_time = time.time()
                 self.pending_features = features
                 print(f"[{now}] [{self.symbol} RL-WAIT] {direction} waiting for pullback "
-                      f"to {target:.2f} ({PULLBACK_POINTS} pts better) | {reason}")
+                      f"to {target:.2f} ({pb_pts} pts, adaptive) | {reason}")
                 send_telegram(self.tg_token, self.tg_chat,
                               f"RL-WAIT|{self.symbol} {direction} @ {price:.2f} -> target {target:.2f}")
                 return
