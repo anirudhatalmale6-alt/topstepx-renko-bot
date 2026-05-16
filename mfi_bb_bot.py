@@ -9,8 +9,8 @@ Strategy: MFI + Vortex Indicator gap on Renko bricks
 - LONG:  MFI oversold + VI- >> VI+ (bearish exhaustion) → enter immediately
 - SHORT: MFI overbought + VI+ >> VI- (bullish exhaustion) → enter immediately
 - If Vortex gap too small → skip (weak signal)
-- ADDON: if unrealized <= -$800, add 1 contract (max 2 total), average entry
-- EXIT: opposite MFI signal flips the position or TP hit.
+- EARLY EXIT: RL tracks MAE per state, cuts trade if drawdown exceeds winner profile
+- EXIT: opposite MFI signal flips the position, TP hit, or early exit.
 
 Usage:
     python mfi_bb_bot.py --symbols "NQ:2:2:ntfy-topic" --tick-interval 1
@@ -197,7 +197,6 @@ MFI_OVERSOLD = 20.0
 MFI_OVERBOUGHT = 80.0
 VORTEX_PERIOD = 14
 VORTEX_GAP_THRESHOLD = 0.50
-ADDON_THRESHOLD_DOLLARS = -800.0
 
 # Smart early exit: cut losses when trade MAE exceeds what winners typically see
 EARLY_EXIT_MULTIPLIER = 1.5   # exit if current MAE > avg winning MAE * this
@@ -637,9 +636,7 @@ class SymbolState:
         self.live_pnl = 0.0
         self.trade_mae = 0.0        # max adverse excursion (worst drawdown $ during trade)
         self.mae_history = []        # list of MAE values for averaging
-        self.MAX_CONTRACTS = 3
-        self.TP_BASE_DOLLARS = 200.0
-        self.TP_INCREMENT_DOLLARS = 0.0
+        self.TP_DOLLARS = 200.0
 
         # Pullback entry state (RL "wait" action)
         self.pending_direction = None   # "LONG" or "SHORT"
@@ -971,8 +968,7 @@ class SymbolState:
             print(f"    Vortex({VORTEX_PERIOD}): warming")
         tp_str = ""
         if self.contracts_held > 0:
-            tp = self.TP_BASE_DOLLARS + self.TP_INCREMENT_DOLLARS * (self.contracts_held - 1)
-            tp_str = f" | TP: ${tp:.0f}"
+            tp_str = f" | TP: ${self.TP_DOLLARS:.0f}"
         avg_mae_str = ""
         if self.mae_history:
             avg_mae_str = f" | Avg MAE: ${sum(self.mae_history)/len(self.mae_history):.2f} ({len(self.mae_history)} trades)"
@@ -1279,15 +1275,14 @@ class SymbolState:
         # Take profit check
         if self.position != 0 and self.contracts_held > 0:
             contracts = self.contracts_held
-            tp_target = self.TP_BASE_DOLLARS + self.TP_INCREMENT_DOLLARS * (contracts - 1)
             if self.position == 1:
                 unrealized = (price - self.entry_price) * self.point_value * contracts
             else:
                 unrealized = (self.entry_price - price) * self.point_value * contracts
-            if unrealized >= tp_target:
+            if unrealized >= self.TP_DOLLARS:
                 direction = "LONG" if self.position == 1 else "SHORT"
                 now = datetime.now(ET).strftime("%H:%M:%S")
-                print(f"[{now}] [{self.symbol} TP] ${tp_target:.0f} target hit! "
+                print(f"[{now}] [{self.symbol} TP] ${self.TP_DOLLARS:.0f} target hit! "
                       f"{direction} x{contracts} | Unrealized: ${unrealized:.2f}")
                 if self.ml and self.entry_features:
                     self.ml.record_trade(self.entry_features, unrealized, source="tp_hit",
@@ -1299,20 +1294,6 @@ class SymbolState:
                     "FLAT", self.symbol, price, 0),
                     kwargs={"ntfy_topic": self.ntfy_topic,
                             "tp_webhooks": self.tp_webhooks}, daemon=True).start()
-
-        # Drawdown addon: add 1 contract if unrealized <= -$800 and under max
-        if self.position != 0 and self.contracts_held > 0 and self.contracts_held < self.MAX_CONTRACTS:
-            contracts = self.contracts_held
-            if self.position == 1:
-                unrealized = (price - self.entry_price) * self.point_value * contracts
-            else:
-                unrealized = (self.entry_price - price) * self.point_value * contracts
-            if unrealized <= ADDON_THRESHOLD_DOLLARS:
-                direction = "LONG" if self.position == 1 else "SHORT"
-                now = datetime.now(ET).strftime("%H:%M:%S")
-                print(f"[{now}] [{self.symbol} ADDON] {direction} unrealized ${unrealized:.2f} "
-                      f"<= ${ADDON_THRESHOLD_DOLLARS:.0f} — adding contract")
-                await self._enter_addon(price)
 
         return True
 
@@ -1537,52 +1518,6 @@ class SymbolState:
         await self._cleanup_ghost_position()
         send_telegram(self.tg_token, self.tg_chat,
                       f"ALERT|{self.symbol} SHORT {result.upper()} @ {price:.2f}")
-        return False
-
-    async def _enter_addon(self, price: float):
-        """Add 1 contract to existing position (drawdown averaging)."""
-        if self.position == 0 or self.contracts_held >= self.MAX_CONTRACTS:
-            return False
-        side = 0 if self.position == 1 else 1
-        direction = "LONG" if self.position == 1 else "SHORT"
-        now = datetime.now(ET).strftime("%H:%M:%S")
-        print(f"\n[{now}] [{self.symbol}] >>> ADDON {direction} @ {price:.2f} | "
-              f"contracts {self.contracts_held} -> {self.contracts_held + 1}")
-
-        async def _do_order():
-            try:
-                response = await asyncio.wait_for(
-                    self.ctx.orders.place_market_order(
-                        contract_id=self.ctx.instrument_info.id,
-                        side=side, size=1),
-                    timeout=15.0)
-                if response.success:
-                    old_contracts = self.contracts_held
-                    old_entry = self.entry_price
-                    self.contracts_held += 1
-                    self.entry_price = (old_entry * old_contracts + price) / self.contracts_held
-                    print(f"[{self.symbol}] Addon filled. Avg entry: {self.entry_price:.2f} "
-                          f"x{self.contracts_held}")
-                    return "ok"
-                print(f"[{self.symbol}] Addon REJECTED: {response.errorMessage}")
-                return "rejected"
-            except asyncio.TimeoutError:
-                print(f"[{self.symbol}] Addon TIMEOUT (15s)")
-                return "timeout"
-            except Exception as ex:
-                print(f"[{self.symbol}] Addon ERROR: {ex}")
-                return "error"
-
-        result = await asyncio.shield(_do_order())
-        if result == "ok":
-            tp = self.TP_BASE_DOLLARS + self.TP_INCREMENT_DOLLARS * (self.contracts_held - 1)
-            msg = (f"ADDON|{self.symbol} {direction} +1 @ {price:.2f} | "
-                   f"avg={self.entry_price:.2f} x{self.contracts_held} | TP=${tp:.0f}")
-            threading.Thread(target=send_telegram, args=(
-                self.tg_token, self.tg_chat, msg), daemon=True).start()
-            threading.Thread(target=send_ntfy, args=(
-                self.ntfy_topic, msg), daemon=True).start()
-            return True
         return False
 
     async def _flatten(self, price: float, reason: str = ""):
