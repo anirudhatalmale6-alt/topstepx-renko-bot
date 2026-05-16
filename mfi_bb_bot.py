@@ -253,20 +253,23 @@ RL_PNL_SCALE = 500.0     # normalize PnL rewards to ~[-1, 1] range
 RL_Q_DECAY = 0.998       # per-trade decay toward zero (old knowledge fades)
 RL_REGIME_WINDOW = 15    # recent trades to check for regime shift
 RL_REGIME_THRESHOLD = 0.20  # if recent WR drops >20% vs overall, regime shift detected
+PULLBACK_POINTS = 2.0    # points to wait for better entry
+PULLBACK_TIMEOUT = 30    # seconds to wait for pullback before cancelling
 
 import random
 
 
 class TradeML:
     """Q-learning RL filter. Discretizes market state, learns which
-    states are profitable to enter vs skip. Same interface as old KNN."""
+    states are profitable to enter, wait for pullback, or skip."""
 
     ACTION_ENTER = 0
     ACTION_SKIP = 1
+    ACTION_WAIT = 2
 
     def __init__(self, data_file: str):
         self.data_file = data_file
-        self.q_table = {}       # state_key -> [Q(enter), Q(skip)]
+        self.q_table = {}       # state_key -> [Q(enter), Q(skip), Q(wait)]
         self.trades = []        # full trade history for stats
         self.epsilon = RL_EPSILON_START
         self.total_trades = 0
@@ -331,8 +334,12 @@ class TradeML:
 
     def _get_q(self, state_key: str) -> list:
         if state_key not in self.q_table:
-            self.q_table[state_key] = [0.0, 0.0]
-        return self.q_table[state_key]
+            self.q_table[state_key] = [0.0, 0.0, 0.0]
+        q = self.q_table[state_key]
+        if len(q) < 3:
+            q.append(0.0)
+            self.q_table[state_key] = q
+        return q
 
     def _load(self):
         if os.path.exists(self.data_file):
@@ -393,26 +400,37 @@ class TradeML:
         }
 
     def should_skip(self, features: dict) -> tuple:
+        """Returns (action_str, value, reason).
+        action_str: 'enter', 'skip', or 'wait'."""
         if self.total_trades < RL_WARMUP_TRADES:
-            return False, 0.0, f"RL warmup ({self.total_trades}/{RL_WARMUP_TRADES})"
+            return "enter", 0.0, f"RL warmup ({self.total_trades}/{RL_WARMUP_TRADES})"
 
         state = self._state_key(features)
         q_vals = self._get_q(state)
-        q_enter, q_skip = q_vals[0], q_vals[1]
+        q_enter, q_skip, q_wait = q_vals[0], q_vals[1], q_vals[2]
 
         # Epsilon-greedy: explore or exploit
         if random.random() < self.epsilon:
-            action = random.choice([self.ACTION_ENTER, self.ACTION_SKIP])
+            action = random.choice([self.ACTION_ENTER, self.ACTION_SKIP, self.ACTION_WAIT])
             choice = "explore"
         else:
-            action = self.ACTION_ENTER if q_enter >= q_skip else self.ACTION_SKIP
+            best = max(q_enter, q_skip, q_wait)
+            if best == q_enter:
+                action = self.ACTION_ENTER
+            elif best == q_wait:
+                action = self.ACTION_WAIT
+            else:
+                action = self.ACTION_SKIP
             choice = "exploit"
 
-        skip = (action == self.ACTION_SKIP)
+        action_names = {self.ACTION_ENTER: "enter", self.ACTION_SKIP: "skip",
+                        self.ACTION_WAIT: "wait"}
+        action_str = action_names[action]
         regime_tag = "|REGIME" if self.regime_shift else ""
-        reason = (f"RL|{state}|Q(enter)={q_enter:+.2f} Q(skip)={q_skip:+.2f}|"
-                  f"eps={self.epsilon:.2f}|{choice}{regime_tag}")
-        return skip, q_skip - q_enter, reason
+        reason = (f"RL|{state}|Q(now)={q_enter:+.2f} Q(skip)={q_skip:+.2f} "
+                  f"Q(wait)={q_wait:+.2f}|eps={self.epsilon:.2f}|{choice}|"
+                  f"{action_str}{regime_tag}")
+        return action_str, 0.0, reason
 
     def _detect_regime_shift(self) -> bool:
         """Compare recent win rate vs overall. Large divergence = regime shift."""
@@ -428,10 +446,11 @@ class TradeML:
     def _decay_q_table(self):
         """Gradually decay all Q-values toward zero. Old knowledge fades."""
         for key in self.q_table:
-            self.q_table[key][0] *= RL_Q_DECAY
-            self.q_table[key][1] *= RL_Q_DECAY
+            for i in range(len(self.q_table[key])):
+                self.q_table[key][i] *= RL_Q_DECAY
 
-    def record_trade(self, features: dict, pnl: float, source: str = "live"):
+    def record_trade(self, features: dict, pnl: float, source: str = "live",
+                     entry_action: str = "enter"):
         if features is None:
             return
 
@@ -445,16 +464,23 @@ class TradeML:
         # Decay all Q-values (old knowledge fades naturally)
         self._decay_q_table()
 
-        # Update Q(enter) for this state
+        # Update the Q-value for the action that was taken
         q_vals = self._get_q(state)
-        old_q = q_vals[self.ACTION_ENTER]
-        q_vals[self.ACTION_ENTER] = old_q + alpha * (reward - old_q)
+        action_idx = self.ACTION_WAIT if entry_action == "wait" else self.ACTION_ENTER
+        old_q = q_vals[action_idx]
+        q_vals[action_idx] = old_q + alpha * (reward - old_q)
 
-        # If trade was a loser, also boost Q(skip) slightly
+        # If trade was a loser, boost Q(skip) slightly
         if pnl < 0:
             old_skip_q = q_vals[self.ACTION_SKIP]
             skip_reward = abs(reward) * 0.3
             q_vals[self.ACTION_SKIP] = old_skip_q + alpha * (skip_reward - old_skip_q)
+
+        # If wait entry got better PnL than avg, boost Q(wait) extra
+        if entry_action == "wait" and pnl > 0:
+            avg_pnl = sum(t["pnl"] for t in self.trades[-20:]) / max(len(self.trades[-20:]), 1) if self.trades else 0
+            if pnl > avg_pnl:
+                q_vals[self.ACTION_WAIT] += alpha * 0.1
 
         self.recent_outcomes.append(pnl)
         if len(self.recent_outcomes) > 20:
@@ -466,6 +492,7 @@ class TradeML:
             "state": state,
             "pnl": pnl,
             "win": 1 if pnl > 0 else 0,
+            "entry_action": entry_action,
             "q_after": list(q_vals),
             "alpha_used": alpha,
             "regime_shift": self.regime_shift,
@@ -486,8 +513,8 @@ class TradeML:
 
         wins = sum(1 for t in self.trades if t["win"] == 1)
         total = len(self.trades)
-        print(f"[RL] Trade recorded: PnL=${pnl:.2f} | state={state} | "
-              f"Q(enter)={q_vals[0]:+.3f} Q(skip)={q_vals[1]:+.3f} | "
+        print(f"[RL] Trade recorded: PnL=${pnl:.2f} | {entry_action} | state={state} | "
+              f"Q(now)={q_vals[0]:+.3f} Q(skip)={q_vals[1]:+.3f} Q(wait)={q_vals[2]:+.3f} | "
               f"alpha={alpha:.2f} | eps={self.epsilon:.3f} | {total} trades, "
               f"{wins} wins ({100 * wins / total:.0f}%){regime_tag}")
 
@@ -568,6 +595,14 @@ class SymbolState:
         self.MAX_CONTRACTS = 3
         self.TP_BASE_DOLLARS = 200.0
         self.TP_INCREMENT_DOLLARS = 0.0
+
+        # Pullback entry state (RL "wait" action)
+        self.pending_direction = None   # "LONG" or "SHORT"
+        self.pending_signal_price = 0.0 # price when signal fired
+        self.pending_target_price = 0.0 # price we want to enter at
+        self.pending_time = 0.0         # timestamp when pending started
+        self.pending_features = None    # RL features snapshot
+        self.entry_action = "enter"     # track which RL action was used
 
         # Connection / freshness tracking
         self.last_known_price = None
@@ -992,7 +1027,8 @@ class SymbolState:
                       f"{direction} externally (TP/SL/manual). Est PnL: ${pnl_est:+.2f}")
 
                 if self.ml and self.entry_features:
-                    self.ml.record_trade(self.entry_features, pnl_est, source="platform_close")
+                    self.ml.record_trade(self.entry_features, pnl_est, source="platform_close",
+                                         entry_action=self.entry_action)
                 self.entry_features = None
                 self.live_pnl += pnl_est
                 self._log_trade(direction, self.entry_price, price, pnl_est,
@@ -1043,6 +1079,47 @@ class SymbolState:
 
         now_ts = time.time()
         now = datetime.now(ET).strftime("%H:%M:%S")
+
+        # Check pending pullback entry
+        if self.pending_direction is not None and self.position == 0:
+            elapsed = now_ts - self.pending_time
+            if elapsed > PULLBACK_TIMEOUT:
+                # Timeout — cancel pending and enter at market (don't miss the move)
+                print(f"[{now}] [{self.symbol} PULLBACK-TIMEOUT] {self.pending_direction} "
+                      f"no pullback in {PULLBACK_TIMEOUT}s, entering at market {price:.2f}")
+                self.entry_features = self.pending_features
+                self.entry_action = "wait"
+                if self.pending_direction == "LONG":
+                    await self._enter_long(price)
+                else:
+                    await self._enter_short(price)
+                self.pending_direction = None
+                self.pending_features = None
+            else:
+                filled = False
+                if self.pending_direction == "LONG" and price <= self.pending_target_price:
+                    filled = True
+                elif self.pending_direction == "SHORT" and price >= self.pending_target_price:
+                    filled = True
+                if filled:
+                    saved = self.pending_signal_price - price if self.pending_direction == "LONG" \
+                        else price - self.pending_signal_price
+                    print(f"[{now}] [{self.symbol} PULLBACK-FILL] {self.pending_direction} "
+                          f"@ {price:.2f} (saved {saved:.1f} pts vs signal @ "
+                          f"{self.pending_signal_price:.2f})")
+                    self.entry_features = self.pending_features
+                    self.entry_action = "wait"
+                    if self.pending_direction == "LONG":
+                        await self._enter_long(price)
+                    else:
+                        await self._enter_short(price)
+                    self.pending_direction = None
+                    self.pending_features = None
+
+        # Cancel pending if a new position was opened (e.g. by opposite signal flip)
+        if self.pending_direction is not None and self.position != 0:
+            self.pending_direction = None
+            self.pending_features = None
 
         # Feed renko at most once per second (matches TV 1s renko close behaviour)
         if not hasattr(self, "_last_renko_feed_time"):
@@ -1172,7 +1249,8 @@ class SymbolState:
             trade_pnl = ((price - self.entry_price) * self.position
                          * self.point_value * self.contracts_held)
             if self.ml and self.entry_features:
-                self.ml.record_trade(self.entry_features, trade_pnl, source="signal_flip")
+                self.ml.record_trade(self.entry_features, trade_pnl, source="signal_flip",
+                                     entry_action=self.entry_action)
                 self.entry_features = None
             await self._flatten(price, reason="SIGNAL_FLIP")
             if self.position != 0:
@@ -1194,16 +1272,33 @@ class SymbolState:
         ) if self.ml else None
 
         if features and self.ml:
-            skip, _, reason = self.ml.should_skip(features)
-            if skip:
+            action_str, _, reason = self.ml.should_skip(features)
+            if action_str == "skip":
                 print(f"[{now}] [{self.symbol} RL-SKIP] {direction} skipped | {reason}")
                 send_telegram(self.tg_token, self.tg_chat,
                               f"RL-SKIP|{self.symbol} {direction} @ {price:.2f} | {reason}")
                 return
-            print(f"[{now}] [{self.symbol} RL-OK] {direction} approved | {reason}")
+            if action_str == "wait":
+                # Set pending pullback entry
+                if direction == "LONG":
+                    target = price - PULLBACK_POINTS
+                else:
+                    target = price + PULLBACK_POINTS
+                self.pending_direction = direction
+                self.pending_signal_price = price
+                self.pending_target_price = target
+                self.pending_time = time.time()
+                self.pending_features = features
+                print(f"[{now}] [{self.symbol} RL-WAIT] {direction} waiting for pullback "
+                      f"to {target:.2f} ({PULLBACK_POINTS} pts better) | {reason}")
+                send_telegram(self.tg_token, self.tg_chat,
+                              f"RL-WAIT|{self.symbol} {direction} @ {price:.2f} -> target {target:.2f}")
+                return
+            print(f"[{now}] [{self.symbol} RL-OK] {direction} enter now | {reason}")
         self.entry_features = features
+        self.entry_action = "enter"
 
-        # Place the entry
+        # Place the entry immediately
         if direction == "LONG":
             await self._enter_long(price)
         else:
@@ -1811,7 +1906,8 @@ class RenkoBot:
 
                         if st.ml and st.entry_features:
                             st.ml.record_trade(st.entry_features, pnl_est,
-                                               source="ws_platform_close")
+                                               source="ws_platform_close",
+                                               entry_action=st.entry_action)
                         st.entry_features = None
                         st.live_pnl += pnl_est
                         st._log_trade(direction, st.entry_price, price, pnl_est,
