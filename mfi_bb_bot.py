@@ -203,6 +203,20 @@ EARLY_EXIT_MULTIPLIER = 1.5   # exit if current MAE > avg winning MAE * this
 EARLY_EXIT_MIN_SAMPLES = 3    # need this many winning trades per state to activate
 EARLY_EXIT_COOLDOWN = 60      # seconds after entry before early exit can trigger
 
+# Dynamic TP: learn optimal take-profit per state from post-exit price movement
+TP_DEFAULT_DOLLARS = 200.0    # starting TP target
+TP_MIN_DOLLARS = 50.0         # never go below this
+TP_MAX_DOLLARS = 800.0        # never go above this
+TP_LEARN_MIN_SAMPLES = 5      # need this many trades per state to adjust TP
+TP_POST_EXIT_TRACK_SECS = 60  # how long to track price after exit
+TP_ADJUST_RATE = 0.2          # blend 20% of learned TP each trade
+
+# Breakeven exit: take BE if trade recovers but state says unlikely to reach TP
+BE_EXIT_THRESHOLD = 30.0      # within $30 of breakeven and recovering
+BE_EXIT_MIN_SAMPLES = 5       # need this many trade samples per state
+BE_EXIT_MIN_TIME = 90         # seconds in trade before BE exit can trigger
+BE_RECOVERY_RATIO = 0.4       # if <40% of trades in this state that dip then recover hit TP
+
 EMA_PERIOD = 9                # used as ML feature only (not for entry/exit)
 RENKO_SMA_PERIOD = 12         # R.sg (Renko Smoothed Gradient) period
 
@@ -283,6 +297,9 @@ class TradeML:
         self.recent_outcomes = []  # last 20 PnLs for streak/regime tracking
         self.regime_shift = False   # True when recent performance diverges from historical
         self.state_mae = {}     # state_key -> {"win_mae": [...], "lose_mae": [...]}
+        self.state_mfe = {}    # state_key -> [max favorable excursion values]
+        self.state_post_exit = {}  # state_key -> [post-exit price moves in trade direction]
+        self.state_recovery = {}   # state_key -> {"dip_then_tp": N, "dip_then_fail": N}
         self._load()
 
     def _state_key(self, features: dict) -> str:
@@ -361,6 +378,9 @@ class TradeML:
                 self.recent_outcomes = data.get("recent_outcomes", [])
                 self.regime_shift = data.get("regime_shift", False)
                 self.state_mae = data.get("state_mae", {})
+                self.state_mfe = data.get("state_mfe", {})
+                self.state_post_exit = data.get("state_post_exit", {})
+                self.state_recovery = data.get("state_recovery", {})
                 states_explored = len(self.q_table)
                 print(f"[RL] Loaded: {self.total_trades} trades, {states_explored} states, "
                       f"epsilon={self.epsilon:.3f}, {len(self.state_mae)} mae-states")
@@ -375,6 +395,8 @@ class TradeML:
                     "win_mae": v.get("win_mae", [])[-50:],
                     "lose_mae": v.get("lose_mae", [])[-50:],
                 }
+            trimmed_mfe = {k: v[-50:] for k, v in self.state_mfe.items()}
+            trimmed_post = {k: v[-50:] for k, v in self.state_post_exit.items()}
             data = {
                 "q_table": self.q_table,
                 "trades": self.trades[-500:],
@@ -383,6 +405,9 @@ class TradeML:
                 "recent_outcomes": self.recent_outcomes[-20:],
                 "regime_shift": self.regime_shift,
                 "state_mae": trimmed_mae,
+                "state_mfe": trimmed_mfe,
+                "state_post_exit": trimmed_post,
+                "state_recovery": self.state_recovery,
             }
             tmp = self.data_file + ".tmp"
             with open(tmp, "w") as f:
@@ -466,7 +491,7 @@ class TradeML:
                 self.q_table[key][i] *= RL_Q_DECAY
 
     def record_trade(self, features: dict, pnl: float, source: str = "live",
-                     entry_action: str = "enter", mae: float = 0.0):
+                     entry_action: str = "enter", mae: float = 0.0, mfe: float = 0.0):
         if features is None:
             return
 
@@ -480,6 +505,23 @@ class TradeML:
         self.state_mae[state][bucket].append(mae)
         if len(self.state_mae[state][bucket]) > 50:
             self.state_mae[state][bucket] = self.state_mae[state][bucket][-50:]
+
+        # Store MFE per state for dynamic TP learning
+        if mfe > 0:
+            if state not in self.state_mfe:
+                self.state_mfe[state] = []
+            self.state_mfe[state].append(mfe)
+            if len(self.state_mfe[state]) > 50:
+                self.state_mfe[state] = self.state_mfe[state][-50:]
+
+        # Track recovery patterns: did trade dip then reach TP, or dip then fail?
+        if mae < -30 and state not in self.state_recovery:
+            self.state_recovery[state] = {"dip_then_tp": 0, "dip_then_fail": 0}
+        if mae < -30:
+            if pnl > 0:
+                self.state_recovery[state]["dip_then_tp"] += 1
+            else:
+                self.state_recovery[state]["dip_then_fail"] += 1
 
         # Detect regime shift and pick alpha
         self.regime_shift = self._detect_regime_shift()
@@ -575,6 +617,59 @@ class TradeML:
                           f"state={state} ({len(win_maes)} samples)"), avg_win_mae
         return False, "", avg_win_mae
 
+    def get_dynamic_tp(self, features: dict, base_tp: float) -> tuple:
+        """Calculate dynamic TP based on historical MFE for this state.
+        Returns (tp_dollars, reason_str)."""
+        if features is None:
+            return base_tp, "default"
+        state = self._state_key(features)
+        mfe_list = self.state_mfe.get(state, [])
+        if len(mfe_list) < TP_LEARN_MIN_SAMPLES:
+            return base_tp, f"default (need {TP_LEARN_MIN_SAMPLES - len(mfe_list)} more samples)"
+        avg_mfe = sum(mfe_list) / len(mfe_list)
+        # Target 70% of average MFE (leave some on table but capture most)
+        learned_tp = avg_mfe * 0.70
+        # Blend with base: slowly move toward learned value
+        blended = base_tp * (1 - TP_ADJUST_RATE) + learned_tp * TP_ADJUST_RATE
+        blended = max(TP_MIN_DOLLARS, min(TP_MAX_DOLLARS, blended))
+        return round(blended, 2), (f"dynamic TP: avg_mfe=${avg_mfe:.0f}, "
+                                    f"learned=${learned_tp:.0f}, blended=${blended:.0f} "
+                                    f"({len(mfe_list)} samples)")
+
+    def record_post_exit(self, features: dict, post_exit_move: float):
+        """Record how far price moved in trade direction after exit."""
+        if features is None:
+            return
+        state = self._state_key(features)
+        if state not in self.state_post_exit:
+            self.state_post_exit[state] = []
+        self.state_post_exit[state].append(post_exit_move)
+        if len(self.state_post_exit[state]) > 50:
+            self.state_post_exit[state] = self.state_post_exit[state][-50:]
+        self._save()
+
+    def should_breakeven_exit(self, features: dict, current_pnl: float,
+                              had_drawdown: bool) -> tuple:
+        """Check if we should take breakeven rather than wait for full TP.
+        Returns (should_exit: bool, reason: str)."""
+        if features is None or not had_drawdown:
+            return False, ""
+        if current_pnl < 0 or current_pnl > BE_EXIT_THRESHOLD:
+            return False, ""
+        state = self._state_key(features)
+        recovery = self.state_recovery.get(state)
+        if not recovery:
+            return False, ""
+        total_dips = recovery["dip_then_tp"] + recovery["dip_then_fail"]
+        if total_dips < BE_EXIT_MIN_SAMPLES:
+            return False, ""
+        recovery_rate = recovery["dip_then_tp"] / total_dips
+        if recovery_rate < BE_RECOVERY_RATIO:
+            return True, (f"BE exit: pnl ${current_pnl:.0f}, recovery rate "
+                          f"{recovery_rate:.0%} < {BE_RECOVERY_RATIO:.0%} "
+                          f"({total_dips} samples) | state={state}")
+        return False, ""
+
 
 # ============================================================
 # Per-Symbol Strategy State
@@ -635,8 +730,18 @@ class SymbolState:
         self.entry_features = None  # snapshot for ML
         self.live_pnl = 0.0
         self.trade_mae = 0.0        # max adverse excursion (worst drawdown $ during trade)
+        self.trade_mfe = 0.0        # max favorable excursion (best unrealized $ during trade)
         self.mae_history = []        # list of MAE values for averaging
-        self.TP_DOLLARS = 200.0
+        self.TP_DOLLARS = TP_DEFAULT_DOLLARS
+        self.current_tp = TP_DEFAULT_DOLLARS  # dynamic TP for current trade
+
+        # Post-exit tracking (watches price after flatten to learn optimal TP)
+        self.post_exit_tracking = False
+        self.post_exit_direction = 0     # 1 long, -1 short
+        self.post_exit_price = 0.0       # price at exit
+        self.post_exit_time = 0.0        # when we exited
+        self.post_exit_best = 0.0        # best price move in our direction after exit
+        self.post_exit_features = None   # features at entry (for state lookup)
 
         # Pullback entry state (RL "wait" action)
         self.pending_direction = None   # "LONG" or "SHORT"
@@ -646,6 +751,7 @@ class SymbolState:
         self.pending_features = None    # RL features snapshot
         self.entry_action = "enter"     # track which RL action was used
         self.early_exit_triggered = False  # prevent re-triggering
+        self.had_significant_drawdown = False  # trade dipped significantly (for BE exit)
 
         # Connection / freshness tracking
         self.last_known_price = None
@@ -710,8 +816,11 @@ class SymbolState:
             "entry_features": self.entry_features,
             "live_pnl": self.live_pnl,
             "trade_mae": self.trade_mae,
+            "trade_mfe": self.trade_mfe,
             "mae_history": self.mae_history[-100:],
             "early_exit_triggered": self.early_exit_triggered,
+            "had_significant_drawdown": self.had_significant_drawdown,
+            "current_tp": self.current_tp,
         }
 
     def restore_state(self, state: dict, position_ttl: int = 600) -> bool:
@@ -778,8 +887,11 @@ class SymbolState:
 
         self.live_pnl = state.get("live_pnl", 0.0)
         self.trade_mae = state.get("trade_mae", 0.0)
+        self.trade_mfe = state.get("trade_mfe", 0.0)
         self.mae_history = state.get("mae_history", [])
         self.early_exit_triggered = state.get("early_exit_triggered", False)
+        self.had_significant_drawdown = state.get("had_significant_drawdown", False)
+        self.current_tp = state.get("current_tp", TP_DEFAULT_DOLLARS)
         return True
 
     # ----------------------------------------------------------------
@@ -968,7 +1080,7 @@ class SymbolState:
             print(f"    Vortex({VORTEX_PERIOD}): warming")
         tp_str = ""
         if self.contracts_held > 0:
-            tp_str = f" | TP: ${self.TP_DOLLARS:.0f}"
+            tp_str = f" | TP: ${self.current_tp:.0f}"
         avg_mae_str = ""
         if self.mae_history:
             avg_mae_str = f" | Avg MAE: ${sum(self.mae_history)/len(self.mae_history):.2f} ({len(self.mae_history)} trades)"
@@ -1082,7 +1194,8 @@ class SymbolState:
 
                 if self.ml and self.entry_features:
                     self.ml.record_trade(self.entry_features, pnl_est, source="platform_close",
-                                         entry_action=self.entry_action, mae=self.trade_mae)
+                                         entry_action=self.entry_action, mae=self.trade_mae,
+                                         mfe=self.trade_mfe)
                 self.entry_features = None
                 self.live_pnl += pnl_est
                 self._log_trade(direction, self.entry_price, price, pnl_est,
@@ -1234,7 +1347,30 @@ class SymbolState:
                     else:
                         print(f"[{now}] [{self.symbol} SKIP] LONG: MFI overbought but Vortex warming")
 
-        # MAE tracking: track worst drawdown during open trade
+        # Post-exit tracking: watch price after closing to learn optimal TP
+        if self.post_exit_tracking:
+            elapsed = now_ts - self.post_exit_time
+            if elapsed > TP_POST_EXIT_TRACK_SECS:
+                # Done tracking, record result
+                if self.ml and self.post_exit_features:
+                    move_dollars = self.post_exit_best * self.point_value * self.qty
+                    self.ml.record_post_exit(self.post_exit_features, move_dollars)
+                    now = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now}] [{self.symbol} POST-EXIT] Price moved "
+                          f"{self.post_exit_best:.2f} pts (${move_dollars:.0f}) "
+                          f"in our direction after exit")
+                self.post_exit_tracking = False
+                self.post_exit_features = None
+            else:
+                # Track best move in our direction
+                if self.post_exit_direction == 1:
+                    move = price - self.post_exit_price
+                else:
+                    move = self.post_exit_price - price
+                if move > self.post_exit_best:
+                    self.post_exit_best = move
+
+        # MAE/MFE tracking: track worst drawdown and best unrealized during trade
         if self.position != 0 and self.contracts_held > 0:
             contracts = self.contracts_held
             if self.position == 1:
@@ -1243,6 +1379,10 @@ class SymbolState:
                 unrealized = (self.entry_price - price) * self.point_value * contracts
             if unrealized < self.trade_mae:
                 self.trade_mae = unrealized
+                if unrealized < -30:
+                    self.had_significant_drawdown = True
+            if unrealized > self.trade_mfe:
+                self.trade_mfe = unrealized
 
         # Smart early exit: cut trade if MAE exceeds what winners typically see
         if (self.position != 0 and self.contracts_held > 0
@@ -1265,28 +1405,58 @@ class SymbolState:
                         self.ml.record_trade(self.entry_features, trade_pnl,
                                              source="early_exit",
                                              entry_action=self.entry_action,
-                                             mae=self.trade_mae)
+                                             mae=self.trade_mae, mfe=self.trade_mfe)
                         self.entry_features = None
                     await self._flatten(price, reason="EARLY_EXIT")
                     send_telegram(self.tg_token, self.tg_chat,
                                   f"EARLY-EXIT|{self.symbol} {direction} cut @ {price:.2f} | "
                                   f"PnL ${trade_pnl:+.0f} | pattern failed")
 
-        # Take profit check
+        # Breakeven exit: if trade dipped and recovered but state says unlikely to hit TP
+        if (self.position != 0 and self.contracts_held > 0
+                and self.had_significant_drawdown and self.ml
+                and self.entry_features and self.entry_time):
+            time_in_trade = (datetime.now(ET) - self.entry_time).total_seconds()
+            if time_in_trade >= BE_EXIT_MIN_TIME:
+                contracts = self.contracts_held
+                if self.position == 1:
+                    current_pnl = (price - self.entry_price) * self.point_value * contracts
+                else:
+                    current_pnl = (self.entry_price - price) * self.point_value * contracts
+                should_be, be_reason = self.ml.should_breakeven_exit(
+                    self.entry_features, current_pnl, self.had_significant_drawdown)
+                if should_be:
+                    direction = "LONG" if self.position == 1 else "SHORT"
+                    now = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now}] [{self.symbol} BE-EXIT] {direction} taking breakeven! "
+                          f"{be_reason} | PnL: ${current_pnl:+.2f}")
+                    if self.ml and self.entry_features:
+                        self.ml.record_trade(self.entry_features, current_pnl,
+                                             source="be_exit",
+                                             entry_action=self.entry_action,
+                                             mae=self.trade_mae, mfe=self.trade_mfe)
+                        self.entry_features = None
+                    await self._flatten(price, reason="BE_EXIT")
+                    send_telegram(self.tg_token, self.tg_chat,
+                                  f"BE-EXIT|{self.symbol} {direction} @ {price:.2f} | "
+                                  f"PnL ${current_pnl:+.0f} | took breakeven")
+
+        # Take profit check (dynamic TP)
         if self.position != 0 and self.contracts_held > 0:
             contracts = self.contracts_held
             if self.position == 1:
                 unrealized = (price - self.entry_price) * self.point_value * contracts
             else:
                 unrealized = (self.entry_price - price) * self.point_value * contracts
-            if unrealized >= self.TP_DOLLARS:
+            if unrealized >= self.current_tp:
                 direction = "LONG" if self.position == 1 else "SHORT"
                 now = datetime.now(ET).strftime("%H:%M:%S")
-                print(f"[{now}] [{self.symbol} TP] ${self.TP_DOLLARS:.0f} target hit! "
+                print(f"[{now}] [{self.symbol} TP] ${self.current_tp:.0f} target hit! "
                       f"{direction} x{contracts} | Unrealized: ${unrealized:.2f}")
                 if self.ml and self.entry_features:
                     self.ml.record_trade(self.entry_features, unrealized, source="tp_hit",
-                                         entry_action=self.entry_action, mae=self.trade_mae)
+                                         entry_action=self.entry_action,
+                                         mae=self.trade_mae, mfe=self.trade_mfe)
                     self.entry_features = None
                 await self._flatten(price, reason="TP_HIT")
                 threading.Thread(target=send_signals, args=(
@@ -1321,7 +1491,8 @@ class SymbolState:
                          * self.point_value * self.contracts_held)
             if self.ml and self.entry_features:
                 self.ml.record_trade(self.entry_features, trade_pnl, source="signal_flip",
-                                     entry_action=self.entry_action, mae=self.trade_mae)
+                                     entry_action=self.entry_action, mae=self.trade_mae,
+                                     mfe=self.trade_mfe)
                 self.entry_features = None
             await self._flatten(price, reason="SIGNAL_FLIP")
             if self.position != 0:
@@ -1426,7 +1597,15 @@ class SymbolState:
                     self.entry_price = price
                     self.entry_time = datetime.now(ET)
                     self.trade_mae = 0.0
+                    self.trade_mfe = 0.0
                     self.early_exit_triggered = False
+                    self.had_significant_drawdown = False
+                    if self.ml and self.entry_features:
+                        self.current_tp, tp_reason = self.ml.get_dynamic_tp(
+                            self.entry_features, self.TP_DOLLARS)
+                        print(f"[{self.symbol}] TP set: ${self.current_tp:.0f} ({tp_reason})")
+                    else:
+                        self.current_tp = self.TP_DOLLARS
                     print(f"[{self.symbol}] Order filled. ID: {response.orderId}")
                     return "ok"
                 print(f"[{self.symbol}] Order REJECTED: {response.errorMessage}")
@@ -1484,7 +1663,15 @@ class SymbolState:
                     self.entry_price = price
                     self.entry_time = datetime.now(ET)
                     self.trade_mae = 0.0
+                    self.trade_mfe = 0.0
                     self.early_exit_triggered = False
+                    self.had_significant_drawdown = False
+                    if self.ml and self.entry_features:
+                        self.current_tp, tp_reason = self.ml.get_dynamic_tp(
+                            self.entry_features, self.TP_DOLLARS)
+                        print(f"[{self.symbol}] TP set: ${self.current_tp:.0f} ({tp_reason})")
+                    else:
+                        self.current_tp = self.TP_DOLLARS
                     print(f"[{self.symbol}] Order filled. ID: {response.orderId}")
                     return "ok"
                 print(f"[{self.symbol}] Order REJECTED: {response.errorMessage}")
@@ -1556,19 +1743,28 @@ class SymbolState:
         if close_ok:
             saved_entry_time = self.entry_time
             saved_mae = self.trade_mae
+            saved_mfe = self.trade_mfe
             self.mae_history.append(saved_mae)
             if len(self.mae_history) > 100:
                 self.mae_history = self.mae_history[-100:]
             avg_mae = sum(self.mae_history) / len(self.mae_history)
             now_t = datetime.now(ET).strftime("%H:%M:%S")
-            print(f"[{now_t}] [{self.symbol} MAE] This trade: ${saved_mae:.2f} | "
-                  f"Avg MAE ({len(self.mae_history)} trades): ${avg_mae:.2f}")
+            print(f"[{now_t}] [{self.symbol} MAE/MFE] MAE: ${saved_mae:.2f} | "
+                  f"MFE: ${saved_mfe:.2f} | Avg MAE: ${avg_mae:.2f}")
+            # Start post-exit tracking to learn if we're leaving money on table
+            self.post_exit_tracking = True
+            self.post_exit_direction = saved_position
+            self.post_exit_price = price
+            self.post_exit_time = time.time()
+            self.post_exit_best = 0.0
+            self.post_exit_features = self.entry_features
             self.live_pnl += trade_pnl
             self.position = 0
             self.contracts_held = 0
             self.entry_price = 0.0
             self.entry_time = None
             self.trade_mae = 0.0
+            self.trade_mfe = 0.0
             self._log_trade(direction, saved_entry_price, price, trade_pnl, reason,
                             saved_entry_time, mae=saved_mae)
         return close_ok
@@ -1936,7 +2132,7 @@ class RenkoBot:
                             st.ml.record_trade(st.entry_features, pnl_est,
                                                source="ws_platform_close",
                                                entry_action=st.entry_action,
-                                               mae=st.trade_mae)
+                                               mae=st.trade_mae, mfe=st.trade_mfe)
                         st.entry_features = None
                         st.live_pnl += pnl_est
                         st._log_trade(direction, st.entry_price, price, pnl_est,
