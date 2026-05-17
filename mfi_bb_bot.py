@@ -282,11 +282,12 @@ import random
 
 class TradeML:
     """Q-learning RL filter. Discretizes market state, learns which
-    states are profitable to enter, wait for pullback, or skip."""
+    states are profitable to enter, wait for pullback, skip, or flip."""
 
     ACTION_ENTER = 0
     ACTION_SKIP = 1
     ACTION_WAIT = 2
+    ACTION_FLIP = 3
 
     def __init__(self, data_file: str):
         self.data_file = data_file
@@ -359,11 +360,11 @@ class TradeML:
 
     def _get_q(self, state_key: str) -> list:
         if state_key not in self.q_table:
-            self.q_table[state_key] = [0.0, 0.0, 0.0]
+            self.q_table[state_key] = [0.0, 0.0, 0.0, 0.0]
         q = self.q_table[state_key]
-        if len(q) < 3:
+        while len(q) < 4:
             q.append(0.0)
-            self.q_table[state_key] = q
+        self.q_table[state_key] = q
         return q
 
     def _load(self):
@@ -442,22 +443,25 @@ class TradeML:
 
     def should_skip(self, features: dict) -> tuple:
         """Returns (action_str, value, reason).
-        action_str: 'enter', 'skip', or 'wait'."""
+        action_str: 'enter', 'skip', 'wait', or 'flip'."""
         if self.total_trades < RL_WARMUP_TRADES:
             return "enter", 0.0, f"RL warmup ({self.total_trades}/{RL_WARMUP_TRADES})"
 
         state = self._state_key(features)
         q_vals = self._get_q(state)
-        q_enter, q_skip, q_wait = q_vals[0], q_vals[1], q_vals[2]
+        q_enter, q_skip, q_wait, q_flip = q_vals[0], q_vals[1], q_vals[2], q_vals[3]
 
         # Epsilon-greedy: explore or exploit
         if random.random() < self.epsilon:
-            action = random.choice([self.ACTION_ENTER, self.ACTION_SKIP, self.ACTION_WAIT])
+            action = random.choice([self.ACTION_ENTER, self.ACTION_SKIP,
+                                    self.ACTION_WAIT, self.ACTION_FLIP])
             choice = "explore"
         else:
-            best = max(q_enter, q_skip, q_wait)
+            best = max(q_enter, q_skip, q_wait, q_flip)
             if best == q_enter:
                 action = self.ACTION_ENTER
+            elif best == q_flip:
+                action = self.ACTION_FLIP
             elif best == q_wait:
                 action = self.ACTION_WAIT
             else:
@@ -465,12 +469,12 @@ class TradeML:
             choice = "exploit"
 
         action_names = {self.ACTION_ENTER: "enter", self.ACTION_SKIP: "skip",
-                        self.ACTION_WAIT: "wait"}
+                        self.ACTION_WAIT: "wait", self.ACTION_FLIP: "flip"}
         action_str = action_names[action]
         regime_tag = "|REGIME" if self.regime_shift else ""
         reason = (f"RL|{state}|Q(now)={q_enter:+.2f} Q(skip)={q_skip:+.2f} "
-                  f"Q(wait)={q_wait:+.2f}|eps={self.epsilon:.2f}|{choice}|"
-                  f"{action_str}{regime_tag}")
+                  f"Q(wait)={q_wait:+.2f} Q(flip)={q_flip:+.2f}|eps={self.epsilon:.2f}|"
+                  f"{choice}|{action_str}{regime_tag}")
         return action_str, 0.0, reason
 
     def _detect_regime_shift(self) -> bool:
@@ -532,7 +536,9 @@ class TradeML:
 
         # Update the Q-value for the action that was taken
         q_vals = self._get_q(state)
-        action_idx = self.ACTION_WAIT if entry_action == "wait" else self.ACTION_ENTER
+        action_map = {"enter": self.ACTION_ENTER, "wait": self.ACTION_WAIT,
+                       "flip": self.ACTION_FLIP}
+        action_idx = action_map.get(entry_action, self.ACTION_ENTER)
         old_q = q_vals[action_idx]
         q_vals[action_idx] = old_q + alpha * (reward - old_q)
 
@@ -541,6 +547,12 @@ class TradeML:
             old_skip_q = q_vals[self.ACTION_SKIP]
             skip_reward = abs(reward) * 0.3
             q_vals[self.ACTION_SKIP] = old_skip_q + alpha * (skip_reward - old_skip_q)
+
+        # If flip entry won, penalize normal enter (and vice versa)
+        if entry_action == "flip" and pnl > 0:
+            q_vals[self.ACTION_ENTER] += alpha * (-abs(reward) * 0.2)
+        elif entry_action == "enter" and pnl > 0:
+            q_vals[self.ACTION_FLIP] += alpha * (-abs(reward) * 0.1)
 
         # If wait entry got better PnL than avg, boost Q(wait) extra
         if entry_action == "wait" and pnl > 0:
@@ -580,7 +592,7 @@ class TradeML:
         wins = sum(1 for t in self.trades if t["win"] == 1)
         total = len(self.trades)
         print(f"[RL] Trade recorded: PnL=${pnl:.2f} | {entry_action} | state={state} | "
-              f"Q(now)={q_vals[0]:+.3f} Q(skip)={q_vals[1]:+.3f} Q(wait)={q_vals[2]:+.3f} | "
+              f"Q(now)={q_vals[0]:+.3f} Q(skip)={q_vals[1]:+.3f} Q(wait)={q_vals[2]:+.3f} Q(flip)={q_vals[3]:+.3f} | "
               f"alpha={alpha:.2f} | eps={self.epsilon:.3f} | {total} trades, "
               f"{wins} wins ({100 * wins / total:.0f}%){regime_tag}")
 
@@ -1519,6 +1531,19 @@ class SymbolState:
                 print(f"[{now}] [{self.symbol} RL-SKIP] {direction} skipped | {reason}")
                 send_telegram(self.tg_token, self.tg_chat,
                               f"RL-SKIP|{self.symbol} {direction} @ {price:.2f} | {reason}")
+                return
+            if action_str == "flip":
+                # RL thinks opposite direction is better
+                flipped = "SHORT" if direction == "LONG" else "LONG"
+                print(f"[{now}] [{self.symbol} RL-FLIP] {direction} -> {flipped} | {reason}")
+                send_telegram(self.tg_token, self.tg_chat,
+                              f"RL-FLIP|{self.symbol} {direction}->{flipped} @ {price:.2f}")
+                self.entry_features = features
+                self.entry_action = "flip"
+                if flipped == "LONG":
+                    await self._enter_long(price)
+                else:
+                    await self._enter_short(price)
                 return
             if action_str == "wait":
                 # Set pending pullback entry (adaptive from MAE)
