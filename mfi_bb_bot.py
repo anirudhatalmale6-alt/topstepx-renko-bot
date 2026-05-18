@@ -202,6 +202,7 @@ VORTEX_GAP_THRESHOLD = 0.50
 EARLY_EXIT_MULTIPLIER = 1.5   # exit if current MAE > avg winning MAE * this
 EARLY_EXIT_MIN_SAMPLES = 3    # need this many winning trades per state to activate
 EARLY_EXIT_COOLDOWN = 60      # seconds after entry before early exit can trigger
+MAX_LOSS_DOLLARS = 400.0      # hard ceiling: flatten if unrealized loss exceeds this
 
 # Dynamic TP: learn optimal take-profit per state from post-exit price movement
 TP_DEFAULT_DOLLARS = 200.0    # starting TP target
@@ -1423,6 +1424,28 @@ class SymbolState:
                     send_telegram(self.tg_token, self.tg_chat,
                                   f"EARLY-EXIT|{self.symbol} {direction} cut @ {price:.2f} | "
                                   f"PnL ${trade_pnl:+.0f} | pattern failed")
+
+        # Hard max stop loss: absolute ceiling to prevent catastrophic losses
+        if self.position != 0 and self.contracts_held > 0:
+            contracts = self.contracts_held
+            if self.position == 1:
+                unrealized = (price - self.entry_price) * self.point_value * contracts
+            else:
+                unrealized = (self.entry_price - price) * self.point_value * contracts
+            if unrealized <= -MAX_LOSS_DOLLARS:
+                direction = "LONG" if self.position == 1 else "SHORT"
+                now = datetime.now(ET).strftime("%H:%M:%S")
+                print(f"[{now}] [{self.symbol} MAX-SL] {direction} hit ${MAX_LOSS_DOLLARS:.0f} "
+                      f"max loss! Unrealized: ${unrealized:.2f}")
+                if self.ml and self.entry_features:
+                    self.ml.record_trade(self.entry_features, unrealized, source="max_sl",
+                                         entry_action=self.entry_action,
+                                         mae=self.trade_mae, mfe=self.trade_mfe)
+                    self.entry_features = None
+                await self._flatten(price, reason="MAX_SL")
+                send_telegram(self.tg_token, self.tg_chat,
+                              f"MAX-SL|{self.symbol} {direction} cut @ {price:.2f} | "
+                              f"${unrealized:+.0f} hit max loss ceiling")
 
         # Breakeven exit: if trade dipped and recovered but state says unlikely to hit TP
         if (self.position != 0 and self.contracts_held > 0
