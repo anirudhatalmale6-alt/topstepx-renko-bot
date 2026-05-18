@@ -379,7 +379,19 @@ class TradeML:
         else:
             tick_zone = "slow"
 
-        return f"{direction}|{mfi_zone}|{vel_zone}|{gap_zone}|{time_zone}|{vol_zone}|{streak}|{vwap_zone}|{tick_zone}"
+        dm = features.get("delta_momentum", 0.0)
+        if dm >= 10.0:
+            delta_zone = "strong_buyers"
+        elif dm >= 3.0:
+            delta_zone = "buyers"
+        elif dm <= -10.0:
+            delta_zone = "strong_sellers"
+        elif dm <= -3.0:
+            delta_zone = "sellers"
+        else:
+            delta_zone = "neutral"
+
+        return f"{direction}|{mfi_zone}|{vel_zone}|{gap_zone}|{time_zone}|{vol_zone}|{streak}|{vwap_zone}|{tick_zone}|{delta_zone}"
 
     def _get_q(self, state_key: str) -> list:
         if state_key not in self.q_table:
@@ -443,7 +455,8 @@ class TradeML:
     def extract_features(self, direction: int, mfi_value, mfi_velocity,
                          price: float, ema, rsg, brick_size: float,
                          brick_closes: list, vortex_gap: float = 0.0,
-                         vwap: float = None, tick_rate: float = 0.0) -> dict:
+                         vwap: float = None, tick_rate: float = 0.0,
+                         cum_delta: int = 0, delta_momentum: float = 0.0) -> dict:
         mfi_v = float(mfi_value) if mfi_value is not None else 50.0
         mfi_vel = float(mfi_velocity) if mfi_velocity is not None else 0.0
         ema_distance = ((price - ema) / brick_size) if (ema is not None and brick_size > 0) else 0.0
@@ -467,6 +480,8 @@ class TradeML:
             "vortex_gap": round(vortex_gap, 4),
             "vwap_distance": round(vwap_dist, 4),
             "tick_rate": round(float(tick_rate), 2),
+            "cum_delta": int(cum_delta),
+            "delta_momentum": round(float(delta_momentum), 2),
         }
 
     def should_skip(self, features: dict) -> tuple:
@@ -762,6 +777,11 @@ class SymbolState:
         self.tick_count_this_brick = 0
         self.ticks_per_second = 0.0
         self.tick_window = []       # (timestamp, count) pairs for rate calc
+
+        # Delta (uptick/downtick) tracking
+        self.cum_delta = 0           # cumulative upticks minus downticks
+        self.delta_window = []       # (timestamp, +1/-1) for short-term momentum
+        self.delta_session_date = None
 
         # MFI state
         self.mfi_value = None
@@ -1299,6 +1319,10 @@ class SymbolState:
 
         # Price-change tracking for frozen-feed detection
         if self.last_known_price is None or price != self.last_known_price:
+            if self.last_known_price is not None:
+                tick_dir = 1 if price > self.last_known_price else -1
+                self.cum_delta += tick_dir
+                self.delta_window.append((time.time(), tick_dir))
             self.last_known_price = price
             self.last_price_change_time = time.time()
             self.tick_count_this_brick += 1
@@ -1315,13 +1339,21 @@ class SymbolState:
             span = self.tick_window[-1][0] - self.tick_window[0][0]
             self.ticks_per_second = len(self.tick_window) / max(span, 0.1)
 
-        # Session VWAP: reset on new trading day
+        # Delta momentum: trim to 30s window
+        delta_cutoff = now_ts - 30.0
+        self.delta_window = [(t, d) for t, d in self.delta_window if t >= delta_cutoff]
+
+        # Session resets: VWAP and delta on new trading day
         today = datetime.now(ET).date()
         if self.vwap_session_date != today:
             self.vwap_cum_pv = 0.0
             self.vwap_cum_vol = 0
             self.vwap = None
             self.vwap_session_date = today
+        if self.delta_session_date != today:
+            self.cum_delta = 0
+            self.delta_window = []
+            self.delta_session_date = today
 
         # Check pending pullback entry
         if self.pending_direction is not None and self.position == 0:
@@ -1623,6 +1655,7 @@ class SymbolState:
 
         # Build RL features and ask filter
         mfi_velocity = (self.mfi_value - self.prev_mfi_value) if self.prev_mfi_value is not None else 0.0
+        delta_mom = sum(d for _, d in self.delta_window) if self.delta_window else 0.0
         features = self.ml.extract_features(
             direction=1 if direction == "LONG" else -1,
             mfi_value=self.mfi_value,
@@ -1635,6 +1668,8 @@ class SymbolState:
             vortex_gap=vortex_gap,
             vwap=self.vwap,
             tick_rate=self.ticks_per_second,
+            cum_delta=self.cum_delta,
+            delta_momentum=delta_mom,
         ) if self.ml else None
 
         if features and self.ml:
