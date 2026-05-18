@@ -201,8 +201,10 @@ VORTEX_GAP_THRESHOLD = 0.50
 # Smart early exit: cut losses when trade MAE exceeds what winners typically see
 EARLY_EXIT_MULTIPLIER = 1.5   # exit if current MAE > avg winning MAE * this
 EARLY_EXIT_MIN_SAMPLES = 3    # need this many winning trades per state to activate
-EARLY_EXIT_COOLDOWN = 60      # seconds after entry before early exit can trigger
-MAX_LOSS_DOLLARS = 400.0      # hard ceiling: flatten if unrealized loss exceeds this
+EARLY_EXIT_COOLDOWN = 15      # seconds after entry before early exit can trigger
+MAX_LOSS_DOLLARS = 200.0      # hard ceiling: flatten if unrealized loss exceeds this
+QUICK_EXIT_DOLLARS = 100.0    # if this much red within QUICK_EXIT_SECS, exit immediately
+QUICK_EXIT_SECS = 30          # window for quick exit check
 
 # Dynamic TP: learn optimal take-profit per state from post-exit price movement
 TP_DEFAULT_DOLLARS = 200.0    # starting TP target
@@ -357,7 +359,27 @@ class TradeML:
         else:
             streak = "mixed"
 
-        return f"{direction}|{mfi_zone}|{vel_zone}|{gap_zone}|{time_zone}|{vol_zone}|{streak}"
+        vwap_dist = features.get("vwap_distance", 0.0)
+        if vwap_dist > 3.0:
+            vwap_zone = "far_above"
+        elif vwap_dist > 1.0:
+            vwap_zone = "above"
+        elif vwap_dist < -3.0:
+            vwap_zone = "far_below"
+        elif vwap_dist < -1.0:
+            vwap_zone = "below"
+        else:
+            vwap_zone = "at_vwap"
+
+        tr = features.get("tick_rate", 0.0)
+        if tr >= 20.0:
+            tick_zone = "fast"
+        elif tr >= 8.0:
+            tick_zone = "normal"
+        else:
+            tick_zone = "slow"
+
+        return f"{direction}|{mfi_zone}|{vel_zone}|{gap_zone}|{time_zone}|{vol_zone}|{streak}|{vwap_zone}|{tick_zone}"
 
     def _get_q(self, state_key: str) -> list:
         if state_key not in self.q_table:
@@ -420,7 +442,8 @@ class TradeML:
 
     def extract_features(self, direction: int, mfi_value, mfi_velocity,
                          price: float, ema, rsg, brick_size: float,
-                         brick_closes: list, vortex_gap: float = 0.0) -> dict:
+                         brick_closes: list, vortex_gap: float = 0.0,
+                         vwap: float = None, tick_rate: float = 0.0) -> dict:
         mfi_v = float(mfi_value) if mfi_value is not None else 50.0
         mfi_vel = float(mfi_velocity) if mfi_velocity is not None else 0.0
         ema_distance = ((price - ema) / brick_size) if (ema is not None and brick_size > 0) else 0.0
@@ -431,6 +454,8 @@ class TradeML:
         if len(brick_closes) >= 10:
             vol = float(np.std(brick_closes[-10:])) / brick_size if brick_size > 0 else 0.0
 
+        vwap_dist = ((price - vwap) / brick_size) if (vwap is not None and brick_size > 0) else 0.0
+
         return {
             "direction": direction,
             "mfi_value": round(mfi_v, 2),
@@ -440,6 +465,8 @@ class TradeML:
             "hour": hour,
             "volatility": round(vol, 4),
             "vortex_gap": round(vortex_gap, 4),
+            "vwap_distance": round(vwap_dist, 4),
+            "tick_rate": round(float(tick_rate), 2),
         }
 
     def should_skip(self, features: dict) -> tuple:
@@ -725,6 +752,17 @@ class SymbolState:
         self.rsg_dosc_values = []
         self.renko_sma = None  # R.sg SMA over last RENKO_SMA_PERIOD values
 
+        # Session VWAP (resets daily, uses tick count as volume proxy)
+        self.vwap_cum_pv = 0.0    # cumulative (price * tick_count)
+        self.vwap_cum_vol = 0      # cumulative tick count
+        self.vwap = None
+        self.vwap_session_date = None
+
+        # Tick counting for volume proxy
+        self.tick_count_this_brick = 0
+        self.ticks_per_second = 0.0
+        self.tick_window = []       # (timestamp, count) pairs for rate calc
+
         # MFI state
         self.mfi_value = None
         self.prev_mfi_value = None
@@ -918,10 +956,18 @@ class SymbolState:
         _calc_indicators() called immediately after."""
         self.brick_closes.append(brick_close)
         self.brick_opens.append(brick_open)
-        self.brick_volumes.append(1)
+        vol = max(self.tick_count_this_brick, 1)
+        self.brick_volumes.append(vol)
+        self.tick_count_this_brick = 0
         h = max(brick_open, brick_close)
         l = min(brick_open, brick_close)
-        self.brick_typicals.append((h + l + brick_close) / 3.0)
+        typical = (h + l + brick_close) / 3.0
+        self.brick_typicals.append(typical)
+        # Update session VWAP
+        self.vwap_cum_pv += typical * vol
+        self.vwap_cum_vol += vol
+        if self.vwap_cum_vol > 0:
+            self.vwap = self.vwap_cum_pv / self.vwap_cum_vol
         self._update_rsg(brick_open, brick_close)
         if len(self.brick_closes) > self._MAX_BRICK_HISTORY:
             excess = len(self.brick_closes) - self._MAX_BRICK_HISTORY
@@ -1255,10 +1301,27 @@ class SymbolState:
         if self.last_known_price is None or price != self.last_known_price:
             self.last_known_price = price
             self.last_price_change_time = time.time()
+            self.tick_count_this_brick += 1
         self.last_price = price
 
         now_ts = time.time()
         now = datetime.now(ET).strftime("%H:%M:%S")
+
+        # Tick rate: track ticks per second over a rolling 10s window
+        self.tick_window.append((now_ts, 1))
+        cutoff = now_ts - 10.0
+        self.tick_window = [(t, c) for t, c in self.tick_window if t >= cutoff]
+        if len(self.tick_window) > 1:
+            span = self.tick_window[-1][0] - self.tick_window[0][0]
+            self.ticks_per_second = len(self.tick_window) / max(span, 0.1)
+
+        # Session VWAP: reset on new trading day
+        today = datetime.now(ET).date()
+        if self.vwap_session_date != today:
+            self.vwap_cum_pv = 0.0
+            self.vwap_cum_vol = 0
+            self.vwap = None
+            self.vwap_session_date = today
 
         # Check pending pullback entry
         if self.pending_direction is not None and self.position == 0:
@@ -1396,6 +1459,30 @@ class SymbolState:
                     self.had_significant_drawdown = True
             if unrealized > self.trade_mfe:
                 self.trade_mfe = unrealized
+
+        # Quick exit: if trade is significantly red within first 30 seconds, cut it
+        if (self.position != 0 and self.contracts_held > 0 and self.entry_time):
+            time_in_trade = (datetime.now(ET) - self.entry_time).total_seconds()
+            if time_in_trade <= QUICK_EXIT_SECS:
+                contracts = self.contracts_held
+                if self.position == 1:
+                    unrealized = (price - self.entry_price) * self.point_value * contracts
+                else:
+                    unrealized = (self.entry_price - price) * self.point_value * contracts
+                if unrealized <= -QUICK_EXIT_DOLLARS:
+                    direction = "LONG" if self.position == 1 else "SHORT"
+                    now = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now}] [{self.symbol} QUICK-EXIT] {direction} -${abs(unrealized):.0f} "
+                          f"in {time_in_trade:.0f}s — clean trades don't do this")
+                    if self.ml and self.entry_features:
+                        self.ml.record_trade(self.entry_features, unrealized, source="quick_exit",
+                                             entry_action=self.entry_action,
+                                             mae=self.trade_mae, mfe=self.trade_mfe)
+                        self.entry_features = None
+                    await self._flatten(price, reason="QUICK_EXIT")
+                    send_telegram(self.tg_token, self.tg_chat,
+                                  f"QUICK-EXIT|{self.symbol} {direction} @ {price:.2f} | "
+                                  f"${unrealized:+.0f} in {time_in_trade:.0f}s")
 
         # Smart early exit: cut trade if MAE exceeds what winners typically see
         if (self.position != 0 and self.contracts_held > 0
@@ -1546,6 +1633,8 @@ class SymbolState:
             brick_size=self.brick_size,
             brick_closes=self.brick_closes,
             vortex_gap=vortex_gap,
+            vwap=self.vwap,
+            tick_rate=self.ticks_per_second,
         ) if self.ml else None
 
         if features and self.ml:
