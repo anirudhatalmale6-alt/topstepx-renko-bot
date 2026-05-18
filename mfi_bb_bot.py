@@ -6,8 +6,8 @@ Multi-symbol support: runs multiple instruments on one connection.
 Strategy: MFI + Vortex Indicator gap on Renko bricks
 - MFI(14) on Renko bricks (volume = 1 per brick)
 - Vortex Indicator(14) on Renko bricks (VI+ and VI-)
-- LONG:  MFI oversold + VI- >> VI+ (bearish exhaustion) → enter immediately
-- SHORT: MFI overbought + VI+ >> VI- (bullish exhaustion) → enter immediately
+- LONG:  MFI oversold + VI- >> VI+ (bounce expected) → enter immediately
+- SHORT: MFI overbought + VI+ >> VI- (pullback expected) → enter immediately
 - If Vortex gap too small → skip (weak signal)
 - EARLY EXIT: RL tracks MAE per state, cuts trade if drawdown exceeds winner profile
 - EXIT: opposite MFI signal flips the position, TP hit, or early exit.
@@ -1329,35 +1329,35 @@ class SymbolState:
                 if self.mfi_value is None:
                     continue
 
-                # MFI dot + Vortex gap = immediate entry (FLIPPED: oversold=SHORT, overbought=LONG)
+                # MFI dot + Vortex gap = immediate entry (NORMAL: oversold=LONG, overbought=SHORT)
                 if self.mfi_oversold_dot:
                     self.mfi_oversold_dot = False
                     if self.vi_plus is not None and self.vi_minus is not None:
                         gap = self.vi_minus - self.vi_plus
                         if gap >= VORTEX_GAP_THRESHOLD:
-                            print(f"[{now}] [{self.symbol} ENTRY] SHORT: MFI oversold ({self.mfi_value:.1f}) "
+                            print(f"[{now}] [{self.symbol} ENTRY] LONG: MFI oversold ({self.mfi_value:.1f}) "
                                   f"+ Vortex gap {gap:.4f} >= {VORTEX_GAP_THRESHOLD} "
-                                  f"(VI+={self.vi_plus:.4f} VI-={self.vi_minus:.4f}) [FLIPPED]")
-                            await self._handle_signal("SHORT", price, now, vortex_gap=gap)
+                                  f"(VI+={self.vi_plus:.4f} VI-={self.vi_minus:.4f})")
+                            await self._handle_signal("LONG", price, now, vortex_gap=gap)
                         else:
-                            print(f"[{now}] [{self.symbol} SKIP] SHORT: MFI oversold but "
+                            print(f"[{now}] [{self.symbol} SKIP] LONG: MFI oversold but "
                                   f"Vortex gap {gap:.4f} < {VORTEX_GAP_THRESHOLD}")
                     else:
-                        print(f"[{now}] [{self.symbol} SKIP] SHORT: MFI oversold but Vortex warming")
+                        print(f"[{now}] [{self.symbol} SKIP] LONG: MFI oversold but Vortex warming")
                 elif self.mfi_overbought_dot:
                     self.mfi_overbought_dot = False
                     if self.vi_plus is not None and self.vi_minus is not None:
                         gap = self.vi_plus - self.vi_minus
                         if gap >= VORTEX_GAP_THRESHOLD:
-                            print(f"[{now}] [{self.symbol} ENTRY] LONG: MFI overbought ({self.mfi_value:.1f}) "
+                            print(f"[{now}] [{self.symbol} ENTRY] SHORT: MFI overbought ({self.mfi_value:.1f}) "
                                   f"+ Vortex gap {gap:.4f} >= {VORTEX_GAP_THRESHOLD} "
-                                  f"(VI+={self.vi_plus:.4f} VI-={self.vi_minus:.4f}) [FLIPPED]")
-                            await self._handle_signal("LONG", price, now, vortex_gap=gap)
+                                  f"(VI+={self.vi_plus:.4f} VI-={self.vi_minus:.4f})")
+                            await self._handle_signal("SHORT", price, now, vortex_gap=gap)
                         else:
-                            print(f"[{now}] [{self.symbol} SKIP] LONG: MFI overbought but "
+                            print(f"[{now}] [{self.symbol} SKIP] SHORT: MFI overbought but "
                                   f"Vortex gap {gap:.4f} < {VORTEX_GAP_THRESHOLD}")
                     else:
-                        print(f"[{now}] [{self.symbol} SKIP] LONG: MFI overbought but Vortex warming")
+                        print(f"[{now}] [{self.symbol} SKIP] SHORT: MFI overbought but Vortex warming")
 
         # Post-exit tracking: watch price after closing to learn optimal TP
         if self.post_exit_tracking:
