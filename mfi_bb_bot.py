@@ -184,8 +184,8 @@ ET = pytz.timezone("America/New_York")
 
 # NQ futures schedule: Sun 18:00 ET -> Fri 17:00 ET (overnight session continuous).
 # This is intentionally NOT 24/7 because futures have weekly maintenance windows.
-SESSION_START = dtime(18, 0, 0)   # 6:00 PM ET start
-SESSION_END = dtime(15, 30, 0)    # 3:30 PM ET end
+SESSION_START = dtime(18, 30, 0)  # 6:30 PM ET start
+SESSION_END = dtime(16, 0, 0)    # 4:00 PM ET end
 TRADING_DAYS = [0, 1, 2, 3, 4, 6]  # Mon-Fri (0-4) + Sun (6). Saturday excluded.
 # CME daily settlement halt: 4:15-4:30 PM ET (with buffer)
 BLACKOUT_START = dtime(16, 10, 0)
