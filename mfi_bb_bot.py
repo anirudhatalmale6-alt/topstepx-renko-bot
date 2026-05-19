@@ -1222,6 +1222,38 @@ class SymbolState:
             return None
         return 0
 
+    async def _check_platform_hard_stop(self):
+        """Query actual position from platform and exit if real loss exceeds MAX_LOSS.
+        This catches cases where the bot's internal price tracking drifts from reality
+        (crashes, slippage, reconnections)."""
+        if self.position == 0 or self.ctx is None:
+            return
+        now_ts = time.time()
+        if now_ts - self.last_position_poll_time < 3.0:
+            return
+        try:
+            positions = await asyncio.wait_for(
+                self.ctx.positions.get_all_positions(), timeout=4.0)
+            if not positions:
+                return
+            cid = self.ctx.instrument_info.id
+            for p in positions:
+                p_cid = getattr(p, "contract_id", None) or getattr(p, "contractId", None)
+                if p_cid == cid:
+                    price = self.last_price or 0.0
+                    if price <= 0:
+                        return
+                    real_pnl = p.unrealized_pnl(price, self.point_value)
+                    if real_pnl <= -MAX_LOSS_DOLLARS:
+                        direction = "LONG" if self.position == 1 else "SHORT"
+                        now = datetime.now(ET).strftime("%H:%M:%S")
+                        print(f"[{now}] [{self.symbol} PLATFORM-SL] {direction} real loss ${real_pnl:.2f} "
+                              f"(entry {p.averagePrice:.2f}, now {price:.2f}) — emergency exit")
+                        await self._flatten(price, reason="PLATFORM_HARD_SL")
+                    return
+        except Exception:
+            pass
+
     async def reconcile_position_with_platform(self):
         """Periodic safety check. Reconciles bot state with platform reality.
 
@@ -2630,6 +2662,7 @@ class RenkoBot:
             try:
                 await st.tick(cached_price=cached_prices.get(sym))
                 if st.position != 0:
+                    await st._check_platform_hard_stop()
                     await st.reconcile_position_with_platform()
             except Exception as e:
                 print(f"[WARN] {st.symbol} tick raised: {e}")
