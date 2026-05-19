@@ -360,39 +360,7 @@ class TradeML:
         else:
             streak = "mixed"
 
-        vwap_dist = features.get("vwap_distance", 0.0)
-        if vwap_dist > 3.0:
-            vwap_zone = "far_above"
-        elif vwap_dist > 1.0:
-            vwap_zone = "above"
-        elif vwap_dist < -3.0:
-            vwap_zone = "far_below"
-        elif vwap_dist < -1.0:
-            vwap_zone = "below"
-        else:
-            vwap_zone = "at_vwap"
-
-        tr = features.get("tick_rate", 0.0)
-        if tr >= 20.0:
-            tick_zone = "fast"
-        elif tr >= 8.0:
-            tick_zone = "normal"
-        else:
-            tick_zone = "slow"
-
-        dm = features.get("delta_momentum", 0.0)
-        if dm >= 10.0:
-            delta_zone = "strong_buyers"
-        elif dm >= 3.0:
-            delta_zone = "buyers"
-        elif dm <= -10.0:
-            delta_zone = "strong_sellers"
-        elif dm <= -3.0:
-            delta_zone = "sellers"
-        else:
-            delta_zone = "neutral"
-
-        return f"{direction}|{mfi_zone}|{vel_zone}|{gap_zone}|{time_zone}|{vol_zone}|{streak}|{vwap_zone}|{tick_zone}|{delta_zone}"
+        return f"{direction}|{mfi_zone}|{vel_zone}|{gap_zone}|{time_zone}|{vol_zone}|{streak}"
 
     def _get_q(self, state_key: str) -> list:
         if state_key not in self.q_table:
@@ -455,9 +423,7 @@ class TradeML:
 
     def extract_features(self, direction: int, mfi_value, mfi_velocity,
                          price: float, ema, rsg, brick_size: float,
-                         brick_closes: list, vortex_gap: float = 0.0,
-                         vwap: float = None, tick_rate: float = 0.0,
-                         cum_delta: int = 0, delta_momentum: float = 0.0) -> dict:
+                         brick_closes: list, vortex_gap: float = 0.0) -> dict:
         mfi_v = float(mfi_value) if mfi_value is not None else 50.0
         mfi_vel = float(mfi_velocity) if mfi_velocity is not None else 0.0
         ema_distance = ((price - ema) / brick_size) if (ema is not None and brick_size > 0) else 0.0
@@ -468,8 +434,6 @@ class TradeML:
         if len(brick_closes) >= 10:
             vol = float(np.std(brick_closes[-10:])) / brick_size if brick_size > 0 else 0.0
 
-        vwap_dist = ((price - vwap) / brick_size) if (vwap is not None and brick_size > 0) else 0.0
-
         return {
             "direction": direction,
             "mfi_value": round(mfi_v, 2),
@@ -479,10 +443,6 @@ class TradeML:
             "hour": hour,
             "volatility": round(vol, 4),
             "vortex_gap": round(vortex_gap, 4),
-            "vwap_distance": round(vwap_dist, 4),
-            "tick_rate": round(float(tick_rate), 2),
-            "cum_delta": int(cum_delta),
-            "delta_momentum": round(float(delta_momentum), 2),
         }
 
     def should_skip(self, features: dict) -> tuple:
@@ -1688,7 +1648,6 @@ class SymbolState:
 
         # Build RL features and ask filter
         mfi_velocity = (self.mfi_value - self.prev_mfi_value) if self.prev_mfi_value is not None else 0.0
-        delta_mom = sum(d for _, d in self.delta_window) if self.delta_window else 0.0
         features = self.ml.extract_features(
             direction=1 if direction == "LONG" else -1,
             mfi_value=self.mfi_value,
@@ -1699,10 +1658,6 @@ class SymbolState:
             brick_size=self.brick_size,
             brick_closes=self.brick_closes,
             vortex_gap=vortex_gap,
-            vwap=self.vwap,
-            tick_rate=self.ticks_per_second,
-            cum_delta=self.cum_delta,
-            delta_momentum=delta_mom,
         ) if self.ml else None
 
         if features and self.ml:
