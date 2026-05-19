@@ -2151,6 +2151,8 @@ class RenkoBot:
         except Exception:
             pass
 
+        await self._auto_detect_practice_account(symbols)
+
         restored = self.load_all_state()
 
         for sym, st in self.states.items():
@@ -2406,6 +2408,63 @@ class RenkoBot:
             print(f"[BOT] WARNING: no WS handlers registered — relying on HTTP poll only")
 
     # ----------------------------------------------------------------
+    # Auto-detect practice account (handles liquidation resets)
+    # ----------------------------------------------------------------
+
+    async def _auto_detect_practice_account(self, symbols):
+        """If configured account is a practice account that got liquidated,
+        auto-detect the newest practice account and reconnect."""
+        configured = os.environ.get("PROJECT_X_ACCOUNT_NAME", "")
+        if "PRAC" not in configured.upper():
+            return
+        try:
+            acct = self.suite.client.account_info
+            if acct and acct.canTrade:
+                return
+        except Exception:
+            pass
+
+        print("[BOT] Practice account cannot trade (likely liquidated) — scanning for replacement...")
+        try:
+            from project_x_py import TradingSuite
+            accounts = await asyncio.wait_for(
+                self.suite.client.list_accounts(), timeout=10.0)
+            practice_accts = [a for a in accounts if "PRAC" in a.name.upper()
+                              and a.canTrade and a.isVisible]
+            if not practice_accts:
+                print("[BOT] No active practice accounts found")
+                return
+
+            practice_accts.sort(key=lambda a: a.id, reverse=True)
+            new_acct = practice_accts[0]
+            if new_acct.name == configured:
+                print(f"[BOT] Same account {configured} — no change needed")
+                return
+
+            print(f"[BOT] Switching: {configured} -> {new_acct.name} (id={new_acct.id})")
+            os.environ["PROJECT_X_ACCOUNT_NAME"] = new_acct.name
+            send_telegram(self.tg_token, self.tg_chat,
+                          f"ACCOUNT|Auto-switched to {new_acct.name} (old was liquidated)")
+
+            try:
+                await asyncio.wait_for(self.suite.disconnect(), timeout=10.0)
+            except Exception:
+                pass
+
+            self.suite = await asyncio.wait_for(
+                TradingSuite.create(
+                    instruments=symbols,
+                    timeframes=["1sec", "15min"],
+                    initial_days=1,
+                ), timeout=60.0)
+            self._register_websocket_handlers()
+            for sym, st in self.states.items():
+                st.ctx = self.suite[sym]
+            print(f"[BOT] Reconnected with account {new_acct.name}")
+        except Exception as e:
+            print(f"[BOT] Auto-detect failed: {e}")
+
+    # ----------------------------------------------------------------
     # Reconnect with exponential backoff
     # ----------------------------------------------------------------
 
@@ -2454,6 +2513,8 @@ class RenkoBot:
             now = datetime.now(ET).strftime("%H:%M:%S")
             print(f"[{now}] [RECONNECT] WebSocket restored")
             send_telegram(self.tg_token, self.tg_chat, f"STATUS|RECONNECTED ({now} ET)")
+
+            await self._auto_detect_practice_account(symbols)
 
             # Keep position open through reconnects — no safety flatten.
             # Bot preserves all indicator/BB state so it can detect
