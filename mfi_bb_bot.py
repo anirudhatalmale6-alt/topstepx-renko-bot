@@ -1357,7 +1357,7 @@ class SymbolState:
             self.delta_session_date = today
 
         # Check pending pullback entry
-        if self.pending_direction is not None and self.position == 0 and self.live_pnl > -DAILY_LOSS_LIMIT:
+        if self.pending_direction is not None and self.position == 0:
             elapsed = now_ts - self.pending_time
             if elapsed > PULLBACK_TIMEOUT:
                 # Timeout — cancel pending and enter at market (don't miss the move)
@@ -1624,11 +1624,6 @@ class SymbolState:
 
     async def _handle_signal(self, direction: str, price: float, now: str, vortex_gap: float = 0.0):
         """Fire entry/flip logic for a confirmed MFI+brick signal."""
-        if self.live_pnl <= -DAILY_LOSS_LIMIT:
-            print(f"[{now}] [{self.symbol} DAILY-LIMIT] {direction} blocked: "
-                  f"session PnL ${self.live_pnl:.2f} exceeds -${DAILY_LOSS_LIMIT:.0f} limit")
-            return
-
         # R.sg distance filter (optional)
         if self.use_rsg_filter and self.renko_sma is not None:
             last_bc = self.brick_closes[-1] if self.brick_closes else price
