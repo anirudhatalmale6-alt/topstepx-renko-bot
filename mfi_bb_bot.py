@@ -1723,6 +1723,23 @@ class SymbolState:
     # Order placement (shielded against task cancellation)
     # ----------------------------------------------------------------
 
+    async def _get_fill_price(self) -> float | None:
+        """Query platform for actual average fill price after order execution."""
+        try:
+            await asyncio.sleep(0.3)
+            positions = await asyncio.wait_for(
+                self.ctx.positions.get_all_positions(), timeout=4.0)
+            if not positions:
+                return None
+            cid = self.ctx.instrument_info.id
+            for p in positions:
+                p_cid = getattr(p, "contract_id", None) or getattr(p, "contractId", None)
+                if p_cid == cid:
+                    return p.averagePrice
+        except Exception as e:
+            print(f"[{self.symbol}] fill price query failed: {e}")
+        return None
+
     async def _ensure_flat_before_entry(self):
         """Defensive close — runs before an entry to clear any orphan position
         the bot may not know about. Cheap if already flat."""
@@ -1798,9 +1815,14 @@ class SymbolState:
         self.last_order_error = result if result != "ok" else None
 
         if result == "ok":
+            fill = await self._get_fill_price()
+            if fill and fill != price:
+                slip = (fill - price) * self.point_value
+                print(f"[{self.symbol}] FILL PRICE: {fill:.2f} (signal was {price:.2f}, slip: ${slip:+.2f})")
+                self.entry_price = fill
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
-                "LONG", self.symbol, price, self.contracts_held),
+                "LONG", self.symbol, self.entry_price, self.contracts_held),
                 kwargs={"ntfy_topic": self.ntfy_topic,
                         "tp_webhooks": self.tp_webhooks}, daemon=True).start()
             return True
@@ -1864,9 +1886,14 @@ class SymbolState:
         self.last_order_error = result if result != "ok" else None
 
         if result == "ok":
+            fill = await self._get_fill_price()
+            if fill and fill != price:
+                slip = (price - fill) * self.point_value
+                print(f"[{self.symbol}] FILL PRICE: {fill:.2f} (signal was {price:.2f}, slip: ${slip:+.2f})")
+                self.entry_price = fill
             threading.Thread(target=send_signals, args=(
                 self.tg_token, self.tg_chat, self.tg_keys,
-                "SHORT", self.symbol, price, self.contracts_held),
+                "SHORT", self.symbol, self.entry_price, self.contracts_held),
                 kwargs={"ntfy_topic": self.ntfy_topic,
                         "tp_webhooks": self.tp_webhooks}, daemon=True).start()
             return True
@@ -2160,30 +2187,73 @@ class RenkoBot:
         for sym, st in self.states.items():
             if st.ctx is None:
                 continue
-            real_pos = await st._query_platform_position()
-            if real_pos is None:
-                print(f"  [{sym}] Could not query platform position on startup")
+            # Get full position details (not just signed_size) for averagePrice
+            orphan_avg_price = None
+            try:
+                positions = await asyncio.wait_for(
+                    st.ctx.positions.get_all_positions(), timeout=4.0)
+                cid = st.ctx.instrument_info.id
+                real_pos = 0
+                if positions:
+                    for p in positions:
+                        p_cid = getattr(p, "contract_id", None) or getattr(p, "contractId", None)
+                        if p_cid == cid:
+                            real_pos = p.signed_size
+                            orphan_avg_price = p.averagePrice
+                            break
+            except Exception as e:
+                print(f"  [{sym}] startup position query failed: {e}")
                 continue
+
             if real_pos == 0 and st.position != 0:
-                print(f"  [{sym}] Bot thought {st.position}, platform flat — resetting state")
+                direction = "LONG" if st.position == 1 else "SHORT"
+                cur_price = st.last_price or 0.0
+                orphan_pnl = 0.0
+                if st.entry_price and cur_price:
+                    orphan_pnl = (cur_price - st.entry_price) * st.position * st.point_value * max(st.contracts_held, 1)
+                print(f"  [{sym}] ORPHAN CLOSED: bot had {direction}, platform flat. "
+                      f"Est orphan loss: ${orphan_pnl:+.2f} (entry {st.entry_price:.2f})")
+                st.live_pnl += orphan_pnl
+                st._log_trade(direction, st.entry_price, cur_price, orphan_pnl,
+                              "ORPHAN_CLOSED", st.entry_time)
                 send_telegram(self.tg_token, self.tg_chat,
-                              f"STARTUP|{sym} bot thought in position, platform flat — reset")
+                              f"STARTUP|{sym} orphan {direction} closed by platform. "
+                              f"Est loss: ${orphan_pnl:+.2f}")
                 st.position = 0
                 st.contracts_held = 0
                 st.entry_price = 0.0
                 st.entry_features = None
             elif real_pos != 0 and st.position == 0:
-                print(f"  [{sym}] Bot thought flat, platform shows {real_pos} — closing it")
+                direction = "LONG" if real_pos > 0 else "SHORT"
+                cur_price = st.last_price or 0.0
+                orphan_pnl = 0.0
+                if orphan_avg_price and cur_price:
+                    if real_pos > 0:
+                        orphan_pnl = (cur_price - orphan_avg_price) * st.point_value * abs(real_pos)
+                    else:
+                        orphan_pnl = (orphan_avg_price - cur_price) * st.point_value * abs(real_pos)
+                print(f"  [{sym}] ORPHAN FOUND: platform has {direction} x{abs(real_pos)} "
+                      f"@ {orphan_avg_price or 0:.2f}, current {cur_price:.2f}, "
+                      f"unrealized ${orphan_pnl:+.2f} — closing")
                 send_telegram(self.tg_token, self.tg_chat,
-                              f"STARTUP|{sym} unknown {real_pos}-contract position — closing")
+                              f"STARTUP|{sym} orphan {direction} x{abs(real_pos)} "
+                              f"@ {orphan_avg_price or 0:.2f} — closing")
                 try:
                     await asyncio.wait_for(
                         st.ctx.positions.close_position_direct(
                             contract_id=st.ctx.instrument_info.id),
                         timeout=5.0)
+                    st.live_pnl += orphan_pnl
+                    st._log_trade(direction, orphan_avg_price or 0, cur_price, orphan_pnl,
+                                  "ORPHAN_CLOSED")
+                    print(f"  [{sym}] Orphan closed. PnL: ${orphan_pnl:+.2f}")
                 except Exception as e:
                     print(f"  [{sym}] startup close failed: {e}")
             elif real_pos != 0 and st.position != 0:
+                # Both have position — update entry price from platform
+                if orphan_avg_price and orphan_avg_price != st.entry_price:
+                    print(f"  [{sym}] Updating entry price: {st.entry_price:.2f} -> {orphan_avg_price:.2f} (platform)")
+                    st.entry_price = orphan_avg_price
                 if (real_pos > 0) != (st.position > 0):
                     print(f"  [{sym}] OPPOSITE direction! bot={st.position} platform={real_pos}")
                     send_telegram(self.tg_token, self.tg_chat,
