@@ -120,13 +120,13 @@ def send_signals(token: str, chat_id: str, keys: list, direction: str, symbol: s
 
 ET = pytz.timezone("America/New_York")
 
-SESSION_START = dtime(18, 30, 0)   # 6:30 PM ET start
+SESSION_START = dtime(18, 0, 0)    # 6:00 PM ET start
 SESSION_END = dtime(16, 0, 0)      # 4:00 PM ET end
 TRADING_DAYS = [0, 1, 2, 3, 4, 6]  # Mon-Fri + Sun
 BLACKOUT_START = dtime(16, 10, 0)
 BLACKOUT_END = dtime(16, 35, 0)
 
-TRADE_SESSION_START = dtime(9, 27, 0)
+TRADE_SESSION_START = dtime(18, 0, 0)
 TRADE_SESSION_END = dtime(16, 0, 0)
 
 # BB settings — matches TradingView: BB(20, SMA, close, 1.5, ddof=0)
@@ -1470,9 +1470,9 @@ class BBBreakoutBot:
             st.ctx = self.suite[sym]
             st._suite_client = self.suite.client
             price = await st.ctx.data.get_current_price()
-            st.last_price = price
+            st.last_price = price if price else 0.0
             print(f"[BOT] {sym} contract: {st.ctx.instrument_info.id}")
-            print(f"[BOT] {sym} price: {price:.2f}")
+            print(f"[BOT] {sym} price: {price:.2f}" if price else f"[BOT] {sym} price: market closed")
             await st._sync_pnl_from_platform()
 
         await self._auto_detect_practice_account(symbols)
