@@ -762,6 +762,7 @@ class SymbolState:
         self.entry_features = None  # snapshot for ML
         self.live_pnl = 0.0
         self._suite_client = None
+        self._pending_rl = None
         self.trade_mae = 0.0        # max adverse excursion (worst drawdown $ during trade)
         self.trade_mfe = 0.0        # max favorable excursion (best unrealized $ during trade)
         self.mae_history = []        # list of MAE values for averaging
@@ -1265,11 +1266,12 @@ class SymbolState:
                 print(f"\n[{now}] [{self.symbol}] POSITION SYNC: platform closed "
                       f"{direction} externally (TP/SL/manual). Est PnL: ${pnl_est:+.2f}")
 
-                if self.ml and self.entry_features:
-                    self.ml.record_trade(self.entry_features, pnl_est, source="platform_close",
-                                         entry_action=self.entry_action, mae=self.trade_mae,
-                                         mfe=self.trade_mfe)
+                saved_features = self.entry_features
+                saved_action = self.entry_action
+                saved_mae = self.trade_mae
+                saved_mfe = self.trade_mfe
                 self.entry_features = None
+                pnl_before = self.live_pnl
                 self.live_pnl += pnl_est
                 self._log_trade(direction, self.entry_price, price, pnl_est,
                                 "PLATFORM_CLOSED", self.entry_time)
@@ -1279,6 +1281,13 @@ class SymbolState:
                 self.entry_price = 0.0
                 self.entry_time = None
                 self.platform_flat_streak = 0
+
+                await self._sync_pnl_from_platform()
+                real_pnl = self.live_pnl - pnl_before
+                if self.ml and saved_features:
+                    self.ml.record_trade(saved_features, real_pnl, source="platform_close",
+                                         entry_action=saved_action, mae=saved_mae, mfe=saved_mfe)
+                    print(f"[{self.symbol} RL] Recorded real PnL: ${real_pnl:+.2f} (est was ${pnl_est:+.2f})")
 
                 send_telegram(self.tg_token, self.tg_chat,
                               f"SYNC|{self.symbol} {direction} closed externally. "
@@ -1501,9 +1510,9 @@ class SymbolState:
                     print(f"[{now}] [{self.symbol} QUICK-EXIT] {direction} -${abs(unrealized):.0f} "
                           f"in {time_in_trade:.0f}s — clean trades don't do this")
                     if self.ml and self.entry_features:
-                        self.ml.record_trade(self.entry_features, unrealized, source="quick_exit",
-                                             entry_action=self.entry_action,
-                                             mae=self.trade_mae, mfe=self.trade_mfe)
+                        self._pending_rl = {"features": self.entry_features,
+                                            "source": "quick_exit", "entry_action": self.entry_action,
+                                            "mae": self.trade_mae, "mfe": self.trade_mfe}
                         self.entry_features = None
                     await self._flatten(price, reason="QUICK_EXIT")
                     send_telegram(self.tg_token, self.tg_chat,
@@ -1528,10 +1537,9 @@ class SymbolState:
                     print(f"[{now}] [{self.symbol} EARLY-EXIT] {direction} pattern failed! "
                           f"{exit_reason} | PnL: ${trade_pnl:+.2f}")
                     if self.ml and self.entry_features:
-                        self.ml.record_trade(self.entry_features, trade_pnl,
-                                             source="early_exit",
-                                             entry_action=self.entry_action,
-                                             mae=self.trade_mae, mfe=self.trade_mfe)
+                        self._pending_rl = {"features": self.entry_features,
+                                            "source": "early_exit", "entry_action": self.entry_action,
+                                            "mae": self.trade_mae, "mfe": self.trade_mfe}
                         self.entry_features = None
                     await self._flatten(price, reason="EARLY_EXIT")
                     send_telegram(self.tg_token, self.tg_chat,
@@ -1551,9 +1559,9 @@ class SymbolState:
                 print(f"[{now}] [{self.symbol} MAX-SL] {direction} hit ${MAX_LOSS_DOLLARS:.0f} "
                       f"max loss! Unrealized: ${unrealized:.2f}")
                 if self.ml and self.entry_features:
-                    self.ml.record_trade(self.entry_features, unrealized, source="max_sl",
-                                         entry_action=self.entry_action,
-                                         mae=self.trade_mae, mfe=self.trade_mfe)
+                    self._pending_rl = {"features": self.entry_features,
+                                        "source": "max_sl", "entry_action": self.entry_action,
+                                        "mae": self.trade_mae, "mfe": self.trade_mfe}
                     self.entry_features = None
                 await self._flatten(price, reason="MAX_SL")
                 send_telegram(self.tg_token, self.tg_chat,
@@ -1579,10 +1587,9 @@ class SymbolState:
                     print(f"[{now}] [{self.symbol} BE-EXIT] {direction} taking breakeven! "
                           f"{be_reason} | PnL: ${current_pnl:+.2f}")
                     if self.ml and self.entry_features:
-                        self.ml.record_trade(self.entry_features, current_pnl,
-                                             source="be_exit",
-                                             entry_action=self.entry_action,
-                                             mae=self.trade_mae, mfe=self.trade_mfe)
+                        self._pending_rl = {"features": self.entry_features,
+                                            "source": "be_exit", "entry_action": self.entry_action,
+                                            "mae": self.trade_mae, "mfe": self.trade_mfe}
                         self.entry_features = None
                     await self._flatten(price, reason="BE_EXIT")
                     send_telegram(self.tg_token, self.tg_chat,
@@ -1602,9 +1609,9 @@ class SymbolState:
                 print(f"[{now}] [{self.symbol} TP] ${self.current_tp:.0f} target hit! "
                       f"{direction} x{contracts} | Unrealized: ${unrealized:.2f}")
                 if self.ml and self.entry_features:
-                    self.ml.record_trade(self.entry_features, unrealized, source="tp_hit",
-                                         entry_action=self.entry_action,
-                                         mae=self.trade_mae, mfe=self.trade_mfe)
+                    self._pending_rl = {"features": self.entry_features,
+                                        "source": "tp_hit", "entry_action": self.entry_action,
+                                        "mae": self.trade_mae, "mfe": self.trade_mfe}
                     self.entry_features = None
                 await self._flatten(price, reason="TP_HIT")
                 threading.Thread(target=send_signals, args=(
@@ -1638,9 +1645,9 @@ class SymbolState:
             trade_pnl = ((price - self.entry_price) * self.position
                          * self.point_value * self.contracts_held)
             if self.ml and self.entry_features:
-                self.ml.record_trade(self.entry_features, trade_pnl, source="signal_flip",
-                                     entry_action=self.entry_action, mae=self.trade_mae,
-                                     mfe=self.trade_mfe)
+                self._pending_rl = {"features": self.entry_features,
+                                    "source": "signal_flip", "entry_action": self.entry_action,
+                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
                 self.entry_features = None
             await self._flatten(price, reason="SIGNAL_FLIP")
             if self.position != 0:
@@ -1971,6 +1978,7 @@ class SymbolState:
             self.post_exit_time = time.time()
             self.post_exit_best = 0.0
             self.post_exit_features = self.entry_features
+            pnl_before = self.live_pnl
             self.live_pnl += trade_pnl
             self.position = 0
             self.contracts_held = 0
@@ -1980,7 +1988,17 @@ class SymbolState:
             self.trade_mfe = 0.0
             self._log_trade(direction, saved_entry_price, price, trade_pnl, reason,
                             saved_entry_time, mae=saved_mae)
-            asyncio.create_task(self._sync_pnl_from_platform())
+
+            await self._sync_pnl_from_platform()
+            real_trade_pnl = self.live_pnl - pnl_before
+            if self._pending_rl and self.ml:
+                rl = self._pending_rl
+                self.ml.record_trade(rl["features"], real_trade_pnl, source=rl["source"],
+                                     entry_action=rl["entry_action"],
+                                     mae=rl["mae"], mfe=rl["mfe"])
+                if abs(real_trade_pnl - trade_pnl) > 2.0:
+                    print(f"[{self.symbol} RL] Real PnL: ${real_trade_pnl:+.2f} (est was ${trade_pnl:+.2f})")
+                self._pending_rl = None
         return close_ok
 
     def _log_trade(self, direction, entry_price, exit_price, pnl, reason, entry_time=None, mae=0.0):
@@ -2391,12 +2409,12 @@ class RenkoBot:
                         print(f"\n[{ts}] [{sym}] WS-SYNC: {direction} closed externally. "
                               f"Est PnL: ${pnl_est:+.2f}")
 
-                        if st.ml and st.entry_features:
-                            st.ml.record_trade(st.entry_features, pnl_est,
-                                               source="ws_platform_close",
-                                               entry_action=st.entry_action,
-                                               mae=st.trade_mae, mfe=st.trade_mfe)
+                        saved_features = st.entry_features
+                        saved_action = st.entry_action
+                        saved_mae = st.trade_mae
+                        saved_mfe = st.trade_mfe
                         st.entry_features = None
+                        pnl_before = st.live_pnl
                         st.live_pnl += pnl_est
                         st._log_trade(direction, st.entry_price, price, pnl_est,
                                       "WS_PLATFORM_CLOSED", st.entry_time)
@@ -2404,6 +2422,25 @@ class RenkoBot:
                         st.contracts_held = 0
                         st.entry_price = 0.0
                         st.entry_time = None
+
+                        async def _deferred_rl_record(ss, pnl_b, feat, act, mae_v, mfe_v, est):
+                            await ss._sync_pnl_from_platform()
+                            rp = ss.live_pnl - pnl_b
+                            if ss.ml and feat:
+                                ss.ml.record_trade(feat, rp, source="ws_platform_close",
+                                                   entry_action=act, mae=mae_v, mfe=mfe_v)
+                                if abs(rp - est) > 2.0:
+                                    print(f"[{ss.symbol} RL] Real PnL: ${rp:+.2f} (est was ${est:+.2f})")
+                        try:
+                            asyncio.get_event_loop().create_task(
+                                _deferred_rl_record(st, pnl_before, saved_features,
+                                                    saved_action, saved_mae, saved_mfe, pnl_est))
+                        except Exception:
+                            if st.ml and saved_features:
+                                st.ml.record_trade(saved_features, pnl_est,
+                                                   source="ws_platform_close",
+                                                   entry_action=saved_action,
+                                                   mae=saved_mae, mfe=saved_mfe)
                         st.platform_flat_streak = 0
 
                         threading.Thread(target=send_telegram, args=(
