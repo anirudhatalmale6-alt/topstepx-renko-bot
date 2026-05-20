@@ -1630,6 +1630,20 @@ def main():
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
+    def thread_watchdog():
+        """Runs outside the event loop — detects dead loop and force-kills process."""
+        while not stopped:
+            time.sleep(60)
+            if current_bot and current_bot.last_tick_time > 0:
+                gap = time.time() - current_bot.last_tick_time
+                if gap > WATCHDOG_TIMEOUT + 60:
+                    print(f"[THREAD-WATCHDOG] Event loop appears dead — no tick for {gap:.0f}s, force-killing")
+                    current_bot.save_all_state()
+                    os._exit(1)
+
+    wd = threading.Thread(target=thread_watchdog, daemon=True)
+    wd.start()
+
     retry_delay = 30
     while not stopped:
         bot = BBBreakoutBot(
