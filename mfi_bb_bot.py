@@ -761,6 +761,7 @@ class SymbolState:
         self.entry_time = None
         self.entry_features = None  # snapshot for ML
         self.live_pnl = 0.0
+        self._suite_client = None
         self.trade_mae = 0.0        # max adverse excursion (worst drawdown $ during trade)
         self.trade_mfe = 0.0        # max favorable excursion (best unrealized $ during trade)
         self.mae_history = []        # list of MAE values for averaging
@@ -1728,6 +1729,31 @@ class SymbolState:
             print(f"[{self.symbol}] fill price query failed: {e}")
         return None
 
+    async def _sync_pnl_from_platform(self) -> None:
+        """Sync session PnL from platform account balance when flat."""
+        if not self._suite_client or self.position != 0:
+            return
+        try:
+            await asyncio.sleep(0.5)
+            accounts = await asyncio.wait_for(
+                self._suite_client.list_accounts(), timeout=8.0)
+            acct_name = os.environ.get("PROJECT_X_ACCOUNT_NAME", "")
+            for a in accounts:
+                if a.name == acct_name:
+                    if not hasattr(self, '_start_balance') or self._start_balance is None:
+                        self._start_balance = a.balance - self.live_pnl
+                        print(f"[{self.symbol} PNL-SYNC] Baseline set: ${self._start_balance:,.2f}")
+                    real_pnl = a.balance - self._start_balance
+                    drift = abs(real_pnl - self.live_pnl)
+                    if drift > 2.0:
+                        print(f"[{self.symbol} PNL-SYNC] Bot: ${self.live_pnl:.2f} -> "
+                              f"Platform: ${real_pnl:.2f} (drift ${drift:.2f}, "
+                              f"balance ${a.balance:,.2f})")
+                        self.live_pnl = real_pnl
+                    break
+        except Exception as e:
+            print(f"[{self.symbol}] PnL sync failed: {e}")
+
     async def _ensure_flat_before_entry(self):
         """Defensive close — runs before an entry to clear any orphan position
         the bot may not know about. Cheap if already flat."""
@@ -1954,6 +1980,7 @@ class SymbolState:
             self.trade_mfe = 0.0
             self._log_trade(direction, saved_entry_price, price, trade_pnl, reason,
                             saved_entry_time, mae=saved_mae)
+            asyncio.create_task(self._sync_pnl_from_platform())
         return close_ok
 
     def _log_trade(self, direction, entry_price, exit_price, pnl, reason, entry_time=None, mae=0.0):
@@ -2157,6 +2184,7 @@ class RenkoBot:
 
         for sym, st in self.states.items():
             st.ctx = self.suite[sym]
+            st._suite_client = self.suite.client
             print(f"[BOT] {sym} contract: {st.ctx.instrument_info.id}")
             try:
                 price = await st.ctx.data.get_current_price()
@@ -2248,6 +2276,9 @@ class RenkoBot:
                     print(f"  [{sym}] OPPOSITE direction! bot={st.position} platform={real_pos}")
                     send_telegram(self.tg_token, self.tg_chat,
                                   f"CRITICAL|{sym} bot {st.position} vs platform {real_pos}")
+
+        for sym, st in self.states.items():
+            await st._sync_pnl_from_platform()
 
         print()
         self.running = True
@@ -2460,6 +2491,7 @@ class RenkoBot:
             self._register_websocket_handlers()
             for sym, st in self.states.items():
                 st.ctx = self.suite[sym]
+                st._suite_client = self.suite.client
             print(f"[BOT] Reconnected with account {new_acct.name}")
         except Exception as e:
             print(f"[BOT] Auto-detect failed: {e}")
@@ -2495,6 +2527,7 @@ class RenkoBot:
             )
             for sym, st in self.states.items():
                 st.ctx = self.suite[sym]
+                st._suite_client = self.suite.client
                 # Fresh connection — reset freshness trackers, NOT indicators
                 st.last_known_price = None
                 st.last_price_change_time = time.time()
@@ -2658,6 +2691,7 @@ class RenkoBot:
                 self._register_websocket_handlers()
                 for sym, st in self.states.items():
                     st.ctx = self.suite[sym]
+                    st._suite_client = self.suite.client
                     await st.seed_history()
             now = datetime.now(ET).strftime("%H:%M:%S")
             print(f"[{now}] [SESSION] New session started — LIVE")
@@ -2741,6 +2775,7 @@ class RenkoBot:
             self.last_heartbeat = time.time()
             now = datetime.now(ET).strftime("%H:%M:%S")
             for sym, st in self.states.items():
+                await st._sync_pnl_from_platform()
                 pos_str = ("FLAT" if st.position == 0
                            else "LONG" if st.position == 1 else "SHORT")
                 mfi_str = f"{st.mfi_value:.2f}" if st.mfi_value is not None else "N/A"
