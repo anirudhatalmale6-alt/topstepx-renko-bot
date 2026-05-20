@@ -131,9 +131,8 @@ BLACKOUT_END = dtime(16, 35, 0)
 TRADE_SESSION_START = dtime(9, 27, 0)
 TRADE_SESSION_END = dtime(16, 0, 0)
 
-# EMA settings
-EMA_LENGTH = 9
-CANDLE_MINUTES = 5  # 5-minute candles for EMA
+# VWAP / candle settings
+CANDLE_MINUTES = 15  # 15-minute candles for VWAP
 
 # StdDev level multipliers
 STDDEV_LEVELS = [0, 0.5, 1.0, 1.5, 2.0, 2.5]
@@ -292,30 +291,42 @@ class StdDevLevels:
 
 
 # ============================================================
-# 5-Minute Candle Builder
+# 15-Minute Candle Builder + Session VWAP
 # ============================================================
 
 class CandleBuilder:
-    """Builds fixed-interval candles from tick data."""
+    """Builds fixed-interval candles from tick data with session VWAP."""
 
     def __init__(self, interval_minutes: int = CANDLE_MINUTES):
         self.interval = interval_minutes
-        self.candles = []  # list of (timestamp, open, high, low, close, volume)
-        self._current = None  # {start_time, open, high, low, close, volume}
+        self.candles = []
+        self._current = None
         self._max_candles = 500
+        # Session VWAP
+        self.vwap = None
+        self.vwap_cum_pv = 0.0
+        self.vwap_cum_vol = 0
+        self._vwap_session_date = None
 
     def _candle_start(self, ts: float) -> float:
-        """Round timestamp down to nearest candle boundary."""
         dt = datetime.fromtimestamp(ts, tz=ET)
         minute_of_day = dt.hour * 60 + dt.minute
         candle_minute = (minute_of_day // self.interval) * self.interval
         return dt.replace(hour=candle_minute // 60, minute=candle_minute % 60,
                           second=0, microsecond=0).timestamp()
 
+    def _check_vwap_reset(self):
+        today = datetime.now(ET).date()
+        if self._vwap_session_date != today:
+            self.vwap_cum_pv = 0.0
+            self.vwap_cum_vol = 0
+            self.vwap = None
+            self._vwap_session_date = today
+
     def feed(self, price: float, ts: float = None) -> dict:
-        """Feed a tick. Returns completed candle dict if a candle just closed, else None."""
         if ts is None:
             ts = time.time()
+        self._check_vwap_reset()
         candle_start = self._candle_start(ts)
 
         if self._current is None:
@@ -325,6 +336,13 @@ class CandleBuilder:
 
         if candle_start > self._current["start"]:
             completed = dict(self._current)
+            # Update VWAP with completed candle
+            typical = (completed["high"] + completed["low"] + completed["close"]) / 3.0
+            vol = completed["volume"]
+            self.vwap_cum_pv += typical * vol
+            self.vwap_cum_vol += vol
+            if self.vwap_cum_vol > 0:
+                self.vwap = self.vwap_cum_pv / self.vwap_cum_vol
             self.candles.append(completed)
             if len(self.candles) > self._max_candles:
                 self.candles = self.candles[-self._max_candles:]
@@ -346,26 +364,12 @@ class CandleBuilder:
             return closes[-n:]
         return closes
 
-    def get_ema(self, length: int = EMA_LENGTH) -> float:
-        closes = self.get_closes()
-        if len(closes) < length:
-            return None
-        ema = closes[0]
-        mult = 2.0 / (length + 1)
-        for c in closes[1:]:
-            ema = c * mult + ema * (1 - mult)
-        return ema
-
-    def get_prev_ema(self, length: int = EMA_LENGTH) -> float:
-        """EMA as of the previous completed candle (for cross detection)."""
+    def get_momentum(self, lookback: int = 3) -> float:
+        """Price momentum over last N candles (pts per candle)."""
         closes = [c["close"] for c in self.candles]
-        if len(closes) < length:
-            return None
-        ema = closes[0]
-        mult = 2.0 / (length + 1)
-        for c in closes[1:]:
-            ema = c * mult + ema * (1 - mult)
-        return ema
+        if len(closes) < lookback + 1:
+            return 0.0
+        return (closes[-1] - closes[-(lookback + 1)]) / lookback
 
 
 # ============================================================
@@ -411,12 +415,21 @@ class TradeML:
         self._load()
 
     def _state_key(self, features: dict) -> str:
-        """Discretize: direction|zone|ema_position|flip_count|time_zone|momentum"""
-        direction = "long" if features.get("direction", 1) == 1 else "short"
+        """Discretize: zone|vwap_pos|price_vs_vwap|time_zone|momentum|streak"""
         zone = features.get("zone", "unknown")
-        ema_pos = features.get("ema_position", "unknown")
-        flip_count = features.get("flip_count", 0)
-        flip_zone = "1st" if flip_count <= 1 else "2nd" if flip_count == 2 else "3rd" if flip_count == 3 else "4th+"
+        vwap_pos = features.get("vwap_position", "unknown")
+
+        price_vs_vwap = features.get("price_vs_vwap", 0.0)
+        if price_vs_vwap > 20:
+            pvw = "far_above"
+        elif price_vs_vwap > 5:
+            pvw = "above"
+        elif price_vs_vwap < -20:
+            pvw = "far_below"
+        elif price_vs_vwap < -5:
+            pvw = "below"
+        else:
+            pvw = "near"
 
         hour = features.get("hour", 12)
         if hour < 10:
@@ -441,7 +454,7 @@ class TradeML:
         else:
             streak = "mixed"
 
-        return f"{direction}|{zone}|{ema_pos}|{flip_zone}|{time_zone}|{momentum}|{streak}"
+        return f"{zone}|{vwap_pos}|{pvw}|{time_zone}|{momentum}|{streak}"
 
     def _get_q(self, state_key: str) -> list:
         if state_key not in self.q_table:
@@ -499,17 +512,18 @@ class TradeML:
         except Exception as e:
             print(f"[RL] Save error: {e}")
 
-    def extract_features(self, direction: int, zone: str, ema_position: str,
-                         flip_count: int, price: float, ema_value: float,
-                         ema_slope: float, candle_closes: list) -> dict:
+    def extract_features(self, zone: str, vwap_position: str,
+                         price_vs_vwap: float, momentum_pts: float,
+                         price: float, vwap: float,
+                         candle_closes: list) -> dict:
         hour = datetime.now(ET).hour
-        if ema_slope > 1.0:
+        if momentum_pts > 15:
             momentum = "strong_up"
-        elif ema_slope > 0.3:
+        elif momentum_pts > 5:
             momentum = "up"
-        elif ema_slope < -1.0:
+        elif momentum_pts < -15:
             momentum = "strong_down"
-        elif ema_slope < -0.3:
+        elif momentum_pts < -5:
             momentum = "down"
         else:
             momentum = "flat"
@@ -519,15 +533,14 @@ class TradeML:
             vol = float(np.std(candle_closes[-10:]))
 
         return {
-            "direction": direction,
             "zone": zone,
-            "ema_position": ema_position,
-            "flip_count": flip_count,
+            "vwap_position": vwap_position,
+            "price_vs_vwap": round(price_vs_vwap, 2),
             "hour": hour,
             "momentum": momentum,
             "price": round(price, 2),
-            "ema_value": round(ema_value, 2) if ema_value else None,
-            "ema_slope": round(ema_slope, 4),
+            "vwap": round(vwap, 2) if vwap else None,
+            "momentum_pts": round(momentum_pts, 2),
             "volatility": round(vol, 4),
         }
 
@@ -717,12 +730,8 @@ class SymbolState:
 
         # Flip state
         self.flip_count = 0
-        self.last_signal = 0  # 0=none, 1=long, -1=short
         self.tp_hit_this_session = False
-
-        # EMA tracking for cross detection
-        self.prev_ema = None
-        self.curr_ema = None
+        self.prev_zone = None  # Track zone changes
 
         # RL
         self.ml = TradeML(os.path.join(os.getcwd(), f"rl_state_{symbol}_stddev.json"))
@@ -752,57 +761,46 @@ class SymbolState:
             size = self.base_qty * 4
         return min(size, self.base_qty * MAX_SIZE)
 
-    def get_ema_position(self) -> str:
-        """Returns EMA position relative to StdDev levels."""
-        ema = self.curr_ema
-        if ema is None:
+    def get_vwap_position(self) -> str:
+        """Returns VWAP position relative to StdDev levels."""
+        vwap = self.candles.vwap
+        if vwap is None:
             return "unknown"
         l05 = self.stddev.get_level("0.5")
         l0 = self.stddev.get_level("0")
         lm05 = self.stddev.get_level("-0.5")
         if l05 is None or l0 is None or lm05 is None:
             return "unknown"
-        if ema > l05:
+        if vwap > l05:
             return "above_0.5"
-        elif ema > l0:
+        elif vwap > l0:
             return "0_to_0.5"
-        elif ema > lm05:
+        elif vwap > lm05:
             return "-0.5_to_0"
         else:
             return "below_-0.5"
 
-    def get_ema_slope(self) -> float:
-        """Returns normalized EMA slope (change per candle in points)."""
-        if self.prev_ema is None or self.curr_ema is None:
+    def get_price_vs_vwap(self) -> float:
+        """Returns price distance from VWAP in points."""
+        vwap = self.candles.vwap
+        if vwap is None:
             return 0.0
-        return self.curr_ema - self.prev_ema
+        return self.last_price - vwap
 
     def extract_features(self) -> dict:
-        direction = 1 if self.last_signal >= 0 else -1
         zone = self.stddev.get_zone(self.last_price)
-        ema_pos = self.get_ema_position()
-        slope = self.get_ema_slope()
+        vwap_pos = self.get_vwap_position()
+        pvw = self.get_price_vs_vwap()
+        mom = self.candles.get_momentum(3)
         closes = self.candles.get_closes(20)
         return self.ml.extract_features(
-            direction=direction, zone=zone, ema_position=ema_pos,
-            flip_count=self.flip_count, price=self.last_price,
-            ema_value=self.curr_ema, ema_slope=slope, candle_closes=closes)
-
-    def check_ema_cross(self) -> int:
-        """Check if EMA crossed above or below the 0 level (session open).
-        Returns: 1 = cross above (long signal), -1 = cross below (short signal), 0 = no cross."""
-        level_0 = self.stddev.get_level("0")
-        if level_0 is None or self.prev_ema is None or self.curr_ema is None:
-            return 0
-        if self.prev_ema <= level_0 and self.curr_ema > level_0:
-            return 1  # Cross above → long
-        if self.prev_ema >= level_0 and self.curr_ema < level_0:
-            return -1  # Cross below → short
-        return 0
+            zone=zone, vwap_position=vwap_pos, price_vs_vwap=pvw,
+            momentum_pts=mom, price=self.last_price,
+            vwap=self.candles.vwap, candle_closes=closes)
 
     def check_tp_touch(self) -> int:
         """Check if price touches TP level.
-        Returns: 1 = long TP (touched 0.5), -1 = short TP (touched -0.5), 0 = no touch."""
+        Returns: 1 = long TP (touched 0.5σ), -1 = short TP (touched -0.5σ), 0 = no touch."""
         if self.position == 1:
             tp_level = self.stddev.get_level("0.5")
             if tp_level is not None and self.last_price >= tp_level:
@@ -812,6 +810,14 @@ class SymbolState:
             if tp_level is not None and self.last_price <= tp_level:
                 return -1
         return 0
+
+    def check_zone_change(self) -> bool:
+        """Returns True if price moved to a different StdDev zone."""
+        curr_zone = self.stddev.get_zone(self.last_price)
+        if curr_zone != self.prev_zone:
+            self.prev_zone = curr_zone
+            return True
+        return False
 
     async def _sync_pnl_from_platform(self) -> None:
         if not self._suite_client or self.position != 0:
@@ -996,14 +1002,15 @@ class SymbolState:
         self.entry_features = None
 
     def tick(self, price: float, ts: float = None):
-        """Process a new tick. Returns list of async actions to execute."""
+        """Process a new tick. RL-driven: evaluates state on each 15-min candle
+        close and decides entry/exit. Levels provide context, RL decides action."""
         if ts is None:
             ts = time.time()
         self.last_price = price
         self.last_tick_time = ts
         actions = []
 
-        # Session boundary reset (PnL baseline + StdDev levels)
+        # Session boundary reset
         now_et = datetime.now(ET)
         session_day = now_et.date() if now_et.time() >= SESSION_START else now_et.date() - timedelta(days=1)
         if self._pnl_session_day is None or self._pnl_session_day != session_day:
@@ -1012,25 +1019,18 @@ class SymbolState:
             self.live_pnl = 0.0
             self.daily_loss = 0.0
             self.tp_hit_this_session = False
-            self.last_signal = 0
             self.flip_count = 0
+            self.prev_zone = None
             print(f"[{self.symbol} SESSION] New session day {session_day} — all reset")
 
-        # Compute StdDev from history on first tick (one-time)
         if self.stddev.daily_stdev is None:
             self.stddev.compute_stdev_from_history()
 
-        # Set session open on first tick of new session
         self.stddev.check_session_reset()
         if self.stddev.session_open is None and price > 0:
             self.stddev.set_session_open(price)
 
-        # Feed candle builder
         completed_candle = self.candles.feed(price, ts)
-
-        # Update EMA on every tick
-        self.prev_ema = self.curr_ema
-        self.curr_ema = self.candles.get_ema(EMA_LENGTH)
 
         # Track MAE/MFE for open position
         if self.position != 0:
@@ -1041,13 +1041,13 @@ class SymbolState:
             self.trade_mfe = max(self.trade_mfe, unrealized)
             self.trade_mae = min(self.trade_mae, unrealized)
 
-            # Quick exit: too much loss too fast
             elapsed = ts - self.entry_time
+
+            # Quick exit
             if elapsed <= QUICK_EXIT_SECS and unrealized < -QUICK_EXIT_DOLLARS:
                 now_str = datetime.now(ET).strftime("%H:%M:%S")
                 print(f"[{now_str}] [{self.symbol} QUICK-EXIT] "
-                      f"{'LONG' if self.position == 1 else 'SHORT'} "
-                      f"${unrealized:.0f} in {elapsed:.0f}s")
+                      f"{'LONG' if self.position == 1 else 'SHORT'} ${unrealized:.0f} in {elapsed:.0f}s")
                 self._pending_rl = {"features": self.entry_features,
                                     "entry_action": self.entry_action,
                                     "mae": self.trade_mae, "mfe": self.trade_mfe}
@@ -1077,26 +1077,24 @@ class SymbolState:
                     actions.append(("flatten", price, "EARLY_EXIT"))
                     return actions
 
-        # Only process signals on completed candles (like barstate.isconfirmed)
-        if completed_candle is None:
-            # Check TP on every tick though (price touch)
-            if self.position != 0:
-                tp = self.check_tp_touch()
-                if tp != 0:
-                    tp_type = "LONG" if tp == 1 else "SHORT"
-                    tp_level = "0.5" if tp == 1 else "-0.5"
-                    now_str = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now_str}] [{self.symbol}] TP HIT: {tp_type} exit at {tp_level}σ")
-                    self._pending_rl = {"features": self.entry_features,
-                                        "entry_action": self.entry_action,
-                                        "mae": self.trade_mae, "mfe": self.trade_mfe}
-                    self.tp_hit_this_session = True
-                    self.flip_count = 0
-                    self.last_signal = 0
-                    actions.append(("flatten", price, f"TP_{tp_level}"))
-            return actions
+            # TP check on every tick (price touching ±0.5σ)
+            tp = self.check_tp_touch()
+            if tp != 0:
+                tp_level = "0.5" if tp == 1 else "-0.5"
+                now_str = datetime.now(ET).strftime("%H:%M:%S")
+                print(f"[{now_str}] [{self.symbol}] TP HIT at {tp_level}σ | "
+                      f"{'LONG' if self.position == 1 else 'SHORT'}")
+                self._pending_rl = {"features": self.entry_features,
+                                    "entry_action": self.entry_action,
+                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
+                self.tp_hit_this_session = True
+                self.flip_count = 0
+                actions.append(("flatten", price, f"TP_{tp_level}"))
+                return actions
 
-        # --- Signal processing on candle close ---
+        # --- RL evaluation on 15-min candle close ---
+        if completed_candle is None:
+            return actions
 
         if not in_trade_session():
             return actions
@@ -1104,136 +1102,97 @@ class SymbolState:
         if self.tp_hit_this_session:
             return actions
 
-        if self.curr_ema is None:
+        if self.candles.vwap is None:
             return actions
 
-        cross = self.check_ema_cross()
         now_str = datetime.now(ET).strftime("%H:%M:%S")
+        zone = self.stddev.get_zone(price)
+        vwap = self.candles.vwap
+        pvw = self.get_price_vs_vwap()
+        features = self.extract_features()
 
-        # CASE 1: No position — look for first entry
-        if self.position == 0 and self.last_signal == 0:
-            if cross == 1:
-                # EMA crossed above 0 → LONG signal
-                features = self.extract_features()
-                self.entry_features = features
-                action_str, _, reason = self.ml.should_skip(features)
-                print(f"[{now_str}] [{self.symbol} ENTRY] LONG: EMA > 0 level | {reason}")
-
-                if action_str == "enter":
-                    self.last_signal = 1
-                    self.flip_count = 1
-                    self.entry_action = "enter"
-                    actions.append(("enter_long", price))
-                elif action_str == "flip":
-                    # RL says flip → enter SHORT instead
-                    print(f"[{now_str}] [{self.symbol} RL-FLIP] LONG -> SHORT")
-                    self.last_signal = -1
-                    self.flip_count = 1
-                    self.entry_action = "flip"
-                    actions.append(("enter_short", price))
-                else:
-                    print(f"[{now_str}] [{self.symbol} RL-SKIP] LONG skipped | {reason}")
-
-            elif cross == -1:
-                # EMA crossed below 0 → SHORT signal
-                features = self.extract_features()
-                self.entry_features = features
-                action_str, _, reason = self.ml.should_skip(features)
-                print(f"[{now_str}] [{self.symbol} ENTRY] SHORT: EMA < 0 level | {reason}")
-
-                if action_str == "enter":
-                    self.last_signal = -1
-                    self.flip_count = 1
-                    self.entry_action = "enter"
-                    actions.append(("enter_short", price))
-                elif action_str == "flip":
-                    print(f"[{now_str}] [{self.symbol} RL-FLIP] SHORT -> LONG")
-                    self.last_signal = 1
-                    self.flip_count = 1
-                    self.entry_action = "flip"
-                    actions.append(("enter_long", price))
-                else:
-                    print(f"[{now_str}] [{self.symbol} RL-SKIP] SHORT skipped | {reason}")
-
-        # CASE 2: In LONG — check for flip (EMA crosses below 0)
-        elif self.position == 1 and cross == -1:
-            features = self.extract_features()
-            self.entry_features = features
+        # RL decides on every 15-min candle close
+        if self.position == 0:
+            # FLAT: RL decides whether to enter long, short, or skip
             action_str, _, reason = self.ml.should_skip(features)
-            print(f"[{now_str}] [{self.symbol} FLIP] LONG → SHORT: EMA < 0 | {reason}")
 
-            if action_str in ("enter", "flip"):
-                # Close long, enter short
+            # Determine bias from market context:
+            # Price above VWAP + positive zone = bullish bias
+            # Price below VWAP + negative zone = bearish bias
+            if pvw > 0 and zone in ("0_to_0.5", "0.5_to_1.0", "1.0_to_1.5"):
+                bias = "long"
+            elif pvw < 0 and zone in ("-0.5_to_0", "-1.0_to_-0.5", "-1.5_to_-1.0"):
+                bias = "short"
+            elif pvw > 10:
+                bias = "long"
+            elif pvw < -10:
+                bias = "short"
+            else:
+                bias = "neutral"
+
+            print(f"[{now_str}] [{self.symbol} EVAL] Zone: {zone} | VWAP: {vwap:.2f} | "
+                  f"PvsVWAP: {pvw:+.1f} | Bias: {bias} | {reason}")
+
+            if action_str == "enter":
+                if bias == "long":
+                    self.entry_features = features
+                    self.entry_action = "enter"
+                    self.flip_count = 1
+                    actions.append(("enter_long", price))
+                elif bias == "short":
+                    self.entry_features = features
+                    self.entry_action = "enter"
+                    self.flip_count = 1
+                    actions.append(("enter_short", price))
+                # If neutral, don't enter even if RL says enter
+            elif action_str == "flip":
+                # RL says flip = enter opposite of bias
+                if bias == "long":
+                    self.entry_features = features
+                    self.entry_action = "flip"
+                    self.flip_count = 1
+                    actions.append(("enter_short", price))
+                elif bias == "short":
+                    self.entry_features = features
+                    self.entry_action = "flip"
+                    self.flip_count = 1
+                    actions.append(("enter_long", price))
+            # skip/wait: do nothing
+
+        else:
+            # IN POSITION: RL evaluates whether to hold, close, or flip
+            direction = "LONG" if self.position == 1 else "SHORT"
+            action_str, _, reason = self.ml.should_skip(features)
+
+            # Check if market context has shifted against position
+            position_aligned = (self.position == 1 and pvw > 0) or \
+                               (self.position == -1 and pvw < 0)
+
+            print(f"[{now_str}] [{self.symbol} HOLD-CHECK] {direction} | Zone: {zone} | "
+                  f"VWAP: {vwap:.2f} | PvsVWAP: {pvw:+.1f} | Aligned: {position_aligned} | {reason}")
+
+            if action_str == "skip" and not position_aligned:
+                # RL says skip + misaligned = close position
+                self._pending_rl = {"features": self.entry_features,
+                                    "entry_action": self.entry_action,
+                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
+                self.flip_count = 0
+                actions.append(("flatten", price, "RL_CLOSE"))
+
+            elif action_str == "flip":
+                # Flip position
                 self._pending_rl = {"features": self.entry_features,
                                     "entry_action": self.entry_action,
                                     "mae": self.trade_mae, "mfe": self.trade_mfe}
                 self.flip_count += 1
-                self.last_signal = -1
+                self.entry_features = features
                 self.entry_action = "flip"
-                self.entry_features = features
-                actions.append(("flatten", price, "FLIP_TO_SHORT"))
-                actions.append(("enter_short", price))
-            else:
-                # RL says skip the flip — just close
-                self._pending_rl = {"features": self.entry_features,
-                                    "entry_action": self.entry_action,
-                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
-                self.last_signal = 0
-                self.flip_count = 0
-                actions.append(("flatten", price, "EMA_CROSS_EXIT"))
-
-        # CASE 3: In SHORT — check for flip (EMA crosses above 0)
-        elif self.position == -1 and cross == 1:
-            features = self.extract_features()
-            self.entry_features = features
-            action_str, _, reason = self.ml.should_skip(features)
-            print(f"[{now_str}] [{self.symbol} FLIP] SHORT → LONG: EMA > 0 | {reason}")
-
-            if action_str in ("enter", "flip"):
-                self._pending_rl = {"features": self.entry_features,
-                                    "entry_action": self.entry_action,
-                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
-                self.flip_count += 1
-                self.last_signal = 1
-                self.entry_action = "flip"
-                self.entry_features = features
-                actions.append(("flatten", price, "FLIP_TO_LONG"))
-                actions.append(("enter_long", price))
-            else:
-                self._pending_rl = {"features": self.entry_features,
-                                    "entry_action": self.entry_action,
-                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
-                self.last_signal = 0
-                self.flip_count = 0
-                actions.append(("flatten", price, "EMA_CROSS_EXIT"))
-
-        # CASE 4: Flat after a signal but no current position (RL skipped entry)
-        elif self.position == 0 and self.last_signal != 0 and cross != 0:
-            if cross == 1 and self.last_signal == -1:
-                # Was short-biased, now EMA crossed above → long signal
-                features = self.extract_features()
-                self.entry_features = features
-                action_str, _, reason = self.ml.should_skip(features)
-                if action_str == "enter":
-                    self.last_signal = 1
-                    self.flip_count += 1
-                    self.entry_action = "enter"
-                    actions.append(("enter_long", price))
-                else:
-                    self.last_signal = 0
-                    self.flip_count = 0
-            elif cross == -1 and self.last_signal == 1:
-                features = self.extract_features()
-                self.entry_features = features
-                action_str, _, reason = self.ml.should_skip(features)
-                if action_str == "enter":
-                    self.last_signal = -1
-                    self.flip_count += 1
-                    self.entry_action = "enter"
+                if self.position == 1:
+                    actions.append(("flatten", price, "FLIP_TO_SHORT"))
                     actions.append(("enter_short", price))
                 else:
-                    self.last_signal = 0
-                    self.flip_count = 0
+                    actions.append(("flatten", price, "FLIP_TO_LONG"))
+                    actions.append(("enter_long", price))
 
         return actions
 
@@ -1252,14 +1211,15 @@ class SymbolState:
             "trade_mfe": self.trade_mfe,
             "mae_history": self.mae_history[-100:],
             "flip_count": self.flip_count,
-            "last_signal": self.last_signal,
             "tp_hit_this_session": self.tp_hit_this_session,
             "daily_loss": self.daily_loss,
             "session_open": self.stddev.session_open,
             "daily_stdev": self.stddev.daily_stdev,
             "candle_data": self.candles.candles[-100:],
-            "curr_ema": self.curr_ema,
-            "prev_ema": self.prev_ema,
+            "vwap": self.candles.vwap,
+            "vwap_cum_pv": self.candles.vwap_cum_pv,
+            "vwap_cum_vol": self.candles.vwap_cum_vol,
+            "prev_zone": self.prev_zone,
         }
 
     def restore_state(self, state: dict, position_ttl: int = 600) -> bool:
@@ -1270,8 +1230,10 @@ class SymbolState:
             self.stddev.set_session_open(session_open)
         candle_data = state.get("candle_data", [])
         self.candles.candles = candle_data
-        self.curr_ema = state.get("curr_ema")
-        self.prev_ema = state.get("prev_ema")
+        self.candles.vwap = state.get("vwap")
+        self.candles.vwap_cum_pv = state.get("vwap_cum_pv", 0.0)
+        self.candles.vwap_cum_vol = state.get("vwap_cum_vol", 0)
+        self.prev_zone = state.get("prev_zone")
         self.daily_loss = state.get("daily_loss", 0.0)
 
         if age < position_ttl:
@@ -1286,10 +1248,9 @@ class SymbolState:
             self.trade_mfe = state.get("trade_mfe", 0.0)
             self.mae_history = state.get("mae_history", [])
             self.flip_count = state.get("flip_count", 0)
-            self.last_signal = state.get("last_signal", 0)
             self.tp_hit_this_session = state.get("tp_hit_this_session", False)
-            print(f"  [{self.symbol}] Restored: pos={self.position}, "
-                  f"EMA={self.curr_ema:.2f}" if self.curr_ema else f"  [{self.symbol}] Restored (no EMA yet)")
+            vwap_str = f"VWAP={self.candles.vwap:.2f}" if self.candles.vwap else "no VWAP yet"
+            print(f"  [{self.symbol}] Restored: pos={self.position}, {vwap_str}")
             return True
         else:
             print(f"  [{self.symbol}] State too old ({age:.0f}s), position cleared")
@@ -1471,9 +1432,9 @@ class StdDevBot:
 
         symbols = self._symbols_list()
         print(f"[BOT] StdDev EMA Flip Bot starting...")
-        print(f"[BOT] Strategy: EMA({EMA_LENGTH}) cross daily StdDev 0-level, "
-              f"TP at ±0.5σ, flip on cross")
-        print(f"[BOT] Candle interval: {CANDLE_MINUTES}min")
+        print(f"[BOT] Strategy: RL-driven with {CANDLE_MINUTES}min VWAP + StdDev zones, "
+              f"TP at ±0.5σ")
+        print(f"[BOT] Candle interval: {CANDLE_MINUTES}min (VWAP)")
         print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
               f"{TRADE_SESSION_END.strftime('%H:%M')} ET")
         print(f"[BOT] Symbols: {symbols}")
@@ -1516,11 +1477,12 @@ class StdDevBot:
             level_0 = st.stddev.get_level("0") or 0
             level_05 = st.stddev.get_level("0.5") or 0
             level_m05 = st.stddev.get_level("-0.5") or 0
-            msg = (f"STATUS|StdDev EMA Bot started\n"
+            msg = (f"STATUS|StdDev VWAP Bot started\n"
                    f"Account: {acct}\n"
                    f"0-level: {level_0:.2f}\n"
                    f"0.5σ (Long TP): {level_05:.2f}\n"
                    f"-0.5σ (Short TP): {level_m05:.2f}\n"
+                   f"VWAP TF: {CANDLE_MINUTES}min\n"
                    f"{stats}")
             threading.Thread(target=send_telegram, args=(
                 self.tg_token, self.tg_chat, msg), daemon=True).start()
@@ -1577,14 +1539,15 @@ class StdDevBot:
             # Status prints
             if now - last_status > status_interval:
                 for sym, st in self.states.items():
-                    ema_str = f"{st.curr_ema:.2f}" if st.curr_ema else "N/A"
+                    vwap_str = f"{st.candles.vwap:.2f}" if st.candles.vwap else "N/A"
                     l0 = st.stddev.get_level("0")
                     l05 = st.stddev.get_level("0.5")
                     lm05 = st.stddev.get_level("-0.5")
                     pos_str = {0: "FLAT", 1: "LONG", -1: "SHORT"}[st.position]
                     zone = st.stddev.get_zone(st.last_price)
+                    pvw = st.get_price_vs_vwap()
                     print(f"  [{sym} @ {datetime.now(ET).strftime('%H:%M:%S')}]")
-                    print(f"    Price: {st.last_price:.2f} | EMA(9): {ema_str} | Zone: {zone}")
+                    print(f"    Price: {st.last_price:.2f} | VWAP: {vwap_str} | PvsVWAP: {pvw:+.1f} | Zone: {zone}")
                     print(f"    0: {l0:.2f} | 0.5: {l05:.2f} | -0.5: {lm05:.2f}" if l0 else "    Levels: N/A")
                     print(f"    Position: {pos_str} x{st.contracts_held} | "
                           f"P&L: ${st.live_pnl:.2f} | Flip #{st.flip_count} | "
@@ -1648,9 +1611,9 @@ def main():
         print("ERROR: No symbols configured")
         return
 
-    print(f"[BOT] StdDev EMA Flip Bot")
-    print(f"[BOT] ENTRY: EMA({EMA_LENGTH}) crosses daily StdDev 0-level")
-    print(f"[BOT] EXIT: Price touches ±0.5σ (TP) or EMA crosses back (flip/exit)")
+    print(f"[BOT] StdDev VWAP RL Bot")
+    print(f"[BOT] ENTRY: RL decides from {CANDLE_MINUTES}min VWAP + StdDev zone context")
+    print(f"[BOT] EXIT: Price touches ±0.5σ (TP), RL close, or flip")
     print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
           f"{TRADE_SESSION_END.strftime('%H:%M')} ET")
     for cfg in symbol_configs:
@@ -1691,7 +1654,7 @@ def main():
             print(f"[CRASH] {type(e).__name__}: {e}")
             print(f"[CRASH] Restarting in {retry_delay}s...")
             send_telegram(args.tg_token, args.tg_chat,
-                          f"STATUS|StdDev bot crashed, restarting in {retry_delay}s")
+                          f"STATUS|StdDev VWAP bot crashed, restarting in {retry_delay}s")
             retry_delay = min(retry_delay * 2, 300)
         finally:
             bot.save_all_state()
