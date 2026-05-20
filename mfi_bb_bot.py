@@ -27,7 +27,7 @@ import threading
 import csv
 import urllib.request
 import urllib.error
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 
 import numpy as np
 import pytz
@@ -763,6 +763,8 @@ class SymbolState:
         self.live_pnl = 0.0
         self._suite_client = None
         self._pending_rl = None
+        self._start_balance = None
+        self._pnl_session_day = None
         self.trade_mae = 0.0        # max adverse excursion (worst drawdown $ during trade)
         self.trade_mfe = 0.0        # max favorable excursion (best unrealized $ during trade)
         self.mae_history = []        # list of MAE values for averaging
@@ -1357,6 +1359,13 @@ class SymbolState:
             self.cum_delta = 0
             self.delta_window = []
             self.delta_session_date = today
+        now_et = datetime.now(ET)
+        session_day = now_et.date() if now_et.time() >= SESSION_START else now_et.date() - timedelta(days=1)
+        if not hasattr(self, '_pnl_session_day') or self._pnl_session_day != session_day:
+            self._pnl_session_day = session_day
+            self._start_balance = None
+            self.live_pnl = 0.0
+            print(f"[{self.symbol} PNL-SYNC] New session day {session_day} — baseline reset")
 
         # Check pending pullback entry
         if self.pending_direction is not None and self.position == 0:
@@ -1747,16 +1756,19 @@ class SymbolState:
             acct_name = os.environ.get("PROJECT_X_ACCOUNT_NAME", "")
             for a in accounts:
                 if a.name == acct_name:
-                    if not hasattr(self, '_start_balance') or self._start_balance is None:
-                        self._start_balance = a.balance - self.live_pnl
-                        print(f"[{self.symbol} PNL-SYNC] Baseline set: ${self._start_balance:,.2f}")
-                    real_pnl = a.balance - self._start_balance
-                    drift = abs(real_pnl - self.live_pnl)
-                    if drift > 2.0:
-                        print(f"[{self.symbol} PNL-SYNC] Bot: ${self.live_pnl:.2f} -> "
-                              f"Platform: ${real_pnl:.2f} (drift ${drift:.2f}, "
-                              f"balance ${a.balance:,.2f})")
-                        self.live_pnl = real_pnl
+                    if self._start_balance is None:
+                        self._start_balance = a.balance
+                        self.live_pnl = 0.0
+                        print(f"[{self.symbol} PNL-SYNC] Baseline set: ${self._start_balance:,.2f} "
+                              f"(live_pnl reset to 0)")
+                    else:
+                        real_pnl = a.balance - self._start_balance
+                        drift = abs(real_pnl - self.live_pnl)
+                        if drift > 2.0:
+                            print(f"[{self.symbol} PNL-SYNC] Bot: ${self.live_pnl:.2f} -> "
+                                  f"Platform: ${real_pnl:.2f} (drift ${drift:.2f}, "
+                                  f"balance ${a.balance:,.2f})")
+                            self.live_pnl = real_pnl
                     break
         except Exception as e:
             print(f"[{self.symbol}] PnL sync failed: {e}")
