@@ -1183,23 +1183,28 @@ class SymbolState:
         if not in_trade_session():
             return actions
 
-        # --- Check if candle fully closed outside BB → arm ---
+        # --- Check if candle fully outside BB (body not touching) → arm ---
         if self.position == 0:
-            if candle_close < bb["lower"]:
+            candle_high_body = max(candle_open, candle_close)
+            candle_low_body = min(candle_open, candle_close)
+
+            if candle_high_body < bb["lower"]:
                 strength = bb["lower"] - candle_close
                 self.armed_direction = "long"
                 self.armed_level = bb["lower"]
                 self.armed_strength = strength
-                print(f"[{now_str}] [{self.symbol} ARMED-LONG] Candle closed {candle_close:.2f} "
-                      f"below lower BB {bb['lower']:.2f} (strength: {strength:.2f}pts)")
+                print(f"[{now_str}] [{self.symbol} ARMED-LONG] Candle fully below lower BB "
+                      f"(O:{candle_open:.2f} C:{candle_close:.2f} < BB:{bb['lower']:.2f}, "
+                      f"strength: {strength:.2f}pts)")
 
-            elif candle_close > bb["upper"]:
+            elif candle_low_body > bb["upper"]:
                 strength = candle_close - bb["upper"]
                 self.armed_direction = "short"
                 self.armed_level = bb["upper"]
                 self.armed_strength = strength
-                print(f"[{now_str}] [{self.symbol} ARMED-SHORT] Candle closed {candle_close:.2f} "
-                      f"above upper BB {bb['upper']:.2f} (strength: {strength:.2f}pts)")
+                print(f"[{now_str}] [{self.symbol} ARMED-SHORT] Candle fully above upper BB "
+                      f"(O:{candle_open:.2f} C:{candle_close:.2f} > BB:{bb['upper']:.2f}, "
+                      f"strength: {strength:.2f}pts)")
 
             elif self.armed_direction is not None:
                 # Candle closed inside BB without triggering → disarm
