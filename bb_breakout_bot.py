@@ -1465,8 +1465,28 @@ class BBBreakoutBot:
 
         self.load_all_state()
 
-        self.suite = await TradingSuite.create(
-            instruments=symbols, timeframes=["1sec"], initial_days=1)
+        try:
+            self.suite = await TradingSuite.create(
+                instruments=symbols, timeframes=["1sec"], initial_days=1)
+        except Exception as e:
+            err_msg = str(e)
+            configured = os.environ.get("PROJECT_X_ACCOUNT_NAME", "")
+            if "not found" in err_msg and "PRAC" in configured.upper():
+                import re
+                acct_names = re.findall(r'(PRAC-V2-\S+)', err_msg)
+                acct_names = [a.rstrip(',') for a in acct_names]
+                if acct_names:
+                    new_acct = acct_names[0]
+                    print(f"[AUTO-SWITCH] Account gone, switching: {configured} -> {new_acct}")
+                    os.environ["PROJECT_X_ACCOUNT_NAME"] = new_acct
+                    send_telegram(self.tg_token, self.tg_chat,
+                                  f"STATUS|Account auto-switched to {new_acct}")
+                    self.suite = await TradingSuite.create(
+                        instruments=symbols, timeframes=["1sec"], initial_days=1)
+                else:
+                    raise
+            else:
+                raise
         self._register_websocket_handlers()
 
         print(f"[BOT] Connected to TopstepX")
