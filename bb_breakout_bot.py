@@ -176,6 +176,8 @@ def in_blackout() -> bool:
 
 def in_trade_session() -> bool:
     t = datetime.now(ET).time()
+    if TRADE_SESSION_START > TRADE_SESSION_END:
+        return t >= TRADE_SESSION_START or t < TRADE_SESSION_END
     return TRADE_SESSION_START <= t < TRADE_SESSION_END
 
 
