@@ -1473,8 +1473,8 @@ class BBBreakoutBot:
             configured = os.environ.get("PROJECT_X_ACCOUNT_NAME", "")
             if "not found" in err_msg and "PRAC" in configured.upper():
                 import re
-                acct_names = re.findall(r'(PRAC-V2-\S+)', err_msg)
-                acct_names = [a.rstrip(',') for a in acct_names]
+                acct_names = re.findall(r'PRAC-V2-[\w-]+', err_msg)
+                acct_names = [a for a in set(acct_names) if a != configured]
                 if acct_names:
                     new_acct = acct_names[0]
                     print(f"[AUTO-SWITCH] Account gone, switching: {configured} -> {new_acct}")
