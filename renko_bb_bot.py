@@ -284,6 +284,7 @@ EARLY_EXIT_MULTIPLIER = 1.5
 EARLY_EXIT_MIN_SAMPLES = 3
 EARLY_EXIT_COOLDOWN = 10
 SLTP_WARMUP = 40  # trades before RL adjusts SL/TP
+DEFAULT_TP_PTS = 10  # default TP in points ($200 on NQ) before RL learns
 
 
 class TradeML:
@@ -524,7 +525,8 @@ class TradeML:
     def select_sl_tp(self, features: dict) -> tuple:
         """Select SL/TP tiers. Returns (sl_pts, tp_pts, sl_idx, tp_idx)."""
         if self.total_trades < SLTP_WARMUP:
-            return 0, 0, 0, 0  # defaults during warmup
+            tp_idx = TP_TIERS.index(DEFAULT_TP_PTS) if DEFAULT_TP_PTS in TP_TIERS else 0
+            return 0, DEFAULT_TP_PTS, 0, tp_idx
 
         state = self._state_key(features)
         sl_q = self._get_sl_q(state)
@@ -1390,7 +1392,7 @@ class RenkoBBBot:
               f"{CANDLE_SECONDS}s candles")
         print(f"[BOT] ENTRY: RED candle above upper BB -> SHORT | GREEN candle below lower BB -> LONG")
         print(f"[BOT] EXIT: candle failure / RL SL/TP / RL close")
-        print(f"[BOT] SL/TP: default=candle_failure, RL learns tiers after {SLTP_WARMUP} trades")
+        print(f"[BOT] SL/TP: default=candle_fail + TP={DEFAULT_TP_PTS}pts (${DEFAULT_TP_PTS * 20}), RL learns after {SLTP_WARMUP} trades")
         print(f"[BOT] SL tiers: {SL_TIERS} pts | TP tiers: {TP_TIERS} pts")
         print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
               f"{TRADE_SESSION_END.strftime('%H:%M')} ET")
@@ -1448,7 +1450,7 @@ class RenkoBBBot:
             msg = (f"STATUS|30s Candle BB Mean-Reversion Bot started\n"
                    f"Account: {acct}\n"
                    f"BB({BB_LENGTH}, {BB_MULT}) on {CANDLE_SECONDS}s candles\n"
-                   f"SL: candle failure (RL learns tiers)\n"
+                   f"SL: candle failure | TP: {DEFAULT_TP_PTS}pts (${DEFAULT_TP_PTS * 20}) default, RL learns tiers\n"
                    f"{stats}")
             threading.Thread(target=send_telegram, args=(
                 self.tg_token, self.tg_chat, msg), daemon=True).start()
