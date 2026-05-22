@@ -766,12 +766,13 @@ class SymbolState:
         now = datetime.now(ET).strftime("%H:%M:%S")
 
         features = self.extract_features()
-        sl_pts, tp_pts, sl_idx, tp_idx = self.ml.select_sl_tp(features)
-        sl_str = f"SL={sl_pts}pts" if sl_pts > 0 else "SL=candle_fail"
-        tp_str = f"TP={tp_pts}pts" if tp_pts > 0 else "TP=RL_managed"
+        sl_pts = 0  # candle failure
+        tp_pts = DEFAULT_TP_PTS
+        sl_idx = 0
+        tp_idx = TP_TIERS.index(DEFAULT_TP_PTS) if DEFAULT_TP_PTS in TP_TIERS else 0
 
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG @ {price:.2f} | "
-              f"{sl_str} | {tp_str} | Session P&L: ${self.live_pnl:.2f}")
+              f"SL=candle_fail | TP={tp_pts}pts (${tp_pts * 20}) | Session P&L: ${self.live_pnl:.2f}")
 
         try:
             response = await asyncio.wait_for(
@@ -817,12 +818,13 @@ class SymbolState:
         now = datetime.now(ET).strftime("%H:%M:%S")
 
         features = self.extract_features()
-        sl_pts, tp_pts, sl_idx, tp_idx = self.ml.select_sl_tp(features)
-        sl_str = f"SL={sl_pts}pts" if sl_pts > 0 else "SL=candle_fail"
-        tp_str = f"TP={tp_pts}pts" if tp_pts > 0 else "TP=RL_managed"
+        sl_pts = 0  # candle failure
+        tp_pts = DEFAULT_TP_PTS
+        sl_idx = 0
+        tp_idx = TP_TIERS.index(DEFAULT_TP_PTS) if DEFAULT_TP_PTS in TP_TIERS else 0
 
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT @ {price:.2f} | "
-              f"{sl_str} | {tp_str} | Session P&L: ${self.live_pnl:.2f}")
+              f"SL=candle_fail | TP={tp_pts}pts (${tp_pts * 20}) | Session P&L: ${self.live_pnl:.2f}")
 
         try:
             response = await asyncio.wait_for(
@@ -976,34 +978,7 @@ class SymbolState:
                 actions.append(("flatten", price, "MAX_LOSS"))
                 return actions
 
-            # Fixed SL check (RL-selected, on every tick)
-            if self.active_sl_pts > 0:
-                if self.position == 1:
-                    sl_price = self.entry_price - self.active_sl_pts
-                    if price <= sl_price:
-                        now_str = datetime.now(ET).strftime("%H:%M:%S")
-                        print(f"[{now_str}] [{self.symbol} SL-HIT] LONG SL={self.active_sl_pts}pts @ {price:.2f}")
-                        self._pending_rl = {"features": self.entry_features,
-                                            "entry_action": self.entry_action,
-                                            "sl_idx": self.active_sl_idx,
-                                            "tp_idx": self.active_tp_idx,
-                                            "mae": self.trade_mae, "mfe": self.trade_mfe}
-                        actions.append(("flatten", price, f"SL_{self.active_sl_pts}pts"))
-                        return actions
-                else:
-                    sl_price = self.entry_price + self.active_sl_pts
-                    if price >= sl_price:
-                        now_str = datetime.now(ET).strftime("%H:%M:%S")
-                        print(f"[{now_str}] [{self.symbol} SL-HIT] SHORT SL={self.active_sl_pts}pts @ {price:.2f}")
-                        self._pending_rl = {"features": self.entry_features,
-                                            "entry_action": self.entry_action,
-                                            "sl_idx": self.active_sl_idx,
-                                            "tp_idx": self.active_tp_idx,
-                                            "mae": self.trade_mae, "mfe": self.trade_mfe}
-                        actions.append(("flatten", price, f"SL_{self.active_sl_pts}pts"))
-                        return actions
-
-            # Fixed TP check (RL-selected, on every tick)
+            # Fixed TP check (on every tick)
             if self.active_tp_pts > 0:
                 if self.position == 1:
                     tp_price = self.entry_price + self.active_tp_pts
@@ -1029,22 +1004,6 @@ class SymbolState:
                                             "mae": self.trade_mae, "mfe": self.trade_mfe}
                         actions.append(("flatten", price, f"TP_{self.active_tp_pts}pts"))
                         return actions
-
-            # RL early exit (checked on ticks, not bricks)
-            elapsed = ts - self.entry_time
-            if elapsed > EARLY_EXIT_COOLDOWN:
-                should_exit, reason, _ = self.ml.should_early_exit(
-                    self.entry_features, unrealized)
-                if should_exit:
-                    now_str = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now_str}] [{self.symbol} EARLY-EXIT] {reason}")
-                    self._pending_rl = {"features": self.entry_features,
-                                        "entry_action": self.entry_action,
-                                        "sl_idx": self.active_sl_idx,
-                                        "tp_idx": self.active_tp_idx,
-                                        "mae": self.trade_mae, "mfe": self.trade_mfe}
-                    actions.append(("flatten", price, "EARLY_EXIT"))
-                    return actions
 
         # --- Process completed candle ---
         if completed_candle is not None:
@@ -1082,40 +1041,6 @@ class SymbolState:
                     actions.append(("flatten", price, "CANDLE_FAIL"))
                     return actions
 
-            # --- If in position: RL hold/flip check on candle close ---
-            if self.position != 0:
-                features = self.extract_features()
-                action_str, _, reason = self.ml.should_skip(features)
-                direction = "LONG" if self.position == 1 else "SHORT"
-
-                if action_str == "flip":
-                    print(f"[{now_str}] [{self.symbol} RL-FLIP] {direction} | {reason}")
-                    self._pending_rl = {"features": self.entry_features,
-                                        "entry_action": self.entry_action,
-                                        "sl_idx": self.active_sl_idx,
-                                        "tp_idx": self.active_tp_idx,
-                                        "mae": self.trade_mae, "mfe": self.trade_mfe}
-                    if self.position == 1:
-                        actions.append(("flatten", price, "RL_FLIP_SHORT"))
-                        actions.append(("enter_short", price))
-                    else:
-                        actions.append(("flatten", price, "RL_FLIP_LONG"))
-                        actions.append(("enter_long", price))
-                    return actions
-
-                elif action_str == "skip":
-                    position_aligned = (self.position == 1 and candle_close > bb["basis"]) or \
-                                       (self.position == -1 and candle_close < bb["basis"])
-                    if not position_aligned:
-                        print(f"[{now_str}] [{self.symbol} RL-CLOSE] {direction} misaligned | {reason}")
-                        self._pending_rl = {"features": self.entry_features,
-                                            "entry_action": self.entry_action,
-                                            "sl_idx": self.active_sl_idx,
-                                            "tp_idx": self.active_tp_idx,
-                                            "mae": self.trade_mae, "mfe": self.trade_mfe}
-                        actions.append(("flatten", price, "RL_CLOSE"))
-                        return actions
-
             if not in_trade_session():
                 return actions
 
@@ -1127,14 +1052,8 @@ class SymbolState:
                     print(f"[{now_str}] [{self.symbol} SIGNAL-SHORT] Red 30s candle above upper BB: "
                           f"close={candle_close:.2f} > upper={bb['upper']:.2f} "
                           f"(strength: {strength:.2f}pts)")
-                    features = self.extract_features()
-                    action_str, _, reason = self.ml.should_skip(features)
-                    print(f"  RL decision: {reason}")
-                    if action_str in ("enter", "flip"):
-                        actions.append(("enter_short", price))
-                        return actions
-                    else:
-                        print(f"  SHORT signal SKIPPED by RL")
+                    actions.append(("enter_short", price))
+                    return actions
 
                 # GREEN candle closes BELOW lower BB → LONG
                 elif candle_direction == "green" and candle_close < bb["lower"]:
@@ -1142,14 +1061,8 @@ class SymbolState:
                     print(f"[{now_str}] [{self.symbol} SIGNAL-LONG] Green 30s candle below lower BB: "
                           f"close={candle_close:.2f} < lower={bb['lower']:.2f} "
                           f"(strength: {strength:.2f}pts)")
-                    features = self.extract_features()
-                    action_str, _, reason = self.ml.should_skip(features)
-                    print(f"  RL decision: {reason}")
-                    if action_str in ("enter", "flip"):
-                        actions.append(("enter_long", price))
-                        return actions
-                    else:
-                        print(f"  LONG signal SKIPPED by RL")
+                    actions.append(("enter_long", price))
+                    return actions
 
         return actions
 
@@ -1391,8 +1304,8 @@ class RenkoBBBot:
         print(f"[BOT] Strategy: BB({BB_LENGTH}, {BB_MULT}) mean-reversion on "
               f"{CANDLE_SECONDS}s candles")
         print(f"[BOT] ENTRY: RED candle above upper BB -> SHORT | GREEN candle below lower BB -> LONG")
-        print(f"[BOT] EXIT: candle failure / RL SL/TP / RL close")
-        print(f"[BOT] SL/TP: default=candle_fail + TP={DEFAULT_TP_PTS}pts (${DEFAULT_TP_PTS * 20}), RL learns after {SLTP_WARMUP} trades")
+        print(f"[BOT] EXIT: candle failure (SL) / TP={DEFAULT_TP_PTS}pts (${DEFAULT_TP_PTS * 20})")
+        print(f"[BOT] MODE: Data collection (no ML) — fixed SL/TP")
         print(f"[BOT] SL tiers: {SL_TIERS} pts | TP tiers: {TP_TIERS} pts")
         print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
               f"{TRADE_SESSION_END.strftime('%H:%M')} ET")
@@ -1450,8 +1363,9 @@ class RenkoBBBot:
             msg = (f"STATUS|30s Candle BB Mean-Reversion Bot started\n"
                    f"Account: {acct}\n"
                    f"BB({BB_LENGTH}, {BB_MULT}) on {CANDLE_SECONDS}s candles\n"
-                   f"SL: candle failure | TP: {DEFAULT_TP_PTS}pts (${DEFAULT_TP_PTS * 20}) default, RL learns tiers\n"
-                   f"{stats}")
+                   f"SL: candle failure | TP: {DEFAULT_TP_PTS}pts (${DEFAULT_TP_PTS * 20})\n"
+                   f"Mode: Data collection (no ML)\n"
+                   f"Session P&L: ${st.live_pnl:.2f}")
             threading.Thread(target=send_telegram, args=(
                 self.tg_token, self.tg_chat, msg), daemon=True).start()
 
@@ -1593,7 +1507,8 @@ def main():
     print(f"[BOT] 30s Candle BB Mean-Reversion Bot")
     print(f"[BOT] BB({BB_LENGTH}, {BB_MULT}) on {CANDLE_SECONDS}s candles")
     print(f"[BOT] ENTRY: red candle close > upper BB -> SHORT | green candle close < lower BB -> LONG")
-    print(f"[BOT] EXIT: candle failure / RL SL/TP / RL close")
+    print(f"[BOT] EXIT: candle failure (SL) / TP={DEFAULT_TP_PTS}pts (${DEFAULT_TP_PTS * 20})")
+    print(f"[BOT] MODE: Data collection (no ML)")
     print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
           f"{TRADE_SESSION_END.strftime('%H:%M')} ET")
     for cfg in symbol_configs:
