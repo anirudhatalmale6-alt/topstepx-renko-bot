@@ -1528,6 +1528,8 @@ class BBBreakoutBot:
         status_interval = 300
         gc_interval = 120
         last_gc = time.time()
+        last_acct_check = time.time()
+        acct_check_interval = 60
 
         while self.running:
             if not in_session():
@@ -1586,6 +1588,26 @@ class BBBreakoutBot:
                 rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
                 print(f"[{datetime.now(ET).strftime('%H:%M:%S')}] [MEM] RSS: {rss_mb:.0f}MB (gc collected)")
                 last_gc = now
+
+            if now - last_acct_check > acct_check_interval:
+                last_acct_check = now
+                configured = os.environ.get("PROJECT_X_ACCOUNT_NAME", "")
+                if "PRAC" in configured.upper():
+                    try:
+                        accounts = await asyncio.wait_for(
+                            self.suite.client.list_accounts(), timeout=10.0)
+                        acct_names = [a.name for a in accounts]
+                        if configured not in acct_names:
+                            prac = [n for n in acct_names if "PRAC" in n.upper()]
+                            print(f"[ACCT-CHECK] {configured} gone! Available: {acct_names}")
+                            if prac:
+                                print(f"[ACCT-CHECK] New practice found: {prac[0]} — restarting to switch")
+                            else:
+                                print(f"[ACCT-CHECK] No practice accounts — restarting to retry")
+                            self.save_all_state()
+                            os._exit(1)
+                    except Exception:
+                        pass
 
             if time.time() - self.last_tick_time > WATCHDOG_TIMEOUT:
                 print(f"[WATCHDOG] No ticks for {time.time() - self.last_tick_time:.0f}s — killing")
