@@ -1005,64 +1005,66 @@ class SymbolState:
                         actions.append(("flatten", price, f"TP_{self.active_tp_pts}pts"))
                         return actions
 
-        # --- Process completed candle ---
+        # --- Update BB on completed candle ---
         if completed_candle is not None:
             closes = self.candles.get_closes()
             bb = self.bb.compute(closes)
-            if bb is None:
+            if bb is not None:
+                self.last_bb = bb
+
+        # --- Ghost candle: check live forming candle on every tick ---
+        bb = self.last_bb
+        forming = self.candles._current
+        if bb is None or forming is None:
+            return actions
+
+        candle_open = forming["open"]
+        ghost_dir = "green" if price >= candle_open else "red"
+        now_str = datetime.now(ET).strftime("%H:%M:%S")
+
+        # --- If in position: ghost candle failure stop (immediate) ---
+        if self.position != 0:
+            if self.position == 1 and ghost_dir == "red" and price < bb["lower"]:
+                print(f"[{now_str}] [{self.symbol} CANDLE-FAIL] LONG: ghost red candle "
+                      f"{price:.2f} < lower BB {bb['lower']:.2f}")
+                self._pending_rl = {"features": self.entry_features,
+                                    "entry_action": self.entry_action,
+                                    "sl_idx": self.active_sl_idx,
+                                    "tp_idx": self.active_tp_idx,
+                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
+                actions.append(("flatten", price, "CANDLE_FAIL"))
                 return actions
-            self.last_bb = bb
-
-            candle_close = completed_candle["close"]
-            candle_open = completed_candle["open"]
-            candle_direction = completed_candle["direction"]  # "green" or "red"
-            now_str = datetime.now(ET).strftime("%H:%M:%S")
-
-            # --- If in position: check candle failure stop (default SL=0) ---
-            if self.position != 0 and self.active_sl_pts == 0:
-                if self.position == 1 and candle_direction == "red" and candle_close < bb["lower"]:
-                    print(f"[{now_str}] [{self.symbol} CANDLE-FAIL] LONG: red candle closed "
-                          f"{candle_close:.2f} < lower BB {bb['lower']:.2f}")
-                    self._pending_rl = {"features": self.entry_features,
-                                        "entry_action": self.entry_action,
-                                        "sl_idx": self.active_sl_idx,
-                                        "tp_idx": self.active_tp_idx,
-                                        "mae": self.trade_mae, "mfe": self.trade_mfe}
-                    actions.append(("flatten", price, "CANDLE_FAIL"))
-                    return actions
-                elif self.position == -1 and candle_direction == "green" and candle_close > bb["upper"]:
-                    print(f"[{now_str}] [{self.symbol} CANDLE-FAIL] SHORT: green candle closed "
-                          f"{candle_close:.2f} > upper BB {bb['upper']:.2f}")
-                    self._pending_rl = {"features": self.entry_features,
-                                        "entry_action": self.entry_action,
-                                        "sl_idx": self.active_sl_idx,
-                                        "tp_idx": self.active_tp_idx,
-                                        "mae": self.trade_mae, "mfe": self.trade_mfe}
-                    actions.append(("flatten", price, "CANDLE_FAIL"))
-                    return actions
-
-            if not in_trade_session():
+            elif self.position == -1 and ghost_dir == "green" and price > bb["upper"]:
+                print(f"[{now_str}] [{self.symbol} CANDLE-FAIL] SHORT: ghost green candle "
+                      f"{price:.2f} > upper BB {bb['upper']:.2f}")
+                self._pending_rl = {"features": self.entry_features,
+                                    "entry_action": self.entry_action,
+                                    "sl_idx": self.active_sl_idx,
+                                    "tp_idx": self.active_tp_idx,
+                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
+                actions.append(("flatten", price, "CANDLE_FAIL"))
                 return actions
 
-            # --- Entry logic (mean-reversion) when flat ---
-            if self.position == 0:
-                # RED candle closes ABOVE upper BB → SHORT
-                if candle_direction == "red" and candle_close > bb["upper"]:
-                    strength = candle_close - bb["upper"]
-                    print(f"[{now_str}] [{self.symbol} SIGNAL-SHORT] Red 30s candle above upper BB: "
-                          f"close={candle_close:.2f} > upper={bb['upper']:.2f} "
-                          f"(strength: {strength:.2f}pts)")
-                    actions.append(("enter_short", price))
-                    return actions
+        if not in_trade_session():
+            return actions
 
-                # GREEN candle closes BELOW lower BB → LONG
-                elif candle_direction == "green" and candle_close < bb["lower"]:
-                    strength = bb["lower"] - candle_close
-                    print(f"[{now_str}] [{self.symbol} SIGNAL-LONG] Green 30s candle below lower BB: "
-                          f"close={candle_close:.2f} < lower={bb['lower']:.2f} "
-                          f"(strength: {strength:.2f}pts)")
-                    actions.append(("enter_long", price))
-                    return actions
+        # --- Entry: ghost candle mean-reversion (immediate on tick) ---
+        if self.position == 0:
+            if ghost_dir == "red" and price > bb["upper"]:
+                strength = price - bb["upper"]
+                print(f"[{now_str}] [{self.symbol} SIGNAL-SHORT] Ghost red candle above upper BB: "
+                      f"price={price:.2f} > upper={bb['upper']:.2f} "
+                      f"(strength: {strength:.2f}pts)")
+                actions.append(("enter_short", price))
+                return actions
+
+            elif ghost_dir == "green" and price < bb["lower"]:
+                strength = bb["lower"] - price
+                print(f"[{now_str}] [{self.symbol} SIGNAL-LONG] Ghost green candle below lower BB: "
+                      f"price={price:.2f} < lower={bb['lower']:.2f} "
+                      f"(strength: {strength:.2f}pts)")
+                actions.append(("enter_long", price))
+                return actions
 
         return actions
 
@@ -1303,9 +1305,9 @@ class RenkoBBBot:
         print(f"[BOT] 30s Candle BB Mean-Reversion Bot starting...")
         print(f"[BOT] Strategy: BB({BB_LENGTH}, {BB_MULT}) mean-reversion on "
               f"{CANDLE_SECONDS}s candles")
-        print(f"[BOT] ENTRY: RED candle above upper BB -> SHORT | GREEN candle below lower BB -> LONG")
-        print(f"[BOT] EXIT: candle failure (SL) / TP={DEFAULT_TP_PTS}pts (${DEFAULT_TP_PTS * 20})")
-        print(f"[BOT] MODE: Data collection (no ML) — fixed SL/TP")
+        print(f"[BOT] ENTRY: Ghost RED candle above upper BB -> SHORT | Ghost GREEN candle below lower BB -> LONG")
+        print(f"[BOT] EXIT: Ghost candle failure (immediate) / TP={DEFAULT_TP_PTS}pts (${DEFAULT_TP_PTS * 20})")
+        print(f"[BOT] MODE: Ghost candle, no ML — immediate entry/exit on tick")
         print(f"[BOT] SL tiers: {SL_TIERS} pts | TP tiers: {TP_TIERS} pts")
         print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
               f"{TRADE_SESSION_END.strftime('%H:%M')} ET")
@@ -1364,7 +1366,7 @@ class RenkoBBBot:
                    f"Account: {acct}\n"
                    f"BB({BB_LENGTH}, {BB_MULT}) on {CANDLE_SECONDS}s candles\n"
                    f"SL: candle failure | TP: {DEFAULT_TP_PTS}pts (${DEFAULT_TP_PTS * 20})\n"
-                   f"Mode: Data collection (no ML)\n"
+                   f"Mode: Ghost candle (immediate entry/exit, no ML)\n"
                    f"Session P&L: ${st.live_pnl:.2f}")
             threading.Thread(target=send_telegram, args=(
                 self.tg_token, self.tg_chat, msg), daemon=True).start()
@@ -1506,9 +1508,9 @@ def main():
 
     print(f"[BOT] 30s Candle BB Mean-Reversion Bot")
     print(f"[BOT] BB({BB_LENGTH}, {BB_MULT}) on {CANDLE_SECONDS}s candles")
-    print(f"[BOT] ENTRY: red candle close > upper BB -> SHORT | green candle close < lower BB -> LONG")
-    print(f"[BOT] EXIT: candle failure (SL) / TP={DEFAULT_TP_PTS}pts (${DEFAULT_TP_PTS * 20})")
-    print(f"[BOT] MODE: Data collection (no ML)")
+    print(f"[BOT] ENTRY: Ghost red candle > upper BB -> SHORT | Ghost green candle < lower BB -> LONG")
+    print(f"[BOT] EXIT: Ghost candle failure (immediate) / TP={DEFAULT_TP_PTS}pts (${DEFAULT_TP_PTS * 20})")
+    print(f"[BOT] MODE: Ghost candle, no ML")
     print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
           f"{TRADE_SESSION_END.strftime('%H:%M')} ET")
     for cfg in symbol_configs:
