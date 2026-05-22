@@ -1,7 +1,7 @@
 """
 TopstepX Renko BB Mean-Reversion Bot (LIVE)
 ============================================
-Strategy: Bollinger Band(20, 1.5) mean-reversion on Renko bricks (0.25pt brick size)
+Strategy: Bollinger Band(20, 1.5) mean-reversion on Renko bricks (1pt brick size)
 - Build close-based Renko bricks from live tick prices (brick size = RENKO_BRICK_SIZE pts)
 - Compute BB(20, SMA, close, 1.5 StdDev, ddof=0) on Renko brick closes — matches TradingView
 - Entry (mean-reversion):
@@ -135,7 +135,7 @@ TRADE_SESSION_END = dtime(16, 0, 0)
 # BB settings — matches TradingView: BB(20, SMA, close, 1.5, ddof=0)
 BB_LENGTH = 20
 BB_MULT = 1.5
-RENKO_BRICK_SIZE = 0.25  # points per brick
+RENKO_BRICK_SIZE = 1.0  # points per brick
 
 # SL/TP tiers the RL can learn to select
 # 0 = default behavior (brick failure for SL, no fixed TP)
