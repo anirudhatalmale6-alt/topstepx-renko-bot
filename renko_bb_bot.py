@@ -1,18 +1,17 @@
 """
-TopstepX Renko BB Mean-Reversion Bot (LIVE)
-============================================
-Strategy: Bollinger Band(20, 1.5) mean-reversion on Renko bricks (1pt brick size)
-- Build close-based Renko bricks from live tick prices (brick size = RENKO_BRICK_SIZE pts)
-- Compute BB(20, SMA, close, 1.5 StdDev, ddof=0) on Renko brick closes — matches TradingView
+TopstepX BB Mean-Reversion Bot (LIVE)
+======================================
+Strategy: Bollinger Band(20, 1.5) mean-reversion on 30-second candles
+- Compute BB(20, SMA, close, 1.5 StdDev, ddof=0) on 30s candle closes — matches TradingView
 - Entry (mean-reversion):
-    RED brick forms AND close is ABOVE upper BB  → enter SHORT  (overextended up, reverting down)
-    GREEN brick forms AND close is BELOW lower BB → enter LONG  (overextended down, reverting up)
-- Exit (brick failure):
-    LONG position: new RED brick closes BELOW lower BB  → exit
-    SHORT position: new GREEN brick closes ABOVE upper BB → exit
+    RED candle (close < open) AND close is ABOVE upper BB  → enter SHORT
+    GREEN candle (close > open) AND close is BELOW lower BB → enter LONG
+- Exit (candle failure):
+    LONG position: new RED candle closes BELOW lower BB  → exit
+    SHORT position: new GREEN candle closes ABOVE upper BB → exit
 - RL learns to adjust SL/TP tiers over time via Q-learning
-- Fixed-point SL/TP checked on every tick; brick-failure stop checked on brick close
-- Re-entry possible immediately on the next qualifying brick
+- Fixed-point SL/TP checked on every tick; candle-failure stop on candle close
+- Re-entry possible immediately on the next qualifying candle
 
 Usage:
     python renko_bb_bot.py --symbols "NQ:1" --tick-interval 1
@@ -135,10 +134,10 @@ TRADE_SESSION_END = dtime(16, 0, 0)
 # BB settings — matches TradingView: BB(20, SMA, close, 1.5, ddof=0)
 BB_LENGTH = 20
 BB_MULT = 1.5
-RENKO_BRICK_SIZE = 1.0  # points per brick
+CANDLE_SECONDS = 30  # 30-second candles
 
 # SL/TP tiers the RL can learn to select
-# 0 = default behavior (brick failure for SL, no fixed TP)
+# 0 = default behavior (candle failure for SL, no fixed TP)
 SL_TIERS = [0, 3, 5, 8, 12, 20]      # points
 TP_TIERS = [0, 5, 10, 20, 40, 80]    # points
 
@@ -185,55 +184,58 @@ def in_trade_session() -> bool:
 
 
 # ============================================================
-# Renko Brick Builder
+# 30-Second Candle Builder
 # ============================================================
 
-class RenkoBrickBuilder:
-    """Close-based Renko brick builder. Feeds tick prices, returns completed bricks."""
+class CandleBuilder:
+    """Builds fixed-interval candles from tick data."""
 
-    def __init__(self, brick_size: float = RENKO_BRICK_SIZE):
-        self.brick_size = brick_size
-        self.bricks = []
-        self._last_close = None
-        self._max_bricks = 500
+    def __init__(self, interval_secs: int = CANDLE_SECONDS):
+        self.interval = interval_secs
+        self.candles = []
+        self._current = None
+        self._max_candles = 500
 
-    def feed(self, price: float) -> list:
-        """Feed a price tick. Returns list of completed bricks (usually 0 or 1, can be multiple on gap)."""
-        if self._last_close is None:
-            # Initialize: round to nearest brick boundary
-            self._last_close = round(price / self.brick_size) * self.brick_size
-            return []
+    def _candle_start(self, ts: float) -> float:
+        dt = datetime.fromtimestamp(ts, tz=ET)
+        sod = dt.hour * 3600 + dt.minute * 60 + dt.second
+        candle_sec = (sod // self.interval) * self.interval
+        h, rem = divmod(candle_sec, 3600)
+        m, s = divmod(rem, 60)
+        return dt.replace(hour=h, minute=m, second=s, microsecond=0).timestamp()
 
-        completed = []
-        while price >= self._last_close + self.brick_size:
-            new_close = self._last_close + self.brick_size
-            brick = {"open": self._last_close, "close": new_close,
-                     "high": new_close, "low": self._last_close,
-                     "direction": "green"}
-            completed.append(brick)
-            self.bricks.append(brick)
-            self._last_close = new_close
+    def feed(self, price: float, ts: float = None) -> dict:
+        if ts is None:
+            ts = time.time()
+        candle_start = self._candle_start(ts)
 
-        while price <= self._last_close - self.brick_size:
-            new_close = self._last_close - self.brick_size
-            brick = {"open": self._last_close, "close": new_close,
-                     "high": self._last_close, "low": new_close,
-                     "direction": "red"}
-            completed.append(brick)
-            self.bricks.append(brick)
-            self._last_close = new_close
+        if self._current is None:
+            self._current = {"start": candle_start, "open": price, "high": price,
+                             "low": price, "close": price, "volume": 1}
+            return None
 
-        if len(self.bricks) > self._max_bricks:
-            self.bricks = self.bricks[-self._max_bricks:]
+        if candle_start > self._current["start"]:
+            completed = dict(self._current)
+            completed["direction"] = "green" if completed["close"] >= completed["open"] else "red"
+            self.candles.append(completed)
+            if len(self.candles) > self._max_candles:
+                self.candles = self.candles[-self._max_candles:]
+            self._current = {"start": candle_start, "open": price, "high": price,
+                             "low": price, "close": price, "volume": 1}
+            return completed
 
-        return completed
+        self._current["high"] = max(self._current["high"], price)
+        self._current["low"] = min(self._current["low"], price)
+        self._current["close"] = price
+        self._current["volume"] += 1
+        return None
 
     def get_closes(self, n=None):
-        closes = [b["close"] for b in self.bricks]
+        closes = [c["close"] for c in self.candles]
         return closes[-n:] if n else closes
 
     def get_momentum(self, lookback=5):
-        closes = [b["close"] for b in self.bricks]
+        closes = [c["close"] for c in self.candles]
         if len(closes) < lookback + 1:
             return 0.0
         return (closes[-1] - closes[-(lookback + 1)]) / lookback
@@ -285,7 +287,7 @@ SLTP_WARMUP = 40  # trades before RL adjusts SL/TP
 
 
 class TradeML:
-    """Q-learning RL for Renko BB reversal with SL/TP tier learning."""
+    """Q-learning RL for 30s candle BB reversal with SL/TP tier learning."""
 
     ACTION_ENTER = 0
     ACTION_SKIP = 1
@@ -416,7 +418,7 @@ class TradeML:
         except Exception as e:
             print(f"[RL] Save error: {e}")
 
-    def extract_features(self, price: float, bb: dict, renko_closes: list,
+    def extract_features(self, price: float, bb: dict, candle_closes: list,
                          armed_direction: str = None, armed_strength: float = 0.0) -> dict:
         hour = datetime.now(ET).hour
 
@@ -443,9 +445,9 @@ class TradeML:
             else:
                 bb_pos = "middle"
 
-        # Momentum from last 5 renko closes
-        if len(renko_closes) >= 6:
-            mom_pts = (renko_closes[-1] - renko_closes[-6]) / 5.0
+        # Momentum from last 5 candle closes
+        if len(candle_closes) >= 6:
+            mom_pts = (candle_closes[-1] - candle_closes[-6]) / 5.0
         else:
             mom_pts = 0.0
         if mom_pts > 3:
@@ -470,8 +472,8 @@ class TradeML:
             breakout_str = "none"
 
         vol = 0.0
-        if len(renko_closes) >= 10:
-            vol = float(np.std(renko_closes[-10:]))
+        if len(candle_closes) >= 10:
+            vol = float(np.std(candle_closes[-10:]))
 
         return {
             "bb_position": bb_pos,
@@ -623,7 +625,7 @@ class TradeML:
 
         wins = sum(1 for t in self.trades if t["win"] == 1)
         total = len(self.trades)
-        sl_str = f"SL={SL_TIERS[sl_idx]}pts" if sl_idx < len(SL_TIERS) and SL_TIERS[sl_idx] > 0 else "SL=brick"
+        sl_str = f"SL={SL_TIERS[sl_idx]}pts" if sl_idx < len(SL_TIERS) and SL_TIERS[sl_idx] > 0 else "SL=candle_fail"
         tp_str = f"TP={TP_TIERS[tp_idx]}pts" if tp_idx < len(TP_TIERS) and TP_TIERS[tp_idx] > 0 else "TP=RL"
         print(f"[RL] Trade recorded: PnL=${pnl:.2f} | {entry_action} | {sl_str} | {tp_str} | "
               f"state={state} | eps={self.epsilon:.3f} | "
@@ -674,8 +676,8 @@ class SymbolState:
         self.tp_webhooks = tp_webhooks or []
         self.pv = POINT_VALUES.get(symbol, 20.0)
 
-        # Market data — Renko brick builder instead of candles
-        self.renko = RenkoBrickBuilder(RENKO_BRICK_SIZE)
+        # Market data — 30-second candle builder
+        self.candles = CandleBuilder(CANDLE_SECONDS)
         self.bb = BollingerBands(BB_LENGTH, BB_MULT)
         self.last_price = 0.0
         self.last_tick_time = 0.0
@@ -688,8 +690,8 @@ class SymbolState:
         self.entry_time = 0.0
         self.entry_features = None
         self.entry_action = "enter"
-        self.entry_bb = None         # BB values at entry (for brick failure stop)
-        self.active_sl_pts = 0       # RL-selected SL in points (0 = brick failure)
+        self.entry_bb = None         # BB values at entry (for candle failure stop)
+        self.active_sl_pts = 0       # RL-selected SL in points (0 = candle failure)
         self.active_tp_pts = 0       # RL-selected TP in points (0 = no fixed TP)
         self.active_sl_idx = 0
         self.active_tp_idx = 0
@@ -698,7 +700,7 @@ class SymbolState:
         self.trade_mfe = 0.0
 
         # RL
-        self.ml = TradeML(os.path.join(os.getcwd(), f"rl_state_{symbol}_renko_bb.json"))
+        self.ml = TradeML(os.path.join(os.getcwd(), f"rl_state_{symbol}_30s_bb.json"))
 
         # TopstepX context
         self.ctx = None
@@ -712,10 +714,10 @@ class SymbolState:
         self._save_counter = 0
 
     def extract_features(self) -> dict:
-        closes = self.renko.get_closes(BB_LENGTH + 10)
+        closes = self.candles.get_closes(BB_LENGTH + 10)
         return self.ml.extract_features(
             price=self.last_price, bb=self.last_bb,
-            renko_closes=closes,
+            candle_closes=closes,
             armed_direction=None,
             armed_strength=0.0)
 
@@ -763,7 +765,7 @@ class SymbolState:
 
         features = self.extract_features()
         sl_pts, tp_pts, sl_idx, tp_idx = self.ml.select_sl_tp(features)
-        sl_str = f"SL={sl_pts}pts" if sl_pts > 0 else "SL=brick_fail"
+        sl_str = f"SL={sl_pts}pts" if sl_pts > 0 else "SL=candle_fail"
         tp_str = f"TP={tp_pts}pts" if tp_pts > 0 else "TP=RL_managed"
 
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG @ {price:.2f} | "
@@ -814,7 +816,7 @@ class SymbolState:
 
         features = self.extract_features()
         sl_pts, tp_pts, sl_idx, tp_idx = self.ml.select_sl_tp(features)
-        sl_str = f"SL={sl_pts}pts" if sl_pts > 0 else "SL=brick_fail"
+        sl_str = f"SL={sl_pts}pts" if sl_pts > 0 else "SL=candle_fail"
         tp_str = f"TP={tp_pts}pts" if tp_pts > 0 else "TP=RL_managed"
 
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT @ {price:.2f} | "
@@ -918,7 +920,7 @@ class SymbolState:
         self.entry_bb = None
 
     def tick(self, price: float, ts: float = None):
-        """Process a tick. Renko BB mean-reversion strategy."""
+        """Process a tick. 30s candle BB mean-reversion strategy."""
         if ts is None:
             ts = time.time()
         self.last_price = price
@@ -935,8 +937,8 @@ class SymbolState:
             self.daily_loss = 0.0
             print(f"[{self.symbol} SESSION] New session day {session_day} — all reset")
 
-        # Feed tick to renko builder — may produce 0 or more completed bricks
-        completed_bricks = self.renko.feed(price)
+        # Feed tick to candle builder — returns completed candle or None
+        completed_candle = self.candles.feed(price, ts)
 
         # Track MAE/MFE for open position (tick-level)
         if self.position != 0:
@@ -1042,45 +1044,43 @@ class SymbolState:
                     actions.append(("flatten", price, "EARLY_EXIT"))
                     return actions
 
-        # --- Process each completed brick ---
-        for brick in completed_bricks:
-            # Recompute BB on current renko closes
-            closes = self.renko.get_closes()
+        # --- Process completed candle ---
+        if completed_candle is not None:
+            closes = self.candles.get_closes()
             bb = self.bb.compute(closes)
             if bb is None:
-                continue
+                return actions
             self.last_bb = bb
 
-            brick_close = brick["close"]
-            brick_direction = brick["direction"]  # "green" or "red"
+            candle_close = completed_candle["close"]
+            candle_open = completed_candle["open"]
+            candle_direction = completed_candle["direction"]  # "green" or "red"
             now_str = datetime.now(ET).strftime("%H:%M:%S")
 
-            # --- If in position: check brick failure stop (default SL=0) ---
+            # --- If in position: check candle failure stop (default SL=0) ---
             if self.position != 0 and self.active_sl_pts == 0:
-                # LONG: exit if a red brick closes below lower BB
-                if self.position == 1 and brick_direction == "red" and brick_close < bb["lower"]:
-                    print(f"[{now_str}] [{self.symbol} BRICK-FAIL] LONG: red brick closed "
-                          f"{brick_close:.2f} < lower BB {bb['lower']:.2f}")
+                if self.position == 1 and candle_direction == "red" and candle_close < bb["lower"]:
+                    print(f"[{now_str}] [{self.symbol} CANDLE-FAIL] LONG: red candle closed "
+                          f"{candle_close:.2f} < lower BB {bb['lower']:.2f}")
                     self._pending_rl = {"features": self.entry_features,
                                         "entry_action": self.entry_action,
                                         "sl_idx": self.active_sl_idx,
                                         "tp_idx": self.active_tp_idx,
                                         "mae": self.trade_mae, "mfe": self.trade_mfe}
-                    actions.append(("flatten", price, "BRICK_FAIL"))
+                    actions.append(("flatten", price, "CANDLE_FAIL"))
                     return actions
-                # SHORT: exit if a green brick closes above upper BB
-                elif self.position == -1 and brick_direction == "green" and brick_close > bb["upper"]:
-                    print(f"[{now_str}] [{self.symbol} BRICK-FAIL] SHORT: green brick closed "
-                          f"{brick_close:.2f} > upper BB {bb['upper']:.2f}")
+                elif self.position == -1 and candle_direction == "green" and candle_close > bb["upper"]:
+                    print(f"[{now_str}] [{self.symbol} CANDLE-FAIL] SHORT: green candle closed "
+                          f"{candle_close:.2f} > upper BB {bb['upper']:.2f}")
                     self._pending_rl = {"features": self.entry_features,
                                         "entry_action": self.entry_action,
                                         "sl_idx": self.active_sl_idx,
                                         "tp_idx": self.active_tp_idx,
                                         "mae": self.trade_mae, "mfe": self.trade_mfe}
-                    actions.append(("flatten", price, "BRICK_FAIL"))
+                    actions.append(("flatten", price, "CANDLE_FAIL"))
                     return actions
 
-            # --- If in position: RL hold/flip check on brick close ---
+            # --- If in position: RL hold/flip check on candle close ---
             if self.position != 0:
                 features = self.extract_features()
                 action_str, _, reason = self.ml.should_skip(features)
@@ -1102,9 +1102,8 @@ class SymbolState:
                     return actions
 
                 elif action_str == "skip":
-                    # RL says skip while in position — close if misaligned with BB basis
-                    position_aligned = (self.position == 1 and brick_close > bb["basis"]) or \
-                                       (self.position == -1 and brick_close < bb["basis"])
+                    position_aligned = (self.position == 1 and candle_close > bb["basis"]) or \
+                                       (self.position == -1 and candle_close < bb["basis"])
                     if not position_aligned:
                         print(f"[{now_str}] [{self.symbol} RL-CLOSE] {direction} misaligned | {reason}")
                         self._pending_rl = {"features": self.entry_features,
@@ -1116,15 +1115,15 @@ class SymbolState:
                         return actions
 
             if not in_trade_session():
-                continue
+                return actions
 
             # --- Entry logic (mean-reversion) when flat ---
             if self.position == 0:
-                # RED brick closes ABOVE upper BB → SHORT (price overextended up, mean-revert down)
-                if brick_direction == "red" and brick_close > bb["upper"]:
-                    strength = brick_close - bb["upper"]
-                    print(f"[{now_str}] [{self.symbol} SIGNAL-SHORT] Red brick above upper BB: "
-                          f"close={brick_close:.2f} > upper={bb['upper']:.2f} "
+                # RED candle closes ABOVE upper BB → SHORT
+                if candle_direction == "red" and candle_close > bb["upper"]:
+                    strength = candle_close - bb["upper"]
+                    print(f"[{now_str}] [{self.symbol} SIGNAL-SHORT] Red 30s candle above upper BB: "
+                          f"close={candle_close:.2f} > upper={bb['upper']:.2f} "
                           f"(strength: {strength:.2f}pts)")
                     features = self.extract_features()
                     action_str, _, reason = self.ml.should_skip(features)
@@ -1135,11 +1134,11 @@ class SymbolState:
                     else:
                         print(f"  SHORT signal SKIPPED by RL")
 
-                # GREEN brick closes BELOW lower BB → LONG (price overextended down, mean-revert up)
-                elif brick_direction == "green" and brick_close < bb["lower"]:
-                    strength = bb["lower"] - brick_close
-                    print(f"[{now_str}] [{self.symbol} SIGNAL-LONG] Green brick below lower BB: "
-                          f"close={brick_close:.2f} < lower={bb['lower']:.2f} "
+                # GREEN candle closes BELOW lower BB → LONG
+                elif candle_direction == "green" and candle_close < bb["lower"]:
+                    strength = bb["lower"] - candle_close
+                    print(f"[{now_str}] [{self.symbol} SIGNAL-LONG] Green 30s candle below lower BB: "
+                          f"close={candle_close:.2f} < lower={bb['lower']:.2f} "
                           f"(strength: {strength:.2f}pts)")
                     features = self.extract_features()
                     action_str, _, reason = self.ml.should_skip(features)
@@ -1171,18 +1170,15 @@ class SymbolState:
             "trade_mae": self.trade_mae,
             "trade_mfe": self.trade_mfe,
             "daily_loss": self.daily_loss,
-            "renko_last_close": self.renko._last_close,
-            "renko_data": self.renko.bricks[-50:],
+            "candle_data": self.candles.candles[-50:],
             "last_bb": self.last_bb,
         }
 
     def restore_state(self, state: dict, position_ttl: int = 600) -> bool:
         age = time.time() - state.get("saved_at", 0)
-        renko_last_close = state.get("renko_last_close")
-        renko_data = state.get("renko_data", [])
-        if renko_last_close is not None:
-            self.renko._last_close = renko_last_close
-        self.renko.bricks = renko_data
+        candle_data = state.get("candle_data", [])
+        if candle_data:
+            self.candles.candles = candle_data
         self.last_bb = state.get("last_bb")
         self.daily_loss = state.get("daily_loss", 0.0)
 
@@ -1203,8 +1199,7 @@ class SymbolState:
             self.trade_mfe = state.get("trade_mfe", 0.0)
             bb_str = f"BB basis={self.last_bb['basis']:.2f}" if self.last_bb else "no BB yet"
             print(f"  [{self.symbol}] Restored: pos={self.position}, {bb_str}, "
-                  f"renko_bricks={len(self.renko.bricks)}, "
-                  f"renko_last_close={self.renko._last_close}")
+                  f"candles={len(self.candles.candles)}")
             return True
         else:
             print(f"  [{self.symbol}] State too old ({age:.0f}s), cleared")
@@ -1226,7 +1221,7 @@ class RenkoBBBot:
         self.running = True
         self.suite = None
         self.states = {}
-        self.state_file = os.path.join(os.getcwd(), "bot_state_renko_bb.json")
+        self.state_file = os.path.join(os.getcwd(), "bot_state_30s_bb.json")
         self.last_tick_time = time.time()
 
         for cfg in symbol_configs:
@@ -1390,12 +1385,12 @@ class RenkoBBBot:
         from project_x_py import TradingSuite
 
         symbols = self._symbols_list()
-        print(f"[BOT] Renko BB Mean-Reversion Bot starting...")
+        print(f"[BOT] 30s Candle BB Mean-Reversion Bot starting...")
         print(f"[BOT] Strategy: BB({BB_LENGTH}, {BB_MULT}) mean-reversion on "
-              f"Renko bricks ({RENKO_BRICK_SIZE}pt brick size)")
-        print(f"[BOT] ENTRY: RED brick above upper BB -> SHORT | GREEN brick below lower BB -> LONG")
-        print(f"[BOT] EXIT: brick failure / RL SL/TP / RL close")
-        print(f"[BOT] SL/TP: default=brick_failure, RL learns tiers after {SLTP_WARMUP} trades")
+              f"{CANDLE_SECONDS}s candles")
+        print(f"[BOT] ENTRY: RED candle above upper BB -> SHORT | GREEN candle below lower BB -> LONG")
+        print(f"[BOT] EXIT: candle failure / RL SL/TP / RL close")
+        print(f"[BOT] SL/TP: default=candle_failure, RL learns tiers after {SLTP_WARMUP} trades")
         print(f"[BOT] SL tiers: {SL_TIERS} pts | TP tiers: {TP_TIERS} pts")
         print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
               f"{TRADE_SESSION_END.strftime('%H:%M')} ET")
@@ -1443,17 +1438,17 @@ class RenkoBBBot:
         await self._auto_detect_practice_account(symbols)
 
         print(f"[BOT] Session active: {in_session()}")
-        print(f"[BOT] Trading LIVE — Renko BB Mean-Reversion strategy ({', '.join(symbols)})")
+        print(f"[BOT] Trading LIVE — 30s Candle BB Mean-Reversion strategy ({', '.join(symbols)})")
         print(f"[BOT] Watchdog: {WATCHDOG_TIMEOUT}s timeout")
         print(f"[BOT] Press Ctrl+C to stop")
 
         # Startup Telegram
         for sym, st in self.states.items():
             stats = st.ml.stats()
-            msg = (f"STATUS|Renko BB Mean-Reversion Bot started\n"
+            msg = (f"STATUS|30s Candle BB Mean-Reversion Bot started\n"
                    f"Account: {acct}\n"
-                   f"BB({BB_LENGTH}, {BB_MULT}) on Renko bricks ({RENKO_BRICK_SIZE}pt)\n"
-                   f"SL: brick failure (RL learns tiers)\n"
+                   f"BB({BB_LENGTH}, {BB_MULT}) on {CANDLE_SECONDS}s candles\n"
+                   f"SL: candle failure (RL learns tiers)\n"
                    f"{stats}")
             threading.Thread(target=send_telegram, args=(
                 self.tg_token, self.tg_chat, msg), daemon=True).start()
@@ -1516,8 +1511,7 @@ class RenkoBBBot:
                     print(f"    Price: {st.last_price:.2f} | {bb_str}")
                     print(f"    Position: {pos_str} x{st.contracts_held} | "
                           f"P&L: ${st.live_pnl:.2f}")
-                    print(f"    Renko bricks: {len(st.renko.bricks)} | "
-                          f"Last close: {st.renko._last_close} | {st.ml.stats()}")
+                    print(f"    Candles: {len(st.candles.candles)} | {st.ml.stats()}")
                 last_status = now
 
             if now - last_gc > gc_interval:
@@ -1576,7 +1570,7 @@ def parse_symbol_configs(symbols_str: str) -> list:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TopstepX Renko BB Mean-Reversion Bot")
+    parser = argparse.ArgumentParser(description="TopstepX 30s Candle BB Mean-Reversion Bot")
     parser.add_argument("--symbols", default="NQ:1",
                         help="Multi-symbol: 'NQ:1:ntfy-topic,ES:1'")
     parser.add_argument("--tg-token", default="", help="Telegram bot token")
@@ -1594,10 +1588,10 @@ def main():
         print("ERROR: No symbols configured")
         return
 
-    print(f"[BOT] Renko BB Mean-Reversion Bot")
-    print(f"[BOT] BB({BB_LENGTH}, {BB_MULT}) on Renko bricks ({RENKO_BRICK_SIZE}pt brick size)")
-    print(f"[BOT] ENTRY: red brick close > upper BB -> SHORT | green brick close < lower BB -> LONG")
-    print(f"[BOT] EXIT: brick failure / RL SL/TP / RL close")
+    print(f"[BOT] 30s Candle BB Mean-Reversion Bot")
+    print(f"[BOT] BB({BB_LENGTH}, {BB_MULT}) on {CANDLE_SECONDS}s candles")
+    print(f"[BOT] ENTRY: red candle close > upper BB -> SHORT | green candle close < lower BB -> LONG")
+    print(f"[BOT] EXIT: candle failure / RL SL/TP / RL close")
     print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
           f"{TRADE_SESSION_END.strftime('%H:%M')} ET")
     for cfg in symbol_configs:
@@ -1652,7 +1646,7 @@ def main():
             print(f"[CRASH] {type(e).__name__}: {e}")
             print(f"[CRASH] Restarting in {retry_delay}s...")
             send_telegram(args.tg_token, args.tg_chat,
-                          f"STATUS|Renko BB bot crashed, restarting in {retry_delay}s")
+                          f"STATUS|30s Candle BB bot crashed, restarting in {retry_delay}s")
             retry_delay = min(retry_delay * 2, 300)
         finally:
             bot.save_all_state()
