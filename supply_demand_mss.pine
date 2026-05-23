@@ -1,0 +1,320 @@
+// This Pine Script™ source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// Supply/Demand MSS Detector — SMC Internal/External Structure
+
+//@version=6
+indicator("Supply Demand MSS Detector", overlay=true, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+// ─── Inputs ───
+extPivotLen     = input.int(5, "External Pivot Length", minval=2, maxval=20, group="Structure")
+intPivotLen     = input.int(3, "Internal Pivot Length", minval=1, maxval=10, group="Structure")
+showExtLabels   = input.bool(true, "Show External Labels (eHH/eHL/eLH/eLL)", group="Display")
+showIntLabels   = input.bool(true, "Show Internal Labels (iHH/iHL/iLH/iLL)", group="Display")
+showBOS         = input.bool(true, "Show BOS", group="Display")
+showMSS         = input.bool(true, "Show MSS (CHoCH)", group="Display")
+showSDZones     = input.bool(true, "Show S/D Zones", group="Display")
+showStructLines = input.bool(true, "Show Structure Lines", group="Display")
+
+htf             = input.timeframe("60", "S/D Zone Timeframe", group="Supply/Demand")
+maxZones        = input.int(3, "Max Zones", minval=1, maxval=10, group="Supply/Demand")
+supplyColor     = input.color(color.new(#2962FF, 75), "Supply Zone", group="Colors")
+demandColor     = input.color(color.new(#2962FF, 75), "Demand Zone", group="Colors")
+bullColor       = input.color(color.new(#26a69a, 0), "Bullish", group="Colors")
+bearColor       = input.color(color.new(#ef5350, 0), "Bearish", group="Colors")
+mssBoxBull      = input.color(color.new(#26a69a, 80), "MSS Box Bull", group="Colors")
+mssBoxBear      = input.color(color.new(#ef5350, 80), "MSS Box Bear", group="Colors")
+
+// ─── External Structure ───
+var float extLastHigh      = na
+var float extLastLow       = na
+var float extPrevHigh      = na
+var float extPrevLow       = na
+var int   extLastHighBar   = na
+var int   extLastLowBar    = na
+var int   extTrend         = 0  // 1=up, -1=down
+
+extSwingHigh = ta.pivothigh(high, extPivotLen, extPivotLen)
+extSwingLow  = ta.pivotlow(low, extPivotLen, extPivotLen)
+
+var line extHighLine = na
+var line extLowLine  = na
+
+if not na(extSwingHigh)
+    extPrevHigh    := extLastHigh
+    extLastHigh    := extSwingHigh
+    extLastHighBar := bar_index - extPivotLen
+
+if not na(extSwingLow)
+    extPrevLow    := extLastLow
+    extLastLow    := extSwingLow
+    extLastLowBar := bar_index - extPivotLen
+
+// External BOS & structure labels
+var int extLastBOSBar = 0
+
+// Bullish BOS: close breaks above external swing high in uptrend
+extBullBOS = not na(extLastHigh) and close > extLastHigh and close[1] <= extLastHigh and bar_index - extLastBOSBar > 3
+// Bearish BOS: close breaks below external swing low in downtrend
+extBearBOS = not na(extLastLow) and close < extLastLow and close[1] >= extLastLow and bar_index - extLastBOSBar > 3
+
+if extBullBOS
+    extTrend := 1
+    extLastBOSBar := bar_index
+    if showBOS
+        label.new(bar_index, low - syminfo.mintick * 30, "BOS ↑",
+                  color=color.new(color.white, 100), textcolor=bullColor,
+                  style=label.style_label_up, size=size.tiny)
+    if showStructLines
+        line.delete(extHighLine)
+        extHighLine := line.new(extLastHighBar, extLastHigh, bar_index, extLastHigh,
+                                color=bullColor, style=line.style_dashed, width=1)
+
+if extBearBOS
+    extTrend := -1
+    extLastBOSBar := bar_index
+    if showBOS
+        label.new(bar_index, high + syminfo.mintick * 30, "BOS ↓",
+                  color=color.new(color.white, 100), textcolor=bearColor,
+                  style=label.style_label_down, size=size.tiny)
+    if showStructLines
+        line.delete(extLowLine)
+        extLowLine := line.new(extLastLowBar, extLastLow, bar_index, extLastLow,
+                               color=bearColor, style=line.style_dashed, width=1)
+
+// External swing labels
+if showExtLabels and not na(extSwingHigh)
+    lbl = ""
+    if not na(extPrevHigh)
+        lbl := extSwingHigh > extPrevHigh ? "eHH" : "eLH"
+    else
+        lbl := "eHH"
+    label.new(bar_index - extPivotLen, extSwingHigh, lbl,
+              color=color.new(color.white, 100),
+              textcolor=extSwingHigh > nz(extPrevHigh) ? bullColor : bearColor,
+              style=label.style_label_down, size=size.tiny)
+
+if showExtLabels and not na(extSwingLow)
+    lbl = ""
+    if not na(extPrevLow)
+        lbl := extSwingLow < extPrevLow ? "eLL" : "eHL"
+    else
+        lbl := "eLL"
+    label.new(bar_index - extPivotLen, extSwingLow, lbl,
+              color=color.new(color.white, 100),
+              textcolor=extSwingLow < nz(extPrevLow) ? bearColor : bullColor,
+              style=label.style_label_up, size=size.tiny)
+
+// ─── Internal Structure ───
+var float intLastHigh      = na
+var float intLastLow       = na
+var float intPrevHigh      = na
+var float intPrevLow       = na
+var int   intLastHighBar   = na
+var int   intLastLowBar    = na
+
+intSwingHigh = ta.pivothigh(high, intPivotLen, intPivotLen)
+intSwingLow  = ta.pivotlow(low, intPivotLen, intPivotLen)
+
+if not na(intSwingHigh)
+    intPrevHigh    := intLastHigh
+    intLastHigh    := intSwingHigh
+    intLastHighBar := bar_index - intPivotLen
+
+if not na(intSwingLow)
+    intPrevLow    := intLastLow
+    intLastLow    := intSwingLow
+    intLastLowBar := bar_index - intPivotLen
+
+// Internal MSS (CHoCH) — structure shift against the prevailing external trend
+var int intLastMSSBar = 0
+
+// Bullish Internal MSS: break above internal swing high while external trend was down
+// (or after making a lower low internally)
+intBullMSS = not na(intLastHigh) and not na(intLastLow) and not na(intPrevLow) and
+             close > intLastHigh and close[1] <= intLastHigh and
+             intLastLow < intPrevLow and
+             bar_index - intLastMSSBar > 3
+
+// Bearish Internal MSS: break below internal swing low while external trend was up
+// (or after making a higher high internally)
+intBearMSS = not na(intLastLow) and not na(intLastHigh) and not na(intPrevHigh) and
+             close < intLastLow and close[1] >= intLastLow and
+             intLastHigh > intPrevHigh and
+             bar_index - intLastMSSBar > 3
+
+// Internal BOS (trend continuation within internal structure)
+var int intLastBOSBar = 0
+
+intBullBOS = not na(intLastHigh) and not na(intPrevHigh) and
+             close > intLastHigh and close[1] <= intLastHigh and
+             intLastLow >= nz(intPrevLow) and
+             bar_index - intLastBOSBar > 3 and bar_index - intLastMSSBar > 3
+
+intBearBOS = not na(intLastLow) and not na(intPrevLow) and
+             close < intLastLow and close[1] >= intLastLow and
+             intLastHigh <= nz(intPrevHigh) and
+             bar_index - intLastBOSBar > 3 and bar_index - intLastMSSBar > 3
+
+// Plot Internal MSS
+if intBullMSS
+    intLastMSSBar := bar_index
+    if showMSS
+        label.new(bar_index, low - syminfo.mintick * 15, "INTERNAL MSS ↑",
+                  color=mssBoxBull, textcolor=color.white,
+                  style=label.style_label_up, size=size.small)
+        if showStructLines
+            line.new(intLastHighBar, intLastHigh, bar_index, intLastHigh,
+                     color=bullColor, style=line.style_solid, width=1)
+
+if intBearMSS
+    intLastMSSBar := bar_index
+    if showMSS
+        label.new(bar_index, high + syminfo.mintick * 15, "INTERNAL MSS ↓",
+                  color=mssBoxBear, textcolor=color.white,
+                  style=label.style_label_down, size=size.small)
+        if showStructLines
+            line.new(intLastLowBar, intLastLow, bar_index, intLastLow,
+                     color=bearColor, style=line.style_solid, width=1)
+
+// Internal BOS labels
+if intBullBOS and not intBullMSS
+    intLastBOSBar := bar_index
+    if showBOS
+        label.new(bar_index, low - syminfo.mintick * 15, "iBOS ↑",
+                  color=color.new(color.white, 100), textcolor=bullColor,
+                  style=label.style_label_up, size=size.tiny)
+
+if intBearBOS and not intBearMSS
+    intLastBOSBar := bar_index
+    if showBOS
+        label.new(bar_index, high + syminfo.mintick * 15, "iBOS ↓",
+                  color=color.new(color.white, 100), textcolor=bearColor,
+                  style=label.style_label_down, size=size.tiny)
+
+// Internal swing labels
+if showIntLabels and not na(intSwingHigh)
+    lbl = ""
+    if not na(intPrevHigh)
+        lbl := intSwingHigh > intPrevHigh ? "iHH" : "iLH"
+    else
+        lbl := "iHH"
+    label.new(bar_index - intPivotLen, intSwingHigh, lbl,
+              color=color.new(color.white, 100),
+              textcolor=color.new(intSwingHigh > nz(intPrevHigh) ? bullColor : bearColor, 40),
+              style=label.style_label_down, size=size.tiny)
+
+if showIntLabels and not na(intSwingLow)
+    lbl = ""
+    if not na(intPrevLow)
+        lbl := intSwingLow < intPrevLow ? "iLL" : "iHL"
+    else
+        lbl := "iLL"
+    label.new(bar_index - intPivotLen, intSwingLow, lbl,
+              color=color.new(color.white, 100),
+              textcolor=color.new(intSwingLow < nz(intPrevLow) ? bearColor : bullColor, 40),
+              style=label.style_label_up, size=size.tiny)
+
+// ─── 1H Supply/Demand Zones ───
+[htfOpen, htfClose, htfHigh, htfLow] = request.security(syminfo.tickerid, htf, [open, close, high, low], lookahead=barmerge.lookahead_off)
+
+htfBodyHigh = math.max(htfOpen, htfClose)
+htfBodyLow  = math.min(htfOpen, htfClose)
+newHTFBar   = ta.change(time(htf)) != 0
+
+var float[] supplyTops    = array.new_float(0)
+var float[] supplyBottoms = array.new_float(0)
+var float[] demandTops    = array.new_float(0)
+var float[] demandBottoms = array.new_float(0)
+var box[]   supplyBoxes   = array.new_box(0)
+var box[]   demandBoxes   = array.new_box(0)
+
+if newHTFBar and showSDZones
+    prevST = htfHigh[1]
+    prevSB = htfBodyHigh[1]
+    prevDT = htfBodyLow[1]
+    prevDB = htfLow[1]
+
+    if prevST - prevSB > syminfo.mintick * 5
+        array.push(supplyTops, prevST)
+        array.push(supplyBottoms, prevSB)
+        array.push(supplyBoxes, box.new(bar_index - 1, prevST, bar_index + 60, prevSB,
+                   border_color=color.new(#2962FF, 60), bgcolor=supplyColor))
+
+    if prevDT - prevDB > syminfo.mintick * 5
+        array.push(demandTops, prevDT)
+        array.push(demandBottoms, prevDB)
+        array.push(demandBoxes, box.new(bar_index - 1, prevDT, bar_index + 60, prevDB,
+                   border_color=color.new(#2962FF, 60), bgcolor=demandColor))
+
+    while array.size(supplyTops) > maxZones
+        array.shift(supplyTops)
+        array.shift(supplyBottoms)
+        box.delete(array.shift(supplyBoxes))
+    while array.size(demandTops) > maxZones
+        array.shift(demandTops)
+        array.shift(demandBottoms)
+        box.delete(array.shift(demandBoxes))
+
+if barstate.islast and showSDZones
+    for i = 0 to array.size(supplyBoxes) - 1
+        box.set_right(array.get(supplyBoxes, i), bar_index + 10)
+    for i = 0 to array.size(demandBoxes) - 1
+        box.set_right(array.get(demandBoxes, i), bar_index + 10)
+
+// ─── Signal: MSS + Zone Side ───
+priceFromDemand() =>
+    result = false
+    for i = 0 to array.size(demandTops) - 1
+        dTop = array.get(demandTops, i)
+        dBot = array.get(demandBottoms, i)
+        for j = 1 to 30
+            if low[j] <= dTop and low[j] >= dBot - (dTop - dBot) * 0.5
+                result := true
+                break
+        if result
+            break
+    result
+
+priceFromSupply() =>
+    result = false
+    for i = 0 to array.size(supplyTops) - 1
+        sTop = array.get(supplyTops, i)
+        sBot = array.get(supplyBottoms, i)
+        for j = 1 to 30
+            if high[j] >= sBot and high[j] <= sTop + (sTop - sBot) * 0.5
+                result := true
+                break
+        if result
+            break
+    result
+
+fromDemand = priceFromDemand()
+fromSupply = priceFromSupply()
+
+// Long: bullish internal MSS + came from demand
+longSignal  = intBullMSS and fromDemand
+// Short: bearish internal MSS + came from supply
+shortSignal = intBearMSS and fromSupply
+
+// Target & SL
+if longSignal and array.size(supplyBottoms) > 0
+    target = array.get(supplyBottoms, array.size(supplyBottoms) - 1)
+    label.new(bar_index, low - syminfo.mintick * 60, "READY LONG",
+              color=bullColor, textcolor=color.white,
+              style=label.style_label_up, size=size.small)
+    line.new(bar_index, close, bar_index + 30, target,
+             color=bullColor, style=line.style_dashed, width=1)
+
+if shortSignal and array.size(demandTops) > 0
+    target = array.get(demandTops, array.size(demandTops) - 1)
+    label.new(bar_index, high + syminfo.mintick * 60, "READY SHORT",
+              color=bearColor, textcolor=color.white,
+              style=label.style_label_down, size=size.small)
+    line.new(bar_index, close, bar_index + 30, target,
+             color=bearColor, style=line.style_dashed, width=1)
+
+// ─── Alerts ───
+alertcondition(longSignal, title="Long Entry", message="MSS LONG: Bullish MSS from demand side")
+alertcondition(shortSignal, title="Short Entry", message="MSS SHORT: Bearish MSS from supply side")
+alertcondition(intBullMSS, title="Bullish MSS", message="Internal MSS ↑ detected")
+alertcondition(intBearMSS, title="Bearish MSS", message="Internal MSS ↓ detected")
