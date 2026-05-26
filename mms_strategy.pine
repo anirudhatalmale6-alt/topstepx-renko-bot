@@ -1,0 +1,385 @@
+// This Pine Script™ is subject to the Terms of Use at https://www.tradingview.com/pine-script-docs/
+// @version=6
+// ICT Market Maker Model (MMS) Strategy
+// BOS + FVG Tap Entry + EQH/EQL Targets
+// Multi-Timeframe: 15m Trend / 5m Structure / 1m Entry
+
+indicator("ICT MMS - BOS + FVG + EQH/EQL", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// ============================================================
+// Inputs
+// ============================================================
+
+grp_tf = "Timeframes"
+trendTF    = input.timeframe("15", "Trend Timeframe", group=grp_tf)
+structTF   = input.timeframe("5",  "Structure Timeframe", group=grp_tf)
+
+grp_swing = "Swing Detection"
+swingLookback = input.int(3, "Swing Lookback (candles each side)", minval=1, maxval=10, group=grp_swing)
+
+grp_fvg = "Fair Value Gaps"
+fvgMinSize   = input.float(0.5, "Min FVG Size (pts)", minval=0.1, step=0.25, group=grp_fvg)
+maxFvgAge    = input.int(20, "Max FVG Age (candles)", minval=5, maxval=100, group=grp_fvg)
+showFVGs     = input.bool(true, "Show FVG Zones", group=grp_fvg)
+
+grp_eqhl = "Equal Highs/Lows"
+eqhTolerance = input.float(2.0, "EQH/EQL Tolerance (pts)", minval=0.25, step=0.25, group=grp_eqhl)
+showEQHL     = input.bool(true, "Show EQH/EQL Levels", group=grp_eqhl)
+
+grp_bos = "Break of Structure"
+showBOS      = input.bool(true, "Show BOS Labels", group=grp_bos)
+bosConfirmClose = input.bool(true, "BOS Requires Candle Close", group=grp_bos)
+
+grp_entry = "Entry / Risk"
+minRR        = input.float(1.5, "Min Risk:Reward", minval=0.5, step=0.5, group=grp_entry)
+maxSLpts     = input.float(50.0, "Max SL (points)", minval=5.0, step=5.0, group=grp_entry)
+
+grp_session = "Session Filter"
+useSession   = input.bool(true, "Use Session Filter", group=grp_session)
+sessStart    = input.session("0930-1600", "Trading Session (ET)", group=grp_session)
+
+grp_style = "Style"
+bullColor    = input.color(color.new(#00bcd4, 0), "Bullish Color", group=grp_style)
+bearColor    = input.color(color.new(#ff5252, 0), "Bearish Color", group=grp_style)
+fvgBullColor = input.color(color.new(#00bcd4, 85), "FVG Bullish Fill", group=grp_style)
+fvgBearColor = input.color(color.new(#ff5252, 85), "FVG Bearish Fill", group=grp_style)
+
+// ============================================================
+// HTF Trend Bias (15m swing structure)
+// ============================================================
+
+[htfHigh, htfLow, htfClose] = request.security(syminfo.tickerid, trendTF, [high, low, close])
+
+var float htfSwingHigh1 = na
+var float htfSwingHigh2 = na
+var float htfSwingLow1  = na
+var float htfSwingLow2  = na
+var int   htfTrend      = 0   // 1=bullish, -1=bearish, 0=neutral
+
+// Simple HTF swing detection using pivots
+htfPivotHigh = ta.pivothigh(htfHigh, swingLookback, swingLookback)
+htfPivotLow  = ta.pivotlow(htfLow, swingLookback, swingLookback)
+
+if not na(htfPivotHigh)
+    htfSwingHigh2 := htfSwingHigh1
+    htfSwingHigh1 := htfPivotHigh
+
+if not na(htfPivotLow)
+    htfSwingLow2 := htfSwingLow1
+    htfSwingLow1 := htfPivotLow
+
+if not na(htfSwingHigh1) and not na(htfSwingHigh2) and not na(htfSwingLow1) and not na(htfSwingLow2)
+    if htfSwingHigh1 > htfSwingHigh2 and htfSwingLow1 > htfSwingLow2
+        htfTrend := 1
+    else if htfSwingHigh1 < htfSwingHigh2 and htfSwingLow1 < htfSwingLow2
+        htfTrend := -1
+
+// Trend background
+bgcolor(htfTrend == 1 ? color.new(bullColor, 95) : htfTrend == -1 ? color.new(bearColor, 95) : na, title="Trend BG")
+
+// ============================================================
+// Structure TF Data (5m)
+// ============================================================
+
+[stHigh, stLow, stClose, stOpen] = request.security(syminfo.tickerid, structTF, [high, low, close, open])
+
+// ============================================================
+// 5m Swing Points for BOS Detection
+// ============================================================
+
+stPivotHigh = ta.pivothigh(stHigh, swingLookback, swingLookback)
+stPivotLow  = ta.pivotlow(stLow, swingLookback, swingLookback)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+var float prevSwingHigh = na
+var float prevSwingLow  = na
+
+// Track the most recent swing highs for EQH
+var float swingHighHist1 = na
+var float swingHighHist2 = na
+var float swingHighHist3 = na
+var float swingLowHist1  = na
+var float swingLowHist2  = na
+var float swingLowHist3  = na
+
+if not na(stPivotHigh)
+    prevSwingHigh := lastSwingHigh
+    lastSwingHigh := stPivotHigh
+    swingHighHist3 := swingHighHist2
+    swingHighHist2 := swingHighHist1
+    swingHighHist1 := stPivotHigh
+    label.new(bar_index - swingLookback, stPivotHigh, "SH", style=label.style_label_down,
+              color=color.new(bearColor, 60), textcolor=color.white, size=size.tiny)
+
+if not na(stPivotLow)
+    prevSwingLow := lastSwingLow
+    lastSwingLow := stPivotLow
+    swingLowHist3 := swingLowHist2
+    swingLowHist2 := swingLowHist1
+    swingLowHist1 := stPivotLow
+    label.new(bar_index - swingLookback, stPivotLow, "SL", style=label.style_label_up,
+              color=color.new(bullColor, 60), textcolor=color.white, size=size.tiny)
+
+// ============================================================
+// BOS Detection (Break of Structure)
+// ============================================================
+
+var int   structureBias   = 0     // 1=bullish, -1=bearish
+var float bosPrice        = na
+var float point2Price     = na    // SL reference (liquidity sweep)
+var bool  bosJustFired    = false
+
+bosJustFired := false
+
+// Bullish BOS: close above the last swing high
+bullishBOS = not na(lastSwingHigh) and (bosConfirmClose ? stClose > lastSwingHigh : high > lastSwingHigh) and structureBias != 1
+if bullishBOS
+    structureBias := 1
+    bosPrice := lastSwingHigh
+    point2Price := na(lastSwingLow) ? low : lastSwingLow
+    bosJustFired := true
+    if showBOS
+        label.new(bar_index, high, "BOS\nBULL", style=label.style_label_down,
+                  color=bullColor, textcolor=color.white, size=size.small)
+        line.new(bar_index - 10, lastSwingHigh, bar_index, lastSwingHigh,
+                 color=bullColor, style=line.style_dashed, width=2)
+
+// Bearish BOS: close below the last swing low
+bearishBOS = not na(lastSwingLow) and (bosConfirmClose ? stClose < lastSwingLow : low < lastSwingLow) and structureBias != -1
+if bearishBOS
+    structureBias := -1
+    bosPrice := lastSwingLow
+    point2Price := na(lastSwingHigh) ? high : lastSwingHigh
+    bosJustFired := true
+    if showBOS
+        label.new(bar_index, low, "BOS\nBEAR", style=label.style_label_up,
+                  color=bearColor, textcolor=color.white, size=size.small)
+        line.new(bar_index - 10, lastSwingLow, bar_index, lastSwingLow,
+                 color=bearColor, style=line.style_dashed, width=2)
+
+// ============================================================
+// FVG Detection on Structure TF
+// ============================================================
+
+var array<box> fvgBoxes = array.new<box>()
+
+// Bullish FVG: gap between candle[2].high and candle[0].low
+bullFvgTop    = stLow
+bullFvgBottom = stHigh[2]
+isBullFVG     = bullFvgTop > bullFvgBottom and (bullFvgTop - bullFvgBottom) >= fvgMinSize
+
+// Bearish FVG: gap between candle[2].low and candle[0].high
+bearFvgTop    = stLow[2]
+bearFvgBottom = stHigh
+isBearFVG     = bearFvgTop > bearFvgBottom and (bearFvgTop - bearFvgBottom) >= fvgMinSize
+
+if showFVGs and isBullFVG
+    b = box.new(bar_index - 2, bullFvgTop, bar_index + maxFvgAge, bullFvgBottom,
+                bgcolor=fvgBullColor, border_color=bullColor, border_width=1)
+    array.push(fvgBoxes, b)
+
+if showFVGs and isBearFVG
+    b = box.new(bar_index - 2, bearFvgTop, bar_index + maxFvgAge, bearFvgBottom,
+                bgcolor=fvgBearColor, border_color=bearColor, border_width=1)
+    array.push(fvgBoxes, b)
+
+// Clean up old FVG boxes
+if array.size(fvgBoxes) > 50
+    oldBox = array.shift(fvgBoxes)
+    box.delete(oldBox)
+
+// ============================================================
+// FVG Tap Detection (Entry Trigger)
+// ============================================================
+
+// Check if current price is tapping into a recent FVG
+bullFvgTap = false
+bearFvgTap = false
+var float tapFvgTop = na
+var float tapFvgBot = na
+
+// Look back for recent bullish FVGs
+for i = 1 to maxFvgAge
+    if i >= bar_index
+        break
+    pastBullTop = stLow[i]
+    pastBullBot = stHigh[i + 2]
+    if not na(pastBullTop) and not na(pastBullBot)
+        if pastBullTop > pastBullBot and (pastBullTop - pastBullBot) >= fvgMinSize
+            if low <= pastBullTop and close >= pastBullBot
+                bullFvgTap := true
+                tapFvgTop := pastBullTop
+                tapFvgBot := pastBullBot
+                break
+
+// Look back for recent bearish FVGs
+for i = 1 to maxFvgAge
+    if i >= bar_index
+        break
+    pastBearTop = stLow[i + 2]
+    pastBearBot = stHigh[i]
+    if not na(pastBearTop) and not na(pastBearBot)
+        if pastBearTop > pastBearBot and (pastBearTop - pastBearBot) >= fvgMinSize
+            if high >= pastBearBot and close <= pastBearTop
+                bearFvgTap := true
+                tapFvgTop := pastBearTop
+                tapFvgBot := pastBearBot
+                break
+
+// ============================================================
+// EQH / EQL Detection
+// ============================================================
+
+isEQH = false
+eqhLevel = 0.0
+isEQL = false
+eqlLevel = 0.0
+
+if not na(swingHighHist1) and not na(swingHighHist2)
+    if math.abs(swingHighHist1 - swingHighHist2) <= eqhTolerance
+        isEQH := true
+        eqhLevel := (swingHighHist1 + swingHighHist2) / 2.0
+
+if not na(swingLowHist1) and not na(swingLowHist2)
+    if math.abs(swingLowHist1 - swingLowHist2) <= eqhTolerance
+        isEQL := true
+        eqlLevel := (swingLowHist1 + swingLowHist2) / 2.0
+
+// Draw EQH/EQL
+var line eqhLine = na
+var line eqlLine = na
+
+if showEQHL and isEQH
+    if not na(eqhLine)
+        line.delete(eqhLine)
+    eqhLine := line.new(bar_index - 30, eqhLevel, bar_index + 10, eqhLevel,
+                        color=color.new(bearColor, 30), style=line.style_dotted, width=2)
+    label.new(bar_index + 10, eqhLevel, "EQH " + str.tostring(eqhLevel, "#.##"),
+              style=label.style_label_left, color=color.new(bearColor, 60),
+              textcolor=color.white, size=size.tiny)
+
+if showEQHL and isEQL
+    if not na(eqlLine)
+        line.delete(eqlLine)
+    eqlLine := line.new(bar_index - 30, eqlLevel, bar_index + 10, eqlLevel,
+                        color=color.new(bullColor, 30), style=line.style_dotted, width=2)
+    label.new(bar_index + 10, eqlLevel, "EQL " + str.tostring(eqlLevel, "#.##"),
+              style=label.style_label_left, color=color.new(bullColor, 60),
+              textcolor=color.white, size=size.tiny)
+
+// ============================================================
+// MMS Entry Signals
+// ============================================================
+
+// Bullish Entry: bullish BOS + bullish/neutral trend + price taps bullish FVG
+longSignal = structureBias == 1 and htfTrend != -1 and bullFvgTap and not na(point2Price)
+
+// Bearish Entry: bearish BOS + bearish/neutral trend + price taps bearish FVG
+shortSignal = structureBias == -1 and htfTrend != 1 and bearFvgTap and not na(point2Price)
+
+// Calculate SL and TP for signals
+var float entrySL = na
+var float entryTP = na
+var float entryRR = na
+
+if longSignal
+    slPts = math.abs(close - point2Price) + 1.0
+    tpTarget = isEQH ? eqhLevel : close + slPts * 2.0
+    tpPts = math.abs(tpTarget - close)
+    rr = tpPts / math.max(slPts, 0.1)
+    if slPts <= maxSLpts and rr >= minRR
+        entrySL := point2Price - 1.0
+        entryTP := tpTarget
+        entryRR := rr
+    else
+        longSignal := false
+
+if shortSignal
+    slPts = math.abs(point2Price - close) + 1.0
+    tpTarget = isEQL ? eqlLevel : close - slPts * 2.0
+    tpPts = math.abs(close - tpTarget)
+    rr = tpPts / math.max(slPts, 0.1)
+    if slPts <= maxSLpts and rr >= minRR
+        entrySL := point2Price + 1.0
+        entryTP := tpTarget
+        entryRR := rr
+    else
+        shortSignal := false
+
+// ============================================================
+// Plot Signals
+// ============================================================
+
+plotshape(longSignal, title="MMS Long", location=location.belowbar,
+          style=shape.triangleup, color=bullColor, size=size.normal, text="MMS\nLONG")
+
+plotshape(shortSignal, title="MMS Short", location=location.abovebar,
+          style=shape.triangledown, color=bearColor, size=size.normal, text="MMS\nSHORT")
+
+// Draw SL/TP lines on signal
+if longSignal and not na(entrySL)
+    line.new(bar_index, entrySL, bar_index + 15, entrySL, color=color.red, width=2, style=line.style_solid)
+    line.new(bar_index, entryTP, bar_index + 15, entryTP, color=color.green, width=2, style=line.style_solid)
+    label.new(bar_index + 15, entrySL, "SL " + str.tostring(entrySL, "#.##"),
+              style=label.style_label_left, color=color.red, textcolor=color.white, size=size.tiny)
+    label.new(bar_index + 15, entryTP, "TP " + str.tostring(entryTP, "#.##") + "\nR:R " + str.tostring(entryRR, "#.#"),
+              style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
+
+if shortSignal and not na(entrySL)
+    line.new(bar_index, entrySL, bar_index + 15, entrySL, color=color.red, width=2, style=line.style_solid)
+    line.new(bar_index, entryTP, bar_index + 15, entryTP, color=color.green, width=2, style=line.style_solid)
+    label.new(bar_index + 15, entrySL, "SL " + str.tostring(entrySL, "#.##"),
+              style=label.style_label_left, color=color.red, textcolor=color.white, size=size.tiny)
+    label.new(bar_index + 15, entryTP, "TP " + str.tostring(entryTP, "#.##") + "\nR:R " + str.tostring(entryRR, "#.#"),
+              style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
+
+// ============================================================
+// Info Table
+// ============================================================
+
+var table infoTable = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80),
+                                 border_color=color.gray, border_width=1)
+
+if barstate.islast
+    trendStr = htfTrend == 1 ? "BULLISH" : htfTrend == -1 ? "BEARISH" : "NEUTRAL"
+    trendClr = htfTrend == 1 ? bullColor : htfTrend == -1 ? bearColor : color.gray
+    biasStr  = structureBias == 1 ? "BULLISH BOS" : structureBias == -1 ? "BEARISH BOS" : "NONE"
+    biasClr  = structureBias == 1 ? bullColor : structureBias == -1 ? bearColor : color.gray
+
+    table.cell(infoTable, 0, 0, "ICT MMS", text_color=color.white, text_size=size.normal)
+    table.cell(infoTable, 1, 0, "v1.0", text_color=color.gray, text_size=size.small)
+
+    table.cell(infoTable, 0, 1, "15m Trend", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 1, trendStr, text_color=trendClr, text_size=size.small)
+
+    table.cell(infoTable, 0, 2, "5m Structure", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 2, biasStr, text_color=biasClr, text_size=size.small)
+
+    table.cell(infoTable, 0, 3, "Point 2 (SL)", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 3, na(point2Price) ? "N/A" : str.tostring(point2Price, "#.##"),
+               text_color=color.orange, text_size=size.small)
+
+    table.cell(infoTable, 0, 4, "Active FVGs", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 4, str.tostring(isBullFVG ? 1 : 0) + " bull / " + str.tostring(isBearFVG ? 1 : 0) + " bear",
+               text_color=color.white, text_size=size.small)
+
+    table.cell(infoTable, 0, 5, "EQH", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 5, isEQH ? str.tostring(eqhLevel, "#.##") : "N/A",
+               text_color=bearColor, text_size=size.small)
+
+    table.cell(infoTable, 0, 6, "EQL", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 6, isEQL ? str.tostring(eqlLevel, "#.##") : "N/A",
+               text_color=bullColor, text_size=size.small)
+
+    table.cell(infoTable, 0, 7, "Min R:R", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 7, str.tostring(minRR, "#.#"), text_color=color.white, text_size=size.small)
+
+// ============================================================
+// Alerts
+// ============================================================
+
+alertcondition(longSignal, title="MMS Long Signal", message="ICT MMS LONG: BOS + FVG tap @ {{close}} | SL={{plot_0}} | TP={{plot_1}}")
+alertcondition(shortSignal, title="MMS Short Signal", message="ICT MMS SHORT: BOS + FVG tap @ {{close}} | SL={{plot_0}} | TP={{plot_1}}")
+alertcondition(bullishBOS, title="Bullish BOS", message="Bullish BOS detected @ {{close}}")
+alertcondition(bearishBOS, title="Bearish BOS", message="Bearish BOS detected @ {{close}}")
