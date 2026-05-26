@@ -313,21 +313,103 @@ def find_equal_levels(swings: list, tolerance: float = EQH_TOLERANCE_PTS):
 # MMS Structure Tracker
 # ============================================================
 
+class ElliottWave:
+    """Stores a detected 5-wave pattern."""
+    def __init__(self, direction: str, waves: list, fvgs_at_2: list, fvgs_at_4: list):
+        self.direction = direction  # "bullish_impulse" (up) or "bearish_impulse" (down)
+        self.waves = waves          # list of 5 SwingPoint objects [w1, w2, w3, w4, w5]
+        self.fvgs_at_2 = fvgs_at_2  # FVGs near wave 2 level (entry zones)
+        self.fvgs_at_4 = fvgs_at_4  # FVGs near wave 4 level (entry zones)
+        self.completed = False       # True when wave 5 is confirmed and reversal starts
+        self.used = False
+
+    @property
+    def wave5_price(self):
+        return self.waves[4].price if len(self.waves) >= 5 else None
+
+    @property
+    def wave2_price(self):
+        return self.waves[1].price if len(self.waves) >= 2 else None
+
+    @property
+    def wave4_price(self):
+        return self.waves[3].price if len(self.waves) >= 4 else None
+
+    def __repr__(self):
+        pts = [f"w{i+1}={w.price:.1f}" for i, w in enumerate(self.waves)]
+        return f"Elliott({self.direction} {' '.join(pts)})"
+
+
+def detect_elliott_5wave(swings: list, candles: list, tolerance_pct: float = 0.002):
+    """
+    Detect 5-wave Elliott patterns from swing points.
+
+    Bullish impulse (up): w1=low, w2=high, w3=low(higher), w4=high(higher), w5=low(highest low)
+    Wait... Actually per Adz Trades pics:
+    Bullish 5-wave: 1(start low) -> 2(first low) -> 3(higher high) -> 4(pullback low) -> 5(highest high)
+    Then reversal down -> SHORT at FVG near w4/w2
+
+    Bearish 5-wave: 1(start high) -> 2(first high) -> 3(lower low) -> 4(pullback high) -> 5(lowest low)
+    Then reversal up -> LONG at FVG near w4/w2
+
+    Looking at the images more carefully:
+    IMG_5448 bullish: waves go 1(low)->2(lower low)->3(mid high)->4(pullback)->5(highest)
+    Actually the standard Elliott:
+    - Bullish: 1=impulse up, 2=corrective down, 3=impulse up, 4=corrective down, 5=impulse up
+    So swings: start->w1(high)->w2(low)->w3(higher high)->w4(low)->w5(highest high)
+
+    IMG_5446 bearish: (1)=impulse down, (2)=corrective up(top), (3)=lower low, (4)=corrective up, (5)=lowest low
+    Swings: start->w1(low)->w2(high)->w3(lower low)->w4(high)->w5(lowest low)
+    """
+    patterns = []
+    if len(swings) < 5:
+        return patterns
+
+    # Try all combinations of 5 consecutive swing alternations
+    for start_i in range(len(swings) - 4):
+        w = swings[start_i:start_i + 5]
+
+        # Check alternation: H-L-H-L-H or L-H-L-H-L
+        kinds = [s.kind for s in w]
+
+        # Bullish impulse: H-L-H-L-H (highs getting higher, wave 3 > wave 1, wave 5 > wave 3)
+        if kinds == ["high", "low", "high", "low", "high"]:
+            w1, w2, w3, w4, w5 = w
+            # Elliott rules for bullish impulse:
+            # w3 > w1 (wave 3 higher than wave 1)
+            # w5 > w3 (wave 5 higher than wave 3) - or at least w5 > w1
+            # w4 > w2 (wave 4 low stays above wave 2 low) - no overlap rule
+            # w2 doesn't retrace below the start
+            if (w3.price > w1.price and w5.price > w1.price and
+                    w4.price > w2.price):
+                patterns.append(ElliottWave("bullish_impulse", list(w), [], []))
+
+        # Bearish impulse: L-H-L-H-L (lows getting lower, wave 3 < wave 1, wave 5 < wave 3)
+        elif kinds == ["low", "high", "low", "high", "low"]:
+            w1, w2, w3, w4, w5 = w
+            # Elliott rules for bearish impulse:
+            # w3 < w1 (wave 3 lower than wave 1)
+            # w5 < w1 (wave 5 lower)
+            # w4 < w2 (wave 4 high stays below wave 2 high) - no overlap
+            if (w3.price < w1.price and w5.price < w1.price and
+                    w4.price < w2.price):
+                patterns.append(ElliottWave("bearish_impulse", list(w), [], []))
+
+    return patterns
+
+
 class MMSState:
-    """Tracks the 1-2-3-4-5 Market Maker Model pattern."""
+    """Tracks the 1-2-3-4-5 Market Maker Model pattern (Elliott Wave reversal)."""
 
     def __init__(self):
-        self.trend_bias = None       # "bullish" or "bearish" from HTF
-        self.structure_bias = None   # "bullish" or "bearish" from BOS
-        self.last_bos_price = None   # price level of the BOS
-        self.last_bos_dir = None     # "bullish" or "bearish"
-        self.point2_price = None     # liquidity sweep point (SL goes here)
-        self.active_fvgs = []        # list of FVG objects waiting for tap
-        self.eqh_levels = []         # equal high levels (TP targets for longs)
-        self.eql_levels = []         # equal low levels (TP targets for shorts)
-        self.swing_history = []      # recent swings from structure TF
-        self.pending_entry = None    # dict with entry details waiting for FVG tap
+        self.trend_bias = None         # "bullish" or "bearish" from HTF
+        self.swing_history = []        # recent swings from structure TF
+        self.active_patterns = []      # list of ElliottWave patterns detected
+        self.all_fvgs = []             # all FVGs on structure TF
+        self.eqh_levels = []
+        self.eql_levels = []
         self.last_structure_candle_count = 0
+        self._reversal_confirmed = {}  # pattern id -> bool
 
     def update_trend(self, candles_15m: list):
         """Determine HTF trend from 15m candles using swing structure."""
@@ -346,7 +428,7 @@ class MMSState:
                 self.trend_bias = "bearish"
 
     def update_structure(self, candles_5m: list):
-        """Detect BOS and FVG zones on 5m structure timeframe."""
+        """Detect 5-wave patterns and FVG zones on 5m structure timeframe."""
         if len(candles_5m) < 15:
             return
         if len(candles_5m) == self.last_structure_candle_count:
@@ -354,134 +436,222 @@ class MMSState:
         self.last_structure_candle_count = len(candles_5m)
 
         swings = detect_swings(candles_5m, lookback=SWING_LOOKBACK)
-        self.swing_history = swings[-20:] if swings else []
+        self.swing_history = swings[-30:] if swings else []
 
-        # Detect BOS: latest candle closes beyond a prior swing point
-        if len(swings) >= 2:
-            latest_candle = candles_5m[-1]
-            swing_highs = [s for s in swings if s.kind == "high"]
-            swing_lows = [s for s in swings if s.kind == "low"]
-
-            # Bullish BOS: candle closes above most recent swing high
-            if swing_highs:
-                last_sh = swing_highs[-1]
-                if latest_candle["close"] > last_sh.price and self.last_bos_dir != "bullish":
-                    self.last_bos_dir = "bullish"
-                    self.structure_bias = "bullish"
-                    self.last_bos_price = last_sh.price
-                    # Point 2 = most recent swing low before this BOS
-                    if swing_lows:
-                        self.point2_price = min(s.price for s in swing_lows[-3:])
-                    now_str = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now_str}] [MMS BOS] BULLISH — close {latest_candle['close']:.2f} "
-                          f"> swing high {last_sh.price:.2f} | SL below {self.point2_price:.2f}")
-
-            # Bearish BOS: candle closes below most recent swing low
-            if swing_lows:
-                last_sl = swing_lows[-1]
-                if latest_candle["close"] < last_sl.price and self.last_bos_dir != "bearish":
-                    self.last_bos_dir = "bearish"
-                    self.structure_bias = "bearish"
-                    self.last_bos_price = last_sl.price
-                    if swing_highs:
-                        self.point2_price = max(s.price for s in swing_highs[-3:])
-                    now_str = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now_str}] [MMS BOS] BEARISH — close {latest_candle['close']:.2f} "
-                          f"< swing low {last_sl.price:.2f} | SL above {self.point2_price:.2f}")
-
-        # Detect FVGs on structure TF
-        fvgs = detect_fvgs(candles_5m[-30:], FVG_MIN_SIZE_PTS)
-        # Keep only recent unfilled FVGs
-        current_price = candles_5m[-1]["close"]
-        self.active_fvgs = []
-        for fvg in fvgs[-10:]:
-            age = len(candles_5m) - fvg.index
-            if age > MAX_FVG_AGE:
-                continue
-            # Bullish FVG only valid if price is above it (waiting for retrace down)
-            if fvg.kind == "bullish" and current_price > fvg.top:
-                self.active_fvgs.append(fvg)
-            # Bearish FVG only valid if price is below it (waiting for retrace up)
-            elif fvg.kind == "bearish" and current_price < fvg.bottom:
-                self.active_fvgs.append(fvg)
+        # Detect all FVGs
+        fvgs = detect_fvgs(candles_5m[-50:], FVG_MIN_SIZE_PTS)
+        n_candles = len(candles_5m)
+        self.all_fvgs = []
+        for fvg in fvgs:
+            age = 50 - fvg.index  # age in candles from end of window
+            if age <= MAX_FVG_AGE:
+                # Adjust FVG index to absolute position
+                fvg.index = n_candles - 50 + fvg.index
+                self.all_fvgs.append(fvg)
 
         # Detect EQH/EQL
         eqh, eql = find_equal_levels(self.swing_history, EQH_TOLERANCE_PTS)
         self.eqh_levels = [e["level"] for e in eqh]
         self.eql_levels = [e["level"] for e in eql]
 
+        # Detect 5-wave Elliott patterns
+        if len(self.swing_history) >= 5:
+            patterns = detect_elliott_5wave(self.swing_history, candles_5m)
+            # Only keep new patterns not already tracked
+            existing_w5_prices = set()
+            for p in self.active_patterns:
+                if p.wave5_price is not None:
+                    existing_w5_prices.add(round(p.wave5_price, 1))
+
+            for pat in patterns:
+                w5_key = round(pat.wave5_price, 1) if pat.wave5_price else 0
+                if w5_key not in existing_w5_prices and not pat.used:
+                    # Find FVGs near wave 2 and wave 4 levels
+                    w2_price = pat.wave2_price
+                    w4_price = pat.wave4_price
+                    fvg_tolerance = 5.0  # points range to match FVG to wave level
+
+                    for fvg in self.all_fvgs:
+                        if pat.direction == "bullish_impulse":
+                            # Wave 2 is a swing low, wave 4 is a swing low
+                            # FVGs near those levels (bearish FVGs = gap down = price drops into)
+                            if abs(fvg.mid - w2_price) <= fvg_tolerance:
+                                pat.fvgs_at_2.append(fvg)
+                            if abs(fvg.mid - w4_price) <= fvg_tolerance:
+                                pat.fvgs_at_4.append(fvg)
+                        else:
+                            # Bearish impulse: wave 2 is swing high, wave 4 is swing high
+                            if abs(fvg.mid - w2_price) <= fvg_tolerance:
+                                pat.fvgs_at_2.append(fvg)
+                            if abs(fvg.mid - w4_price) <= fvg_tolerance:
+                                pat.fvgs_at_4.append(fvg)
+
+                    self.active_patterns.append(pat)
+                    existing_w5_prices.add(w5_key)
+                    now_str = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now_str}] [MMS 5-WAVE] {pat.direction.upper()} detected: "
+                          f"w1={pat.waves[0].price:.1f} w2={pat.waves[1].price:.1f} "
+                          f"w3={pat.waves[2].price:.1f} w4={pat.waves[3].price:.1f} "
+                          f"w5={pat.waves[4].price:.1f} | "
+                          f"FVGs@w2: {len(pat.fvgs_at_2)} FVGs@w4: {len(pat.fvgs_at_4)}")
+
+            # Prune old patterns (keep last 5)
+            self.active_patterns = [p for p in self.active_patterns if not p.used][-5:]
+
+    def _check_reversal(self, pattern: ElliottWave, price: float) -> bool:
+        """Check if price has reversed from wave 5 (confirming pattern completion)."""
+        w5 = pattern.wave5_price
+        if w5 is None:
+            return False
+        if pattern.direction == "bullish_impulse":
+            # Bullish 5-wave topped at w5 (a high). Reversal = price drops below w5
+            return price < w5
+        else:
+            # Bearish 5-wave bottomed at w5 (a low). Reversal = price rises above w5
+            return price > w5
+
     def get_entry_signal(self, price: float) -> dict:
-        """Check if price is tapping into an FVG after BOS, aligned with trend."""
-        if not self.structure_bias or not self.last_bos_price:
-            return None
-        if self.point2_price is None:
-            return None
+        """
+        Check if price taps into FVG at wave 2 or wave 4 level after 5-wave completion.
 
-        # Bullish: need bullish BOS + bullish (or None) trend + price taps bullish FVG
-        if self.structure_bias == "bullish":
-            if self.trend_bias == "bearish":
-                return None
-            for fvg in self.active_fvgs:
-                if fvg.kind == "bullish" and fvg.contains(price):
-                    sl_pts = abs(price - self.point2_price) + 1.0
-                    # Find nearest EQH as TP target
-                    tp_price = None
-                    for lvl in sorted(self.eqh_levels):
-                        if lvl > price + 2.0:
-                            tp_price = lvl
-                            break
-                    # Fallback: TP = 2x the SL distance
-                    if tp_price is None:
-                        tp_price = price + sl_pts * 2.0
-                    tp_pts = abs(tp_price - price)
-                    return {
-                        "direction": "LONG",
-                        "fvg": fvg,
-                        "sl_price": self.point2_price - 1.0,
-                        "sl_pts": sl_pts,
-                        "tp_price": tp_price,
-                        "tp_pts": tp_pts,
-                        "bos_price": self.last_bos_price,
-                    }
+        After bullish 5-wave completes -> price reverses DOWN -> SHORT at FVG near w4 (then w2)
+        After bearish 5-wave completes -> price reverses UP -> LONG at FVG near w4 (then w2)
+        """
+        for pattern in self.active_patterns:
+            if pattern.used:
+                continue
+            if not self._check_reversal(pattern, price):
+                continue
 
-        # Bearish: need bearish BOS + bearish (or None) trend + price taps bearish FVG
-        if self.structure_bias == "bearish":
-            if self.trend_bias == "bullish":
-                return None
-            for fvg in self.active_fvgs:
-                if fvg.kind == "bearish" and fvg.contains(price):
-                    sl_pts = abs(self.point2_price - price) + 1.0
-                    tp_price = None
-                    for lvl in sorted(self.eql_levels, reverse=True):
-                        if lvl < price - 2.0:
-                            tp_price = lvl
-                            break
-                    if tp_price is None:
-                        tp_price = price - sl_pts * 2.0
-                    tp_pts = abs(price - tp_price)
-                    return {
-                        "direction": "SHORT",
-                        "fvg": fvg,
-                        "sl_price": self.point2_price + 1.0,
-                        "sl_pts": sl_pts,
-                        "tp_price": tp_price,
-                        "tp_pts": tp_pts,
-                        "bos_price": self.last_bos_price,
-                    }
+            w2 = pattern.wave2_price
+            w4 = pattern.wave4_price
+            w5 = pattern.wave5_price
+
+            if pattern.direction == "bullish_impulse":
+                # After bullish 5-wave: trade the reversal SHORT
+                # Entry: price rises back to FVG near wave 4 (preferred) or wave 2
+                # SL: above wave 5 (the high)
+                # TP: below wave 2 or EQL level
+
+                # Check FVGs at wave 4 first (closer, preferred entry)
+                for fvg in pattern.fvgs_at_4:
+                    if fvg.contains(price) and not fvg.filled:
+                        sl_price = w5 + 2.0  # above the wave 5 high
+                        sl_pts = abs(sl_price - price)
+                        # TP at wave 2 level or EQL
+                        tp_price = None
+                        for lvl in sorted(self.eql_levels, reverse=True):
+                            if lvl < price - 2.0:
+                                tp_price = lvl
+                                break
+                        if tp_price is None:
+                            tp_price = w2  # target wave 2 level
+                        tp_pts = abs(price - tp_price)
+                        return {
+                            "direction": "SHORT",
+                            "fvg": fvg,
+                            "sl_price": sl_price,
+                            "sl_pts": sl_pts,
+                            "tp_price": tp_price,
+                            "tp_pts": tp_pts,
+                            "wave_pattern": str(pattern),
+                            "entry_wave": "w4",
+                            "pattern": pattern,
+                        }
+
+                # Then check FVGs at wave 2
+                for fvg in pattern.fvgs_at_2:
+                    if fvg.contains(price) and not fvg.filled:
+                        sl_price = w5 + 2.0
+                        sl_pts = abs(sl_price - price)
+                        tp_price = None
+                        for lvl in sorted(self.eql_levels, reverse=True):
+                            if lvl < price - 2.0:
+                                tp_price = lvl
+                                break
+                        if tp_price is None:
+                            tp_price = price - sl_pts * 2.0
+                        tp_pts = abs(price - tp_price)
+                        return {
+                            "direction": "SHORT",
+                            "fvg": fvg,
+                            "sl_price": sl_price,
+                            "sl_pts": sl_pts,
+                            "tp_price": tp_price,
+                            "tp_pts": tp_pts,
+                            "wave_pattern": str(pattern),
+                            "entry_wave": "w2",
+                            "pattern": pattern,
+                        }
+
+            elif pattern.direction == "bearish_impulse":
+                # After bearish 5-wave: trade the reversal LONG
+                # Entry: price drops back to FVG near wave 4 (preferred) or wave 2
+                # SL: below wave 5 (the low)
+                # TP: above wave 2 or EQH level
+
+                for fvg in pattern.fvgs_at_4:
+                    if fvg.contains(price) and not fvg.filled:
+                        sl_price = w5 - 2.0  # below wave 5 low
+                        sl_pts = abs(price - sl_price)
+                        tp_price = None
+                        for lvl in sorted(self.eqh_levels):
+                            if lvl > price + 2.0:
+                                tp_price = lvl
+                                break
+                        if tp_price is None:
+                            tp_price = w2  # target wave 2 level
+                        tp_pts = abs(tp_price - price)
+                        return {
+                            "direction": "LONG",
+                            "fvg": fvg,
+                            "sl_price": sl_price,
+                            "sl_pts": sl_pts,
+                            "tp_price": tp_price,
+                            "tp_pts": tp_pts,
+                            "wave_pattern": str(pattern),
+                            "entry_wave": "w4",
+                            "pattern": pattern,
+                        }
+
+                for fvg in pattern.fvgs_at_2:
+                    if fvg.contains(price) and not fvg.filled:
+                        sl_price = w5 - 2.0
+                        sl_pts = abs(price - sl_price)
+                        tp_price = None
+                        for lvl in sorted(self.eqh_levels):
+                            if lvl > price + 2.0:
+                                tp_price = lvl
+                                break
+                        if tp_price is None:
+                            tp_price = price + sl_pts * 2.0
+                        tp_pts = abs(tp_price - price)
+                        return {
+                            "direction": "LONG",
+                            "fvg": fvg,
+                            "sl_price": sl_price,
+                            "sl_pts": sl_pts,
+                            "tp_price": tp_price,
+                            "tp_pts": tp_pts,
+                            "wave_pattern": str(pattern),
+                            "entry_wave": "w2",
+                            "pattern": pattern,
+                        }
+
         return None
 
     def invalidate_fvg(self, fvg: FVG):
         """Mark an FVG as filled/used."""
         fvg.filled = True
-        self.active_fvgs = [f for f in self.active_fvgs if not f.filled]
+
+    def mark_pattern_used(self, pattern):
+        """Mark a pattern as used after trade entry."""
+        pattern.used = True
+        self.active_patterns = [p for p in self.active_patterns if not p.used]
 
     def reset_after_trade(self):
-        """Reset BOS state after a trade so we wait for a fresh setup."""
-        self.last_bos_dir = None
-        self.structure_bias = None
-        self.last_bos_price = None
-        self.point2_price = None
-        self.pending_entry = None
+        """Reset state after a trade so we wait for a fresh setup."""
+        pass  # patterns auto-cleaned by mark_pattern_used
 
 
 # ============================================================
@@ -764,11 +934,11 @@ class SymbolState:
         if completed_5m:
             self.mms.update_structure(self.candles_5m.candles)
             now_str = datetime.now(ET).strftime("%H:%M:%S")
-            n_fvg = len(self.mms.active_fvgs)
+            n_fvg = len(self.mms.all_fvgs)
+            n_pat = len(self.mms.active_patterns)
             n_eqh = len(self.mms.eqh_levels)
             n_eql = len(self.mms.eql_levels)
-            bias = self.mms.structure_bias or "none"
-            print(f"[{now_str}] [{self.symbol} 5M] Bias: {bias} | "
+            print(f"[{now_str}] [{self.symbol} 5M] Patterns: {n_pat} | "
                   f"FVGs: {n_fvg} | EQH: {n_eqh} | EQL: {n_eql}")
 
         # Position management
@@ -844,12 +1014,16 @@ class SymbolState:
                     return actions
 
                 now_str = datetime.now(ET).strftime("%H:%M:%S")
+                wave_info = signal.get("wave_pattern", "")
+                entry_w = signal.get("entry_wave", "")
                 print(f"[{now_str}] [{self.symbol} MMS-SIGNAL] {signal['direction']} "
-                      f"FVG tap @ {price:.2f} | BOS @ {signal['bos_price']:.2f} | "
+                      f"FVG tap @ {price:.2f} (entry at {entry_w}) | "
                       f"SL={signal['sl_price']:.2f} TP={signal['tp_price']:.2f} "
-                      f"R:R={tp_pts/max(sl_pts,0.1):.1f}")
+                      f"R:R={tp_pts/max(sl_pts,0.1):.1f} | {wave_info}")
 
                 self.mms.invalidate_fvg(signal["fvg"])
+                if "pattern" in signal:
+                    self.mms.mark_pattern_used(signal["pattern"])
 
                 if signal["direction"] == "LONG":
                     actions.append(("enter_long", price, signal["sl_price"],
@@ -878,7 +1052,6 @@ class SymbolState:
             "daily_loss": self.daily_loss,
             "trade_count": self._trade_count,
             "trend_bias": self.mms.trend_bias,
-            "structure_bias": self.mms.structure_bias,
             "candle_1m_current": self.candles_1m._current,
             "candle_1m_history": self.candles_1m.candles[-50:],
             "candle_5m_current": self.candles_5m._current,
@@ -902,7 +1075,6 @@ class SymbolState:
 
         # Restore MMS bias
         self.mms.trend_bias = state.get("trend_bias")
-        self.mms.structure_bias = state.get("structure_bias")
 
         pos = state.get("position", 0)
         if pos != 0 and age < position_ttl:
@@ -1086,11 +1258,11 @@ class MMSBot:
 
         symbols = self._symbols_list()
         print(f"[BOT] MMS Bot starting...")
-        print(f"[BOT] Strategy: ICT Market Maker Model (BOS + FVG entry)")
+        print(f"[BOT] Strategy: Elliott 5-Wave Reversal + FVG entry at w2/w4")
         print(f"[BOT] Structure: 5m | Entry: 1m | Trend: 15m")
-        print(f"[BOT] Entry: FVG tap after BOS in trend direction")
-        print(f"[BOT] SL: behind point 2 (liquidity sweep)")
-        print(f"[BOT] TP: equal highs/lows (liquidity target)")
+        print(f"[BOT] Entry: FVG tap at wave 2/4 after 5-wave reversal")
+        print(f"[BOT] SL: beyond wave 5 (impulse extreme)")
+        print(f"[BOT] TP: EQH/EQL levels or wave 2 target")
         print(f"[BOT] Min R:R = 1.5 | Max SL = ${DAILY_LOSS_LIMIT:.0f}")
         print(f"[BOT] Symbols: {symbols}")
 
@@ -1390,9 +1562,9 @@ def main():
         print("ERROR: No symbols configured")
         return
 
-    print(f"[BOT] MMS (Market Maker Model) Bot")
-    print(f"[BOT] Strategy: BOS + FVG tap + EQH/EQL targets")
-    print(f"[BOT] Timeframes: 15m trend / 5m structure / 1m entry")
+    print(f"[BOT] MMS (Market Maker Model) Bot v2")
+    print(f"[BOT] Strategy: Elliott 5-Wave Reversal + FVG tap at wave 2/4")
+    print(f"[BOT] Timeframes: 15m trend / 5m structure+waves / 1m entry")
     for cfg in symbol_configs:
         print(f"  {cfg['symbol']}: qty={cfg['qty']}")
 
