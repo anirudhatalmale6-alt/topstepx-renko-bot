@@ -5,8 +5,8 @@ Strategy: Renko brick reversal on 30-second price sampling
 - Build Renko bricks (0.25 pt brick size) from 30s price samples
 - Entry: brick color flips (red->green = LONG, green->red = SHORT)
 - Exit: immediate on next brick reversal OR TP hit
-- TP: starts at 2 pts, RL learns to hold longer over time
-- RL (Q-learning) adjusts TP dynamically based on trade outcomes
+- TP: $20 total PnL, SL: fixed 20 pts
+- ML (logistic regression) learns to skip bad setups over time
 
 Usage:
     python renko_reversal_bot.py --symbols "NQ:1" --tick-interval 1
@@ -131,12 +131,8 @@ CANDLE_SECONDS = 30
 BB_CANDLE_SECONDS = 15
 BRICK_SIZE = 0.25
 
-# TP tiers the RL can learn
-TP_TIERS = [2, 3, 5, 8, 10, 15, 20]
+# Fixed TP/SL (no RL — ML only filters entries)
 DEFAULT_TP_PTS = 2
-
-# SL tiers the RL can learn (in points)
-SL_TIERS = [5, 10, 15, 20, 30, 50]
 DEFAULT_SL_PTS = 20
 
 # DCA strategy: enter 1 contract, add 1 more at -$80, TP at $20 total
@@ -354,139 +350,81 @@ class RenkoBrickBuilder:
 # Reinforcement Learning for Renko Reversal
 # ============================================================
 
-RL_WARMUP_TRADES = 15
-RL_ALPHA = 0.15
-RL_ALPHA_REGIME = 0.30
-RL_GAMMA = 0.95
-RL_EPSILON_START = 0.90
-RL_EPSILON_MIN = 0.10
-RL_EPSILON_DECAY = 0.985
-RL_PNL_SCALE = 200.0
-RL_Q_DECAY = 0.998
-RL_REGIME_WINDOW = 15
-RL_REGIME_THRESHOLD = 0.20
+ML_WARMUP_TRADES = 15
+ML_LEARNING_RATE = 0.05
+ML_SKIP_THRESHOLD = 0.25
 
 
-class RenkoRL:
-    """Q-learning RL for Renko reversal — learns optimal TP and SL over time."""
+class TradeFilter:
+    """Online logistic regression — learns to skip bad setups."""
 
-    ACTION_ENTER = 0
-    ACTION_SKIP = 1
+    N_FEATURES = 6
 
     def __init__(self, data_file: str):
         self.data_file = data_file
-        self.q_table = {}
-        self.tp_q = {}
-        self.sl_q = {}
+        self.weights = [0.0] * self.N_FEATURES
+        self.bias = 0.0
         self.trades = []
-        self.epsilon = RL_EPSILON_START
         self.total_trades = 0
         self.recent_outcomes = []
-        self.regime_shift = False
         self._load()
 
-    def _state_key(self, features: dict) -> str:
-        consec = features.get("consecutive_bricks", 1)
-        if consec >= 5:
-            consec_zone = "run5+"
-        elif consec >= 3:
-            consec_zone = "run3"
-        elif consec >= 2:
-            consec_zone = "run2"
-        else:
-            consec_zone = "flip"
+    @staticmethod
+    def _sigmoid(x):
+        x = max(-20.0, min(20.0, x))
+        return 1.0 / (1.0 + math.exp(-x))
 
-        mom = features.get("momentum", "flat")
+    def _featurize(self, features: dict) -> list:
+        consec = min(features.get("consecutive_bricks", 1), 10) / 10.0
+        mom = features.get("momentum_pts", 0.0) / 5.0
+        hour = (features.get("hour", 12) - 12) / 4.0
+        day = (datetime.now(ET).weekday() - 2) / 2.0
+        recent = self.recent_outcomes[-10:]
+        recent_wr = sum(1 for p in recent if p > 0) / max(len(recent), 1)
+        bricks = min(features.get("brick_count", 50), 200) / 200.0
+        return [consec, mom, hour, day, recent_wr, bricks]
 
-        hour = features.get("hour", 12)
-        if hour < 10:
-            time_zone = "early"
-        elif hour < 12:
-            time_zone = "morning"
-        elif hour < 14:
-            time_zone = "midday"
-        else:
-            time_zone = "afternoon"
-
-        recent_wins = sum(1 for p in self.recent_outcomes[-5:] if p > 0)
-        recent_total = min(len(self.recent_outcomes), 5)
-        if recent_total < 3:
-            streak = "new"
-        elif recent_wins >= 4:
-            streak = "hot"
-        elif recent_wins <= 1:
-            streak = "cold"
-        else:
-            streak = "mixed"
-
-        return f"{consec_zone}|{mom}|{time_zone}|{streak}"
-
-    def _get_q(self, state_key: str) -> list:
-        if state_key not in self.q_table:
-            self.q_table[state_key] = [0.0, 0.0]
-        q = self.q_table[state_key]
-        while len(q) < 2:
-            q.append(0.0)
-        return q
-
-    def _get_tp_q(self, state_key: str) -> list:
-        if state_key not in self.tp_q:
-            self.tp_q[state_key] = [0.0] * len(TP_TIERS)
-        q = self.tp_q[state_key]
-        while len(q) < len(TP_TIERS):
-            q.append(0.0)
-        return q
-
-    def _get_sl_q(self, state_key: str) -> list:
-        if state_key not in self.sl_q:
-            self.sl_q[state_key] = [0.0] * len(SL_TIERS)
-        q = self.sl_q[state_key]
-        while len(q) < len(SL_TIERS):
-            q.append(0.0)
-        return q
+    def _predict(self, x: list) -> float:
+        z = self.bias + sum(w * xi for w, xi in zip(self.weights, x))
+        return self._sigmoid(z)
 
     def _load(self):
         if os.path.exists(self.data_file):
             try:
                 with open(self.data_file, "r") as f:
                     data = json.load(f)
-                self.q_table = data.get("q_table", {})
-                self.tp_q = data.get("tp_q", {})
-                self.sl_q = data.get("sl_q", {})
+                self.weights = data.get("weights", [0.0] * self.N_FEATURES)
+                self.bias = data.get("bias", 0.0)
                 self.trades = data.get("trades", [])
-                self.epsilon = data.get("epsilon", RL_EPSILON_START)
                 self.total_trades = data.get("total_trades", len(self.trades))
                 self.recent_outcomes = data.get("recent_outcomes", [])
-                self.regime_shift = data.get("regime_shift", False)
-                print(f"[RL] Loaded: {self.total_trades} trades, {len(self.q_table)} states, "
-                      f"epsilon={self.epsilon:.3f}")
+                while len(self.weights) < self.N_FEATURES:
+                    self.weights.append(0.0)
+                print(f"[ML] Loaded: {self.total_trades} trades, "
+                      f"bias={self.bias:.3f}")
             except Exception as e:
-                print(f"[RL] Load error: {e}")
+                print(f"[ML] Load error: {e}")
 
     def _save(self):
         try:
             data = {
-                "q_table": self.q_table,
-                "tp_q": self.tp_q,
-                "sl_q": self.sl_q,
+                "weights": self.weights,
+                "bias": self.bias,
                 "trades": self.trades[-500:],
-                "epsilon": self.epsilon,
                 "total_trades": self.total_trades,
                 "recent_outcomes": self.recent_outcomes[-20:],
-                "regime_shift": self.regime_shift,
             }
             tmp = self.data_file + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(data, f)
             os.replace(tmp, self.data_file)
         except Exception as e:
-            print(f"[RL] Save error: {e}")
+            print(f"[ML] Save error: {e}")
 
     def extract_features(self, price: float, renko: RenkoBrickBuilder) -> dict:
         hour = datetime.now(ET).hour
         consec = renko.consecutive_count()
         last_dir = renko.last_direction() or "none"
-
         closes = renko.get_closes(10)
         if len(closes) >= 6:
             mom_pts = (closes[-1] - closes[-6]) / 5.0
@@ -502,7 +440,6 @@ class RenkoRL:
             momentum = "down"
         else:
             momentum = "flat"
-
         return {
             "consecutive_bricks": consec,
             "last_direction": last_dir,
@@ -514,126 +451,45 @@ class RenkoRL:
         }
 
     def should_enter(self, features: dict) -> tuple:
-        if self.total_trades < RL_WARMUP_TRADES:
-            return True, f"RL warmup ({self.total_trades}/{RL_WARMUP_TRADES})"
-        state = self._state_key(features)
-        q_vals = self._get_q(state)
-        q_enter, q_skip = q_vals
-
-        if random.random() < self.epsilon:
-            action = random.choice([self.ACTION_ENTER, self.ACTION_SKIP])
-            choice = "explore"
-        else:
-            action = self.ACTION_ENTER if q_enter >= q_skip else self.ACTION_SKIP
-            choice = "exploit"
-
-        reason = (f"RL|{state}|Q(enter)={q_enter:+.2f} Q(skip)={q_skip:+.2f}|"
-                  f"eps={self.epsilon:.2f}|{choice}")
-        return action == self.ACTION_ENTER, reason
-
-    def select_tp(self, features: dict) -> tuple:
-        if self.total_trades < RL_WARMUP_TRADES * 2:
-            tp_idx = TP_TIERS.index(DEFAULT_TP_PTS) if DEFAULT_TP_PTS in TP_TIERS else 0
-            return DEFAULT_TP_PTS, tp_idx
-
-        state = self._state_key(features)
-        tp_q = self._get_tp_q(state)
-
-        if random.random() < self.epsilon:
-            tp_idx = random.randint(0, len(TP_TIERS) - 1)
-        else:
-            tp_idx = tp_q.index(max(tp_q))
-
-        return TP_TIERS[tp_idx], tp_idx
-
-    def select_sl(self, features: dict) -> tuple:
-        if self.total_trades < RL_WARMUP_TRADES * 2:
-            sl_idx = SL_TIERS.index(DEFAULT_SL_PTS) if DEFAULT_SL_PTS in SL_TIERS else 0
-            return DEFAULT_SL_PTS, sl_idx
-
-        state = self._state_key(features)
-        sl_q = self._get_sl_q(state)
-
-        if random.random() < self.epsilon:
-            sl_idx = random.randint(0, len(SL_TIERS) - 1)
-        else:
-            sl_idx = sl_q.index(max(sl_q))
-
-        return SL_TIERS[sl_idx], sl_idx
-
-    def _detect_regime_shift(self) -> bool:
-        total = len(self.trades)
-        if total < RL_REGIME_WINDOW + 10:
-            return False
-        overall_wr = sum(1 for t in self.trades if t["win"] == 1) / total
-        recent = self.trades[-RL_REGIME_WINDOW:]
-        recent_wr = sum(1 for t in recent if t["win"] == 1) / len(recent)
-        return (overall_wr - recent_wr) >= RL_REGIME_THRESHOLD
-
-    def _decay_q_table(self):
-        for key in self.q_table:
-            for i in range(len(self.q_table[key])):
-                self.q_table[key][i] *= RL_Q_DECAY
+        if self.total_trades < ML_WARMUP_TRADES:
+            return True, f"ML warmup ({self.total_trades}/{ML_WARMUP_TRADES})"
+        x = self._featurize(features)
+        p_win = self._predict(x)
+        if p_win < ML_SKIP_THRESHOLD:
+            return False, f"ML|P(win)={p_win:.2f}<{ML_SKIP_THRESHOLD}|SKIP"
+        return True, f"ML|P(win)={p_win:.2f}|ENTER"
 
     def record_trade(self, features: dict, pnl: float, source: str = "live",
-                     entered: bool = True, tp_idx: int = 0, sl_idx: int = 0,
-                     mae: float = 0.0, mfe: float = 0.0):
+                     entered: bool = True, mae: float = 0.0, mfe: float = 0.0,
+                     **kwargs):
         if features is None:
             return
-        state = self._state_key(features)
-        reward = pnl / RL_PNL_SCALE
-
-        self.regime_shift = self._detect_regime_shift()
-        alpha = RL_ALPHA_REGIME if self.regime_shift else RL_ALPHA
-        self._decay_q_table()
-
-        q_vals = self._get_q(state)
-        action_idx = self.ACTION_ENTER if entered else self.ACTION_SKIP
-        old_q = q_vals[action_idx]
-        q_vals[action_idx] = old_q + alpha * (reward - old_q)
-
-        if entered and pnl < 0:
-            old_skip_q = q_vals[self.ACTION_SKIP]
-            skip_reward = abs(reward) * 0.3
-            q_vals[self.ACTION_SKIP] = old_skip_q + alpha * (skip_reward - old_skip_q)
-
-        tp_q = self._get_tp_q(state)
-        if tp_idx < len(tp_q):
-            tp_q[tp_idx] = tp_q[tp_idx] + alpha * (reward - tp_q[tp_idx])
-
-        sl_q = self._get_sl_q(state)
-        if sl_idx < len(sl_q):
-            sl_q[sl_idx] = sl_q[sl_idx] + alpha * (reward - sl_q[sl_idx])
+        x = self._featurize(features)
+        y = 1.0 if pnl > 0 else 0.0
+        p = self._predict(x)
+        error = y - p
+        for i in range(self.N_FEATURES):
+            self.weights[i] += ML_LEARNING_RATE * error * x[i]
+        self.bias += ML_LEARNING_RATE * error
 
         self.recent_outcomes.append(pnl)
         if len(self.recent_outcomes) > 20:
             self.recent_outcomes = self.recent_outcomes[-20:]
 
-        sl_pts = SL_TIERS[sl_idx] if sl_idx < len(SL_TIERS) else DEFAULT_SL_PTS
-        tp_pts = TP_TIERS[tp_idx] if tp_idx < len(TP_TIERS) else DEFAULT_TP_PTS
         trade = {
-            "features": features, "state": state, "pnl": pnl,
+            "features": features, "pnl": pnl,
             "win": 1 if pnl > 0 else 0, "entered": entered,
-            "q_after": list(q_vals), "alpha_used": alpha,
-            "regime_shift": self.regime_shift, "epsilon": self.epsilon,
-            "source": source, "timestamp": datetime.now(ET).isoformat(),
-            "tp_idx": tp_idx, "tp_pts": tp_pts,
-            "sl_idx": sl_idx, "sl_pts": sl_pts,
+            "p_win": round(p, 3), "source": source,
+            "timestamp": datetime.now(ET).isoformat(),
             "mae": mae, "mfe": mfe,
         }
         self.trades.append(trade)
         self.total_trades += 1
-
-        if self.regime_shift:
-            self.epsilon = min(0.50, self.epsilon + 0.05)
-        else:
-            self.epsilon = max(RL_EPSILON_MIN, self.epsilon * RL_EPSILON_DECAY)
         self._save()
 
         wins = sum(1 for t in self.trades if t["win"] == 1)
         total = len(self.trades)
-        print(f"[RL] Trade recorded: PnL=${pnl:.2f} | TP={tp_pts}pts SL={sl_pts}pts | "
-              f"state={state} | eps={self.epsilon:.3f} | "
+        print(f"[ML] Trade recorded: PnL=${pnl:.2f} | P(win)={p:.2f} | "
               f"{total} trades, {wins} wins ({100*wins/total:.0f}%)")
 
     def stats(self) -> str:
@@ -642,9 +498,8 @@ class RenkoRL:
         total = len(self.trades)
         wins = sum(1 for t in self.trades if t["win"] == 1)
         total_pnl = sum(t["pnl"] for t in self.trades)
-        return (f"RL: {total} trades | W:{wins} L:{total-wins} | "
-                f"Win%: {100*wins/total:.0f}% | PnL: ${total_pnl:.2f} | "
-                f"{len(self.q_table)} states | eps={self.epsilon:.3f}")
+        return (f"ML: {total} trades | W:{wins} L:{total-wins} | "
+                f"Win%: {100*wins/total:.0f}% | PnL: ${total_pnl:.2f}")
 
 
 # ============================================================
@@ -682,17 +537,14 @@ class SymbolState:
         self.entry_price = 0.0
         self.entry_time = 0.0
         self.entry_features = None
-        self.active_tp_pts = DEFAULT_TP_PTS
-        self.active_tp_idx = 0
         self.active_sl_pts = DEFAULT_SL_PTS
-        self.active_sl_idx = 0
         self.live_pnl = 0.0
         self.trade_mae = 0.0
         self.trade_mfe = 0.0
         self._dca_done = False
         self._entry_prices = []
 
-        self.ml = RenkoRL(os.path.join(os.getcwd(), f"rl_state_{symbol}_renko.json"))
+        self.ml = TradeFilter(os.path.join(os.getcwd(), f"ml_state_{symbol}.json"))
 
         self.ctx = None
         self._suite_client = None
@@ -786,11 +638,9 @@ class SymbolState:
         now = datetime.now(ET).strftime("%H:%M:%S")
 
         features = self.extract_features()
-        tp_pts, tp_idx = self.ml.select_tp(features)
-        sl_pts, sl_idx = self.ml.select_sl(features)
 
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG x{qty} @ {price:.2f} | "
-              f"TP=${DCA_TP_DOLLARS} | SL={sl_pts}pts | DCA at -${abs(DCA_ADD_THRESHOLD)} | "
+              f"TP=${DCA_TP_DOLLARS} | SL={DEFAULT_SL_PTS}pts | DCA at -${abs(DCA_ADD_THRESHOLD)} | "
               f"Session P&L: ${self.live_pnl:.2f}")
 
         try:
@@ -807,10 +657,7 @@ class SymbolState:
                 self._dca_done = False
                 self.entry_time = time.time()
                 self.entry_features = features
-                self.active_tp_pts = tp_pts
-                self.active_tp_idx = tp_idx
-                self.active_sl_pts = sl_pts
-                self.active_sl_idx = sl_idx
+                self.active_sl_pts = DEFAULT_SL_PTS
                 self.trade_mae = 0.0
                 self.trade_mfe = 0.0
                 threading.Thread(target=send_signals, args=(
@@ -838,11 +685,9 @@ class SymbolState:
         now = datetime.now(ET).strftime("%H:%M:%S")
 
         features = self.extract_features()
-        tp_pts, tp_idx = self.ml.select_tp(features)
-        sl_pts, sl_idx = self.ml.select_sl(features)
 
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT x{qty} @ {price:.2f} | "
-              f"TP=${DCA_TP_DOLLARS} | SL={sl_pts}pts | DCA at -${abs(DCA_ADD_THRESHOLD)} | "
+              f"TP=${DCA_TP_DOLLARS} | SL={DEFAULT_SL_PTS}pts | DCA at -${abs(DCA_ADD_THRESHOLD)} | "
               f"Session P&L: ${self.live_pnl:.2f}")
 
         try:
@@ -859,10 +704,7 @@ class SymbolState:
                 self._dca_done = False
                 self.entry_time = time.time()
                 self.entry_features = features
-                self.active_tp_pts = tp_pts
-                self.active_tp_idx = tp_idx
-                self.active_sl_pts = sl_pts
-                self.active_sl_idx = sl_idx
+                self.active_sl_pts = DEFAULT_SL_PTS
                 self.trade_mae = 0.0
                 self.trade_mfe = 0.0
                 threading.Thread(target=send_signals, args=(
@@ -963,14 +805,12 @@ class SymbolState:
             trade_pnl = real_trade_pnl
 
         feat = self._pending_rl["features"] if self._pending_rl else self.entry_features
-        tp_i = self._pending_rl.get("tp_idx", self.active_tp_idx) if self._pending_rl else self.active_tp_idx
-        sl_i = self._pending_rl.get("sl_idx", self.active_sl_idx) if self._pending_rl else self.active_sl_idx
         m = self._pending_rl.get("mae", self.trade_mae) if self._pending_rl else self.trade_mae
         mf = self._pending_rl.get("mfe", self.trade_mfe) if self._pending_rl else self.trade_mfe
 
         if feat:
             self.ml.record_trade(feat, trade_pnl, source="live",
-                                 entered=True, tp_idx=tp_i, sl_idx=sl_i, mae=m, mfe=mf)
+                                 entered=True, mae=m, mfe=mf)
 
         self._pending_rl = None
         self.entry_features = None
@@ -1032,8 +872,6 @@ class SymbolState:
                       f"unrealized ${unrealized:.0f} <= floor ${self._trail_profit_floor:.0f} "
                       f"(peak was ${self._trail_profit_peak:.0f})")
                 self._pending_rl = {"features": self.entry_features,
-                                    "tp_idx": self.active_tp_idx,
-                                    "sl_idx": self.active_sl_idx,
                                     "mae": self.trade_mae, "mfe": self.trade_mfe}
                 if self._tp_limit_order_id:
                     actions.append(("cancel_tp_limit",))
@@ -1047,8 +885,6 @@ class SymbolState:
                 print(f"[{now_str}] [{self.symbol} TP-NEAR] {direction} x{self.contracts_held} "
                       f"est ${unrealized:.0f} >= ${DCA_TP_DOLLARS} @ {price:.2f} — placing TP limit...")
                 self._pending_rl = {"features": self.entry_features,
-                                    "tp_idx": self.active_tp_idx,
-                                    "sl_idx": self.active_sl_idx,
                                     "mae": self.trade_mae, "mfe": self.trade_mfe}
                 actions.append(("tp_limit", price))
                 return actions
@@ -1064,21 +900,19 @@ class SymbolState:
                     actions.append(("dca_add", price))
                     return actions
 
-            # RL STOP LOSS: exit if loss exceeds RL-selected SL (in points)
+            # STOP LOSS: exit if loss exceeds SL (in points)
             sl_dollars = self.active_sl_pts * self.pv * self.contracts_held
             if unrealized <= -sl_dollars:
                 now_str = datetime.now(ET).strftime("%H:%M:%S")
                 direction = "LONG" if self.position == 1 else "SHORT"
-                print(f"[{now_str}] [{self.symbol} RL-SL] {direction} x{self.contracts_held} "
+                print(f"[{now_str}] [{self.symbol} SL] {direction} x{self.contracts_held} "
                       f"unrealized ${unrealized:.0f} <= -${sl_dollars:.0f} "
                       f"(SL={self.active_sl_pts}pts) — STOP LOSS EXIT")
                 self._pending_rl = {"features": self.entry_features,
-                                    "tp_idx": self.active_tp_idx,
-                                    "sl_idx": self.active_sl_idx,
                                     "mae": self.trade_mae, "mfe": self.trade_mfe}
                 if self._tp_limit_order_id:
                     actions.append(("cancel_tp_limit",))
-                actions.append(("flatten", price, "RL_STOP_LOSS"))
+                actions.append(("flatten", price, "STOP_LOSS"))
                 return actions
 
             # HARD BACKSTOP: force exit if loss exceeds daily limit (safety net)
@@ -1088,8 +922,6 @@ class SymbolState:
                 print(f"[{now_str}] [{self.symbol} MAX-LOSS] {direction} x{self.contracts_held} "
                       f"unrealized ${unrealized:.0f} <= -${DAILY_LOSS_LIMIT:.0f} — FORCE EXIT")
                 self._pending_rl = {"features": self.entry_features,
-                                    "tp_idx": self.active_tp_idx,
-                                    "sl_idx": self.active_sl_idx,
                                     "mae": self.trade_mae, "mfe": self.trade_mfe}
                 if self._tp_limit_order_id:
                     actions.append(("cancel_tp_limit",))
@@ -1119,8 +951,6 @@ class SymbolState:
                             print(f"[{now_str}] [{self.symbol} {reason_tag}] LONG x{self.contracts_held} "
                                   f"closed — red brick (PnL ${cur_pnl:.0f})")
                             self._pending_rl = {"features": self.entry_features,
-                                                "tp_idx": self.active_tp_idx,
-                                                "sl_idx": self.active_sl_idx,
                                                 "mae": self.trade_mae, "mfe": self.trade_mfe}
                             if self._tp_limit_order_id:
                                 actions.append(("cancel_tp_limit",))
@@ -1136,8 +966,6 @@ class SymbolState:
                             print(f"[{now_str}] [{self.symbol} {reason_tag}] SHORT x{self.contracts_held} "
                                   f"closed — green brick (PnL ${cur_pnl:.0f})")
                             self._pending_rl = {"features": self.entry_features,
-                                                "tp_idx": self.active_tp_idx,
-                                                "sl_idx": self.active_sl_idx,
                                                 "mae": self.trade_mae, "mfe": self.trade_mfe}
                             if self._tp_limit_order_id:
                                 actions.append(("cancel_tp_limit",))
@@ -1200,10 +1028,7 @@ class SymbolState:
             "entry_price": self.entry_price,
             "entry_time": self.entry_time,
             "entry_features": self.entry_features,
-            "active_tp_pts": self.active_tp_pts,
-            "active_tp_idx": self.active_tp_idx,
             "active_sl_pts": self.active_sl_pts,
-            "active_sl_idx": self.active_sl_idx,
             "live_pnl": self.live_pnl,
             "trade_mae": self.trade_mae,
             "trade_mfe": self.trade_mfe,
@@ -1258,10 +1083,7 @@ class SymbolState:
             self.entry_price = state.get("entry_price", 0.0)
             self.entry_time = state.get("entry_time", 0.0)
             self.entry_features = state.get("entry_features")
-            self.active_tp_pts = state.get("active_tp_pts", DEFAULT_TP_PTS)
-            self.active_tp_idx = state.get("active_tp_idx", 0)
             self.active_sl_pts = state.get("active_sl_pts", DEFAULT_SL_PTS)
-            self.active_sl_idx = state.get("active_sl_idx", 0)
             self.live_pnl = state.get("live_pnl", 0.0)
             self.trade_mae = state.get("trade_mae", 0.0)
             self.trade_mfe = state.get("trade_mfe", 0.0)
@@ -1372,8 +1194,6 @@ class RenkoReversalBot:
                             pnl_est = (st.entry_price - price) * st.pv * st.contracts_held
 
                         features = st.entry_features
-                        tp_i = st.active_tp_idx
-                        sl_i = st.active_sl_idx
                         mae = st.trade_mae
                         mfe = st.trade_mfe
 
@@ -1394,23 +1214,23 @@ class RenkoReversalBot:
                             kwargs={"ntfy_topic": st.ntfy_topic,
                                     "tp_webhooks": st.tp_webhooks}, daemon=True).start()
 
-                        async def _deferred_rl(st_ref, feat, pnl_before, ti, si, m, mf):
+                        async def _deferred_ml(st_ref, feat, pnl_before, m, mf):
                             try:
                                 await st_ref._sync_pnl_from_platform()
                                 real_pnl = st_ref.live_pnl - pnl_before + pnl_est
                                 st_ref.ml.record_trade(feat, real_pnl, source="platform_close",
-                                                       entered=True, tp_idx=ti, sl_idx=si, mae=m, mfe=mf)
+                                                       entered=True, mae=m, mfe=mf)
                             except Exception:
                                 st_ref.ml.record_trade(feat, pnl_est, source="platform_close_est",
-                                                       entered=True, tp_idx=ti, sl_idx=si, mae=m, mfe=mf)
+                                                       entered=True, mae=m, mfe=mf)
 
                         pnl_before = st.live_pnl - pnl_est
                         try:
                             loop = asyncio.get_event_loop()
-                            loop.create_task(_deferred_rl(st, features, pnl_before, tp_i, sl_i, mae, mfe))
+                            loop.create_task(_deferred_ml(st, features, pnl_before, mae, mfe))
                         except Exception:
                             st.ml.record_trade(features, pnl_est, source="platform_close_est",
-                                               entered=True, tp_idx=tp_i, sl_idx=sl_i, mae=mae, mfe=mfe)
+                                               entered=True, mae=mae, mfe=mfe)
                         break
             except Exception as e:
                 print(f"[WS] Position event error: {e}")
@@ -1464,7 +1284,7 @@ class RenkoReversalBot:
         print(f"[BOT] ENTRY: brick color flip -> enter 1 contract")
         print(f"[BOT] DCA: add 1 more at -${abs(DCA_ADD_THRESHOLD)}, max {DCA_MAX_CONTRACTS} contracts")
         print(f"[BOT] EXIT: TP=${DCA_TP_DOLLARS} total PnL / opposite brick color")
-        print(f"[BOT] RL: learns TP={TP_TIERS} and SL={SL_TIERS} (pts) over time")
+        print(f"[BOT] ML: logistic regression skips bad setups, SL={DEFAULT_SL_PTS}pts fixed")
         print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
               f"{TRADE_SESSION_END.strftime('%H:%M')} ET")
         print(f"[BOT] Symbols: {symbols}")
@@ -1518,7 +1338,7 @@ class RenkoReversalBot:
         for sym, st in self.states.items():
             msg = (f"STATUS|Renko Reversal Bot started\n"
                    f"Account: {acct}\n"
-                   f"Brick: {BRICK_SIZE}pt | TP: {DEFAULT_TP_PTS}pts (RL learns)\n"
+                   f"Brick: {BRICK_SIZE}pt | TP: {DEFAULT_TP_PTS}pts (ML filter)\n"
                    f"Mode: Brick flip entry, reversal stop\n"
                    f"Session P&L: ${st.live_pnl:.2f}")
             threading.Thread(target=send_telegram, args=(
@@ -1774,7 +1594,7 @@ def main():
         return
 
     print(f"[BOT] Renko Reversal Bot")
-    print(f"[BOT] Brick: {BRICK_SIZE}pt | TP: {DEFAULT_TP_PTS}pts (RL learns)")
+    print(f"[BOT] Brick: {BRICK_SIZE}pt | TP: {DEFAULT_TP_PTS}pts (ML filter)")
     print(f"[BOT] ENTRY: brick color flip -> enter in new direction")
     print(f"[BOT] EXIT: brick reversal (immediate) / TP hit")
     print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "

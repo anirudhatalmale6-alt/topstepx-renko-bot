@@ -7,8 +7,8 @@ Strategy: Renko brick direction flip + 9 EMA confirmation
 - Entry: brick direction flips AND crosses the 9 EMA
   - Brick flips red -> green AND brick close > 9 EMA = LONG
   - Brick flips green -> red AND brick close < 9 EMA = SHORT
-- Exit: trailing stop (RL learns optimal trail distance via Q-learning)
-- Initial trailing stop: 3 bricks (0.75 pts), RL adjusts over time
+- Exit: trailing stop (fixed 0.75 pts = 3 bricks)
+- ML (logistic regression) learns to skip bad setups over time
 - Hard backstop: $1,000 max loss per trade
 - Daily loss limit: $1,000
 
@@ -140,9 +140,8 @@ CANDLE_SECONDS = 30
 BRICK_SIZE = 0.25
 EMA_LENGTH = 9
 
-# Trailing stop tiers (in points) for RL to learn
-TRAIL_TIERS = [0.50, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0]
-DEFAULT_TRAIL_PTS = 0.75  # 3 bricks * 0.25
+# Trailing stop (fixed)
+DEFAULT_TRAIL_PTS = 0.75  # 3 bricks * 0.25 (fixed)
 
 DAILY_LOSS_LIMIT = 1000.0
 HARD_BACKSTOP_PER_TRADE = 1000.0
@@ -369,131 +368,84 @@ def calc_ema_series(closes: list, period: int = EMA_LENGTH) -> list:
 
 
 # ============================================================
-# Trailing Stop RL (Q-learning)
+# Trade Filter (ML)
 # ============================================================
 
-RL_WARMUP_TRADES = 15
-RL_ALPHA = 0.15
-RL_ALPHA_REGIME = 0.30
-RL_GAMMA = 0.95
-RL_EPSILON_START = 0.90
-RL_EPSILON_MIN = 0.10
-RL_EPSILON_DECAY = 0.985
-RL_PNL_SCALE = 200.0
-RL_Q_DECAY = 0.998
-RL_REGIME_WINDOW = 15
-RL_REGIME_THRESHOLD = 0.20
+ML_WARMUP_TRADES = 15
+ML_LEARNING_RATE = 0.05
+ML_SKIP_THRESHOLD = 0.25
 
 
-class TrailingStopRL:
-    """Q-learning RL for trailing stop distance and enter/skip decision."""
+class TradeFilter:
+    """Online logistic regression — learns to skip bad setups."""
 
-    ACTION_ENTER = 0
-    ACTION_SKIP = 1
+    N_FEATURES = 6
 
     def __init__(self, data_file: str):
         self.data_file = data_file
-        self.q_table = {}       # state -> [Q(enter), Q(skip)]
-        self.trail_q = {}       # state -> [Q for each trail tier]
+        self.weights = [0.0] * self.N_FEATURES
+        self.bias = 0.0
         self.trades = []
-        self.epsilon = RL_EPSILON_START
         self.total_trades = 0
         self.recent_outcomes = []
-        self.regime_shift = False
         self._load()
 
-    def _state_key(self, features: dict) -> str:
-        consec = features.get("consecutive_bricks", 1)
-        if consec >= 5:
-            consec_zone = "run5+"
-        elif consec >= 3:
-            consec_zone = "run3"
-        elif consec >= 2:
-            consec_zone = "run2"
-        else:
-            consec_zone = "flip"
+    @staticmethod
+    def _sigmoid(x):
+        x = max(-20.0, min(20.0, x))
+        return 1.0 / (1.0 + math.exp(-x))
 
-        mom = features.get("momentum", "flat")
+    def _featurize(self, features: dict) -> list:
+        consec = min(features.get("consecutive_bricks", 1), 10) / 10.0
+        mom = features.get("momentum_pts", 0.0) / 5.0
+        hour = (features.get("hour", 12) - 12) / 4.0
+        day = (datetime.now(ET).weekday() - 2) / 2.0
+        recent = self.recent_outcomes[-10:]
+        recent_wr = sum(1 for p in recent if p > 0) / max(len(recent), 1)
+        bricks = min(features.get("brick_count", 50), 200) / 200.0
+        return [consec, mom, hour, day, recent_wr, bricks]
 
-        hour = features.get("hour", 12)
-        if hour < 10:
-            time_zone = "early"
-        elif hour < 12:
-            time_zone = "morning"
-        elif hour < 14:
-            time_zone = "midday"
-        else:
-            time_zone = "afternoon"
-
-        recent_wins = sum(1 for p in self.recent_outcomes[-5:] if p > 0)
-        recent_total = min(len(self.recent_outcomes), 5)
-        if recent_total < 3:
-            streak = "new"
-        elif recent_wins >= 4:
-            streak = "hot"
-        elif recent_wins <= 1:
-            streak = "cold"
-        else:
-            streak = "mixed"
-
-        return f"{consec_zone}|{mom}|{time_zone}|{streak}"
-
-    def _get_q(self, state_key: str) -> list:
-        if state_key not in self.q_table:
-            self.q_table[state_key] = [0.0, 0.0]
-        q = self.q_table[state_key]
-        while len(q) < 2:
-            q.append(0.0)
-        return q
-
-    def _get_trail_q(self, state_key: str) -> list:
-        if state_key not in self.trail_q:
-            self.trail_q[state_key] = [0.0] * len(TRAIL_TIERS)
-        q = self.trail_q[state_key]
-        while len(q) < len(TRAIL_TIERS):
-            q.append(0.0)
-        return q
+    def _predict(self, x: list) -> float:
+        z = self.bias + sum(w * xi for w, xi in zip(self.weights, x))
+        return self._sigmoid(z)
 
     def _load(self):
         if os.path.exists(self.data_file):
             try:
                 with open(self.data_file, "r") as f:
                     data = json.load(f)
-                self.q_table = data.get("q_table", {})
-                self.trail_q = data.get("trail_q", {})
+                self.weights = data.get("weights", [0.0] * self.N_FEATURES)
+                self.bias = data.get("bias", 0.0)
                 self.trades = data.get("trades", [])
-                self.epsilon = data.get("epsilon", RL_EPSILON_START)
                 self.total_trades = data.get("total_trades", len(self.trades))
                 self.recent_outcomes = data.get("recent_outcomes", [])
-                self.regime_shift = data.get("regime_shift", False)
-                print(f"[RL] Loaded: {self.total_trades} trades, {len(self.q_table)} states, "
-                      f"epsilon={self.epsilon:.3f}")
+                while len(self.weights) < self.N_FEATURES:
+                    self.weights.append(0.0)
+                print(f"[ML] Loaded: {self.total_trades} trades, "
+                      f"bias={self.bias:.3f}")
             except Exception as e:
-                print(f"[RL] Load error: {e}")
+                print(f"[ML] Load error: {e}")
 
     def _save(self):
         try:
             data = {
-                "q_table": self.q_table,
-                "trail_q": self.trail_q,
+                "weights": self.weights,
+                "bias": self.bias,
                 "trades": self.trades[-500:],
-                "epsilon": self.epsilon,
                 "total_trades": self.total_trades,
                 "recent_outcomes": self.recent_outcomes[-20:],
-                "regime_shift": self.regime_shift,
             }
             tmp = self.data_file + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(data, f)
             os.replace(tmp, self.data_file)
         except Exception as e:
-            print(f"[RL] Save error: {e}")
+            print(f"[ML] Save error: {e}")
 
     def extract_features(self, price: float, renko: RenkoBrickBuilder) -> dict:
         hour = datetime.now(ET).hour
         consec = renko.consecutive_count()
         last_dir = renko.last_direction() or "none"
-
         closes = renko.get_closes(10)
         if len(closes) >= 6:
             mom_pts = (closes[-1] - closes[-6]) / 5.0
@@ -509,7 +461,6 @@ class TrailingStopRL:
             momentum = "down"
         else:
             momentum = "flat"
-
         return {
             "consecutive_bricks": consec,
             "last_direction": last_dir,
@@ -521,109 +472,45 @@ class TrailingStopRL:
         }
 
     def should_enter(self, features: dict) -> tuple:
-        """Decide whether to enter or skip. Returns (bool, reason_string)."""
-        if self.total_trades < RL_WARMUP_TRADES:
-            return True, f"RL warmup ({self.total_trades}/{RL_WARMUP_TRADES})"
-        state = self._state_key(features)
-        q_vals = self._get_q(state)
-        q_enter, q_skip = q_vals
-
-        if random.random() < self.epsilon:
-            action = random.choice([self.ACTION_ENTER, self.ACTION_SKIP])
-            choice = "explore"
-        else:
-            action = self.ACTION_ENTER if q_enter >= q_skip else self.ACTION_SKIP
-            choice = "exploit"
-
-        reason = (f"RL|{state}|Q(enter)={q_enter:+.2f} Q(skip)={q_skip:+.2f}|"
-                  f"eps={self.epsilon:.2f}|{choice}")
-        return action == self.ACTION_ENTER, reason
-
-    def select_trail(self, features: dict) -> tuple:
-        """Select trailing stop distance. Returns (trail_pts, trail_idx)."""
-        if self.total_trades < RL_WARMUP_TRADES * 2:
-            trail_idx = TRAIL_TIERS.index(DEFAULT_TRAIL_PTS) if DEFAULT_TRAIL_PTS in TRAIL_TIERS else 1
-            return DEFAULT_TRAIL_PTS, trail_idx
-
-        state = self._state_key(features)
-        trail_q = self._get_trail_q(state)
-
-        if random.random() < self.epsilon:
-            trail_idx = random.randint(0, len(TRAIL_TIERS) - 1)
-        else:
-            trail_idx = trail_q.index(max(trail_q))
-
-        return TRAIL_TIERS[trail_idx], trail_idx
-
-    def _detect_regime_shift(self) -> bool:
-        total = len(self.trades)
-        if total < RL_REGIME_WINDOW + 10:
-            return False
-        overall_wr = sum(1 for t in self.trades if t["win"] == 1) / total
-        recent = self.trades[-RL_REGIME_WINDOW:]
-        recent_wr = sum(1 for t in recent if t["win"] == 1) / len(recent)
-        return (overall_wr - recent_wr) >= RL_REGIME_THRESHOLD
-
-    def _decay_q_table(self):
-        for key in self.q_table:
-            for i in range(len(self.q_table[key])):
-                self.q_table[key][i] *= RL_Q_DECAY
+        if self.total_trades < ML_WARMUP_TRADES:
+            return True, f"ML warmup ({self.total_trades}/{ML_WARMUP_TRADES})"
+        x = self._featurize(features)
+        p_win = self._predict(x)
+        if p_win < ML_SKIP_THRESHOLD:
+            return False, f"ML|P(win)={p_win:.2f}<{ML_SKIP_THRESHOLD}|SKIP"
+        return True, f"ML|P(win)={p_win:.2f}|ENTER"
 
     def record_trade(self, features: dict, pnl: float, source: str = "live",
-                     entered: bool = True, trail_idx: int = 0,
-                     mae: float = 0.0, mfe: float = 0.0):
+                     entered: bool = True, mae: float = 0.0, mfe: float = 0.0,
+                     **kwargs):
         if features is None:
             return
-        state = self._state_key(features)
-        reward = pnl / RL_PNL_SCALE
-
-        self.regime_shift = self._detect_regime_shift()
-        alpha = RL_ALPHA_REGIME if self.regime_shift else RL_ALPHA
-        self._decay_q_table()
-
-        # Update enter/skip Q-values
-        q_vals = self._get_q(state)
-        action_idx = self.ACTION_ENTER if entered else self.ACTION_SKIP
-        old_q = q_vals[action_idx]
-        q_vals[action_idx] = old_q + alpha * (reward - old_q)
-
-        if entered and pnl < 0:
-            old_skip_q = q_vals[self.ACTION_SKIP]
-            skip_reward = abs(reward) * 0.3
-            q_vals[self.ACTION_SKIP] = old_skip_q + alpha * (skip_reward - old_skip_q)
-
-        # Update trail Q-values
-        trail_q = self._get_trail_q(state)
-        if trail_idx < len(trail_q):
-            trail_q[trail_idx] = trail_q[trail_idx] + alpha * (reward - trail_q[trail_idx])
+        x = self._featurize(features)
+        y = 1.0 if pnl > 0 else 0.0
+        p = self._predict(x)
+        error = y - p
+        for i in range(self.N_FEATURES):
+            self.weights[i] += ML_LEARNING_RATE * error * x[i]
+        self.bias += ML_LEARNING_RATE * error
 
         self.recent_outcomes.append(pnl)
         if len(self.recent_outcomes) > 20:
             self.recent_outcomes = self.recent_outcomes[-20:]
 
-        trail_pts = TRAIL_TIERS[trail_idx] if trail_idx < len(TRAIL_TIERS) else DEFAULT_TRAIL_PTS
         trade = {
-            "features": features, "state": state, "pnl": pnl,
+            "features": features, "pnl": pnl,
             "win": 1 if pnl > 0 else 0, "entered": entered,
-            "q_after": list(q_vals), "alpha_used": alpha,
-            "regime_shift": self.regime_shift, "epsilon": self.epsilon,
-            "source": source, "timestamp": datetime.now(ET).isoformat(),
-            "trail_idx": trail_idx, "trail_pts": trail_pts,
+            "p_win": round(p, 3), "source": source,
+            "timestamp": datetime.now(ET).isoformat(),
             "mae": mae, "mfe": mfe,
         }
         self.trades.append(trade)
         self.total_trades += 1
-
-        if self.regime_shift:
-            self.epsilon = min(0.50, self.epsilon + 0.05)
-        else:
-            self.epsilon = max(RL_EPSILON_MIN, self.epsilon * RL_EPSILON_DECAY)
         self._save()
 
         wins = sum(1 for t in self.trades if t["win"] == 1)
         total = len(self.trades)
-        print(f"[RL] Trade recorded: PnL=${pnl:.2f} | Trail={trail_pts}pts | "
-              f"state={state} | eps={self.epsilon:.3f} | "
+        print(f"[ML] Trade recorded: PnL=${pnl:.2f} | P(win)={p:.2f} | "
               f"{total} trades, {wins} wins ({100*wins/total:.0f}%)")
 
     def stats(self) -> str:
@@ -632,9 +519,8 @@ class TrailingStopRL:
         total = len(self.trades)
         wins = sum(1 for t in self.trades if t["win"] == 1)
         total_pnl = sum(t["pnl"] for t in self.trades)
-        return (f"RL: {total} trades | W:{wins} L:{total-wins} | "
-                f"Win%: {100*wins/total:.0f}% | PnL: ${total_pnl:.2f} | "
-                f"{len(self.q_table)} states | eps={self.epsilon:.3f}")
+        return (f"ML: {total} trades | W:{wins} L:{total-wins} | "
+                f"Win%: {100*wins/total:.0f}% | PnL: ${total_pnl:.2f}")
 
 
 # ============================================================
@@ -676,13 +562,12 @@ class SymbolState:
 
         # Trailing stop state
         self.active_trail_pts = DEFAULT_TRAIL_PTS
-        self.active_trail_idx = 0
         self.trail_level = 0.0     # current trailing stop price
         self._tp_limit_order_id = None
         self._tp_limit_price = None
 
-        # RL
-        self.rl = TrailingStopRL(os.path.join(os.getcwd(), "rl_data_renko_ema.json"))
+        # ML trade filter
+        self.ml = TradeFilter(os.path.join(os.getcwd(), "ml_state_renko_ema.json"))
 
         # Platform references
         self.ctx = None
@@ -699,7 +584,7 @@ class SymbolState:
         self._ema_value = calc_ema(closes, EMA_LENGTH)
 
     def extract_features(self) -> dict:
-        return self.rl.extract_features(price=self.last_price, renko=self.renko)
+        return self.ml.extract_features(price=self.last_price, renko=self.renko)
 
     # ----------------------------------------------------------
     # Platform sync helpers (from mms_bot pattern)
@@ -780,12 +665,11 @@ class SymbolState:
         now = datetime.now(ET).strftime("%H:%M:%S")
 
         features = self.extract_features()
-        trail_pts, trail_idx = self.rl.select_trail(features)
 
-        trail_level = price - trail_pts
+        trail_level = price - DEFAULT_TRAIL_PTS
 
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG x{qty} @ {price:.2f} | "
-              f"Trail={trail_pts}pts (level={trail_level:.2f}) | "
+              f"Trail={DEFAULT_TRAIL_PTS}pts (level={trail_level:.2f}) | "
               f"EMA={self._ema_value:.2f} | Session P&L: ${self.live_pnl:.2f}")
 
         try:
@@ -800,8 +684,7 @@ class SymbolState:
                 self.entry_price = price
                 self.entry_time = time.time()
                 self.entry_features = features
-                self.active_trail_pts = trail_pts
-                self.active_trail_idx = trail_idx
+                self.active_trail_pts = DEFAULT_TRAIL_PTS
                 self.trail_level = trail_level
                 self.trade_mae = 0.0
                 self.trade_mfe = 0.0
@@ -830,12 +713,11 @@ class SymbolState:
         now = datetime.now(ET).strftime("%H:%M:%S")
 
         features = self.extract_features()
-        trail_pts, trail_idx = self.rl.select_trail(features)
 
-        trail_level = price + trail_pts
+        trail_level = price + DEFAULT_TRAIL_PTS
 
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT x{qty} @ {price:.2f} | "
-              f"Trail={trail_pts}pts (level={trail_level:.2f}) | "
+              f"Trail={DEFAULT_TRAIL_PTS}pts (level={trail_level:.2f}) | "
               f"EMA={self._ema_value:.2f} | Session P&L: ${self.live_pnl:.2f}")
 
         try:
@@ -850,8 +732,7 @@ class SymbolState:
                 self.entry_price = price
                 self.entry_time = time.time()
                 self.entry_features = features
-                self.active_trail_pts = trail_pts
-                self.active_trail_idx = trail_idx
+                self.active_trail_pts = DEFAULT_TRAIL_PTS
                 self.trail_level = trail_level
                 self.trade_mae = 0.0
                 self.trade_mfe = 0.0
@@ -920,13 +801,12 @@ class SymbolState:
             trade_pnl = real_trade_pnl
 
         feat = self._pending_rl["features"] if self._pending_rl else self.entry_features
-        ti = self._pending_rl.get("trail_idx", self.active_trail_idx) if self._pending_rl else self.active_trail_idx
         m = self._pending_rl.get("mae", self.trade_mae) if self._pending_rl else self.trade_mae
         mf = self._pending_rl.get("mfe", self.trade_mfe) if self._pending_rl else self.trade_mfe
 
         if feat:
-            self.rl.record_trade(feat, trade_pnl, source="live",
-                                 entered=True, trail_idx=ti, mae=m, mfe=mf)
+            self.ml.record_trade(feat, trade_pnl, source="live",
+                                 entered=True, mae=m, mfe=mf)
 
         self._pending_rl = None
         self.entry_features = None
@@ -986,7 +866,6 @@ class SymbolState:
                           f"price {price:.2f} <= trail {self.trail_level:.2f} "
                           f"(trail={self.active_trail_pts}pts)")
                     self._pending_rl = {"features": self.entry_features,
-                                        "trail_idx": self.active_trail_idx,
                                         "mae": self.trade_mae, "mfe": self.trade_mfe}
                     if self._tp_limit_order_id:
                         actions.append(("cancel_tp_limit",))
@@ -1003,7 +882,6 @@ class SymbolState:
                           f"price {price:.2f} >= trail {self.trail_level:.2f} "
                           f"(trail={self.active_trail_pts}pts)")
                     self._pending_rl = {"features": self.entry_features,
-                                        "trail_idx": self.active_trail_idx,
                                         "mae": self.trade_mae, "mfe": self.trade_mfe}
                     if self._tp_limit_order_id:
                         actions.append(("cancel_tp_limit",))
@@ -1017,7 +895,6 @@ class SymbolState:
                 print(f"[{now_str}] [{self.symbol} MAX-LOSS] {direction} x{self.contracts_held} "
                       f"unrealized ${unrealized:.0f} <= -${HARD_BACKSTOP_PER_TRADE:.0f} -- FORCE EXIT")
                 self._pending_rl = {"features": self.entry_features,
-                                    "trail_idx": self.active_trail_idx,
                                     "mae": self.trade_mae, "mfe": self.trade_mfe}
                 if self._tp_limit_order_id:
                     actions.append(("cancel_tp_limit",))
@@ -1033,7 +910,6 @@ class SymbolState:
                       f"est ${unrealized:.0f} >= ${tp_threshold_dollars:.0f} @ {price:.2f} "
                       f"-- placing TP limit...")
                 self._pending_rl = {"features": self.entry_features,
-                                    "trail_idx": self.active_trail_idx,
                                     "mae": self.trade_mae, "mfe": self.trade_mfe}
                 actions.append(("tp_limit", price))
                 return actions
@@ -1075,7 +951,7 @@ class SymbolState:
                         continue
 
                     features = self.extract_features()
-                    should_enter, reason = self.rl.should_enter(features)
+                    should_enter, reason = self.ml.should_enter(features)
 
                     if flip_to == "green" and brick_close > ema:
                         # LONG signal: red->green flip AND close above EMA
@@ -1110,7 +986,6 @@ class SymbolState:
             "entry_time": self.entry_time,
             "entry_features": self.entry_features,
             "active_trail_pts": self.active_trail_pts,
-            "active_trail_idx": self.active_trail_idx,
             "trail_level": self.trail_level,
             "live_pnl": self.live_pnl,
             "trade_mae": self.trade_mae,
@@ -1151,7 +1026,6 @@ class SymbolState:
             self.entry_time = state.get("entry_time", 0.0)
             self.entry_features = state.get("entry_features")
             self.active_trail_pts = state.get("active_trail_pts", DEFAULT_TRAIL_PTS)
-            self.active_trail_idx = state.get("active_trail_idx", 0)
             self.trail_level = state.get("trail_level", 0.0)
             self.live_pnl = state.get("live_pnl", 0.0)
             self.trade_mae = state.get("trade_mae", 0.0)
@@ -1261,7 +1135,6 @@ class RenkoEmaFlipBot:
                             pnl_est = (st.entry_price - price) * st.pv * st.contracts_held
 
                         features = st.entry_features
-                        trail_i = st.active_trail_idx
                         mae = st.trade_mae
                         mfe = st.trade_mfe
 
@@ -1283,23 +1156,23 @@ class RenkoEmaFlipBot:
                             kwargs={"ntfy_topic": st.ntfy_topic,
                                     "tp_webhooks": st.tp_webhooks}, daemon=True).start()
 
-                        async def _deferred_rl(st_ref, feat, pnl_before, ti, m, mf):
+                        async def _deferred_ml(st_ref, feat, pnl_before, m, mf):
                             try:
                                 await st_ref._sync_pnl_from_platform()
                                 real_pnl = st_ref.live_pnl - pnl_before + pnl_est
-                                st_ref.rl.record_trade(feat, real_pnl, source="platform_close",
-                                                       entered=True, trail_idx=ti, mae=m, mfe=mf)
+                                st_ref.ml.record_trade(feat, real_pnl, source="platform_close",
+                                                       entered=True, mae=m, mfe=mf)
                             except Exception:
-                                st_ref.rl.record_trade(feat, pnl_est, source="platform_close_est",
-                                                       entered=True, trail_idx=ti, mae=m, mfe=mf)
+                                st_ref.ml.record_trade(feat, pnl_est, source="platform_close_est",
+                                                       entered=True, mae=m, mfe=mf)
 
                         pnl_before = st.live_pnl - pnl_est
                         try:
                             loop = asyncio.get_event_loop()
-                            loop.create_task(_deferred_rl(st, features, pnl_before, trail_i, mae, mfe))
+                            loop.create_task(_deferred_ml(st, features, pnl_before, mae, mfe))
                         except Exception:
-                            st.rl.record_trade(features, pnl_est, source="platform_close_est",
-                                               entered=True, trail_idx=trail_i, mae=mae, mfe=mfe)
+                            st.ml.record_trade(features, pnl_est, source="platform_close_est",
+                                               entered=True, mae=mae, mfe=mfe)
                         break
             except Exception as e:
                 print(f"[WS] Position event error: {e}")
@@ -1353,8 +1226,8 @@ class RenkoEmaFlipBot:
         print(f"[BOT] ENTRY: brick color flip + EMA cross")
         print(f"[BOT]   red->green AND close > EMA = LONG")
         print(f"[BOT]   green->red AND close < EMA = SHORT")
-        print(f"[BOT] EXIT: trailing stop (RL learns distance)")
-        print(f"[BOT] Trail tiers: {TRAIL_TIERS} pts (default={DEFAULT_TRAIL_PTS}pts)")
+        print(f"[BOT] EXIT: trailing stop (ML filter, fixed trail)")
+        print(f"[BOT] Trail tiers: {DEFAULT_TRAIL_PTS} pts (default={DEFAULT_TRAIL_PTS}pts)")
         print(f"[BOT] Hard backstop: ${HARD_BACKSTOP_PER_TRADE:.0f}/trade, "
               f"${DAILY_LOSS_LIMIT:.0f}/day")
         print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
@@ -1414,8 +1287,8 @@ class RenkoEmaFlipBot:
                    f"Account: {acct}\n"
                    f"Brick: {BRICK_SIZE}pt | EMA: {EMA_LENGTH}\n"
                    f"Entry: flip + EMA cross\n"
-                   f"Exit: trailing stop (RL learns)\n"
-                   f"Trail tiers: {TRAIL_TIERS}\n"
+                   f"Exit: trailing stop (ML filter)\n"
+                   f"Trail tiers: {DEFAULT_TRAIL_PTS}\n"
                    f"Session P&L: ${st.live_pnl:.2f}")
             threading.Thread(target=send_telegram, args=(
                 self.tg_token, self.tg_chat, msg), daemon=True).start()
@@ -1598,7 +1471,7 @@ class RenkoEmaFlipBot:
                     print(f"    Price: {st.last_price:.2f} | {brick_str} | {ema_str}")
                     print(f"    Position: {pos_str} x{st.contracts_held} | "
                           f"P&L: ${st.live_pnl:.2f} | {trail_str}")
-                    print(f"    Bricks: {len(st.renko.bricks)} | {st.rl.stats()}")
+                    print(f"    Bricks: {len(st.renko.bricks)} | {st.ml.stats()}")
                 last_status = now
 
             if now - last_gc > gc_interval:
@@ -1678,8 +1551,8 @@ def main():
     print(f"[BOT] Renko EMA Flip Bot")
     print(f"[BOT] Brick: {BRICK_SIZE}pt | EMA: {EMA_LENGTH}")
     print(f"[BOT] ENTRY: brick flip + EMA cross confirmation")
-    print(f"[BOT] EXIT: trailing stop (RL learns optimal distance)")
-    print(f"[BOT] Trail tiers: {TRAIL_TIERS} pts")
+    print(f"[BOT] EXIT: trailing stop (ML filter, fixed {DEFAULT_TRAIL_PTS}pts)")
+    print(f"[BOT] Trail tiers: {DEFAULT_TRAIL_PTS} pts")
     print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
           f"{TRADE_SESSION_END.strftime('%H:%M')} ET")
     for cfg in symbol_configs:
