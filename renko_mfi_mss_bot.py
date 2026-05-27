@@ -244,7 +244,7 @@ class CandleBuilder:
 
 MSS_SWING_LOOKBACK = 5
 MSS_PIVOT_LENGTH = 2
-MSS_MIN_SWING_FILTER = 0.0015
+MSS_MIN_SWING_PTS = 8.0
 MSS_WARMUP_CANDLES = 15
 
 
@@ -252,7 +252,7 @@ class MSSDetector:
     """Detects Market Structure Shift on 15-second candles.
     Bearish MSS: ascending swing lows (bullish structure) broken to downside.
     Bullish MSS: descending swing highs (bearish structure) broken to upside.
-    Matches TradingView MSS Detector: pivot_length=2, min_swing=0.15%."""
+    Matches TradingView MSS Detector: pivot_length=2, min_swing=8pts."""
 
     def __init__(self):
         self.swing_highs = []
@@ -283,11 +283,9 @@ class MSSDetector:
         self.swing_lows = lows[-MSS_SWING_LOOKBACK:]
 
     def check(self, price: float) -> str:
-        min_swing = price * MSS_MIN_SWING_FILTER
-
         if len(self.swing_lows) >= 2 and self.swing_lows[-1] > self.swing_lows[-2]:
             swing_dist = self.swing_lows[-1] - self.swing_lows[-2]
-            if swing_dist >= min_swing and price < self.swing_lows[-1] and not self._bearish_triggered:
+            if swing_dist >= MSS_MIN_SWING_PTS and price < self.swing_lows[-1] and not self._bearish_triggered:
                 self._bearish_triggered = True
                 return "bearish"
         else:
@@ -295,7 +293,7 @@ class MSSDetector:
 
         if len(self.swing_highs) >= 2 and self.swing_highs[-1] < self.swing_highs[-2]:
             swing_dist = self.swing_highs[-2] - self.swing_highs[-1]
-            if swing_dist >= min_swing and price > self.swing_highs[-1] and not self._bullish_triggered:
+            if swing_dist >= MSS_MIN_SWING_PTS and price > self.swing_highs[-1] and not self._bullish_triggered:
                 self._bullish_triggered = True
                 return "bullish"
         else:
