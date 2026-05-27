@@ -1,7 +1,7 @@
 """
 TopstepX Renko MFI + MSS Bot (ML + RL)
 ============================================================
-Strategy: MFI exhaustion on 3pt Renko bricks + 15s MSS confirmation
+Strategy: 15s MSS trend shift + MFI exhaustion on 3pt Renko bricks confirms entry
 - Build Renko bricks (3 pt brick size) from 1-second tick data
 - MFI(14) on Renko bricks: oversold <= 20 (LONG), overbought >= 85 (SHORT)
 - Entry: MFI crossing threshold sets pending signal, MSS on 15s candles confirms
@@ -705,7 +705,7 @@ class SymbolState:
         self.last_price = 0.0
         self.last_tick_time = 0.0
         self._prev_brick_dir = None
-        self._pending_signal = None  # "LONG" or "SHORT" — set by MFI, waiting for MSS confirm
+        self._pending_mss = None  # "bearish" or "bullish" — set by MSS, waiting for MFI confirm
 
         # MFI state
         self.brick_closes = []
@@ -1079,7 +1079,7 @@ class SymbolState:
         self._rl_params = None
 
     def tick(self, price: float, ts: float = None):
-        """Process a tick. MFI exhaustion + MSS confirmation strategy."""
+        """Process a tick. MSS shift first, then MFI exhaustion confirms entry."""
         if ts is None:
             ts = time.time()
         self.last_price = price
@@ -1220,47 +1220,53 @@ class SymbolState:
                         self._prev_brick_dir = brick["direction"]
                         return actions
 
-                # MFI crossing = set pending signal, wait for MSS confirmation
+                # MFI crossing — enter if MSS already confirmed the direction
                 if mfi_signal and self.position == 0 and in_trade_session():
-                    features = self.extract_features()
-                    should_enter, reason = self.ml.should_enter(features)
                     if mfi_signal == "oversold":
                         direction = "LONG"
                     else:
                         direction = "SHORT"
-                    print(f"[{now_str}] [{self.symbol} MFI-DOT] {mfi_signal.upper()} "
-                          f"-> {direction} | {reason}")
-                    if should_enter:
-                        self._pending_signal = direction
-                        self.mss.reset()
-                        print(f"[{now_str}] [{self.symbol} PENDING] {direction} — "
-                              f"waiting for 15s MSS | {self.mss.status()}")
+                    matches_mss = ((self._pending_mss == "bullish" and direction == "LONG") or
+                                   (self._pending_mss == "bearish" and direction == "SHORT"))
+                    if matches_mss:
+                        features = self.extract_features()
+                        should_enter, reason = self.ml.should_enter(features)
+                        print(f"[{now_str}] [{self.symbol} MFI-CONFIRM] {mfi_signal.upper()} "
+                              f"-> {direction} | MSS {self._pending_mss} already active | {reason}")
+                        if should_enter:
+                            self._pending_mss = None
+                            self.mss.reset()
+                            actions.append(("enter_short" if direction == "SHORT" else "enter_long", price))
+                            self._prev_brick_dir = brick["direction"]
+                            return actions
+                    else:
+                        print(f"[{now_str}] [{self.symbol} MFI-DOT] {mfi_signal.upper()} "
+                              f"-> {direction} | no matching MSS pending")
 
                 self._prev_brick_dir = brick["direction"]
 
-        # Update 15s swing points and check pending signal against MSS
+        # Update 15s swing points — MSS shift sets pending direction for MFI entry
         self.mss.update_swings(self.bb_candles.candles)
 
-        if self._pending_signal and self.position == 0 and in_trade_session():
+        if self.position == 0 and in_trade_session():
             if abs(self.daily_loss) >= DAILY_LOSS_LIMIT:
                 now_str = datetime.now(ET).strftime("%H:%M:%S")
                 print(f"[{now_str}] [{self.symbol} DAILY-LIMIT] "
                       f"daily loss ${self.daily_loss:.0f} >= ${DAILY_LOSS_LIMIT:.0f} — no new entries")
-                self._pending_signal = None
+                self._pending_mss = None
             else:
                 mss_signal = self.mss.check(price)
-                if self._pending_signal == "SHORT" and mss_signal == "bearish":
+                if mss_signal and mss_signal != self._pending_mss:
+                    self._pending_mss = mss_signal
                     now_str = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now_str}] [{self.symbol} MSS-CONFIRM] SHORT — bearish MSS "
-                          f"@ {price:.2f} broke SL {self.mss.swing_lows[-1]:.2f}")
-                    self._pending_signal = None
-                    actions.append(("enter_short", price))
-                elif self._pending_signal == "LONG" and mss_signal == "bullish":
-                    now_str = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now_str}] [{self.symbol} MSS-CONFIRM] LONG — bullish MSS "
-                          f"@ {price:.2f} broke SH {self.mss.swing_highs[-1]:.2f}")
-                    self._pending_signal = None
-                    actions.append(("enter_long", price))
+                    if mss_signal == "bearish":
+                        print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BEARISH "
+                              f"@ {price:.2f} broke SL {self.mss.swing_lows[-1]:.2f} "
+                              f"| waiting for MFI overbought -> SHORT")
+                    else:
+                        print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BULLISH "
+                              f"@ {price:.2f} broke SH {self.mss.swing_highs[-1]:.2f} "
+                              f"| waiting for MFI oversold -> LONG")
 
         return actions
 
@@ -1294,7 +1300,7 @@ class SymbolState:
             "candle_history": self.candles.candles[-20:],
             "bb_candle_current": self.bb_candles._current,
             "bb_candle_history": self.bb_candles.candles[-30:],
-            "pending_signal": self._pending_signal,
+            "pending_mss": self._pending_mss,
             "brick_closes": self.brick_closes[-200:],
             "brick_opens": self.brick_opens[-200:],
             "brick_typicals": self.brick_typicals[-200:],
@@ -1332,7 +1338,7 @@ class SymbolState:
         bb_candle_history = state.get("bb_candle_history", [])
         if bb_candle_history:
             self.bb_candles.candles = bb_candle_history
-        self._pending_signal = state.get("pending_signal")
+        self._pending_mss = state.get("pending_mss")
         self.brick_closes = state.get("brick_closes", [])
         self.brick_opens = state.get("brick_opens", [])
         self.brick_typicals = state.get("brick_typicals", [])
@@ -1870,7 +1876,7 @@ def main():
 
     print(f"[BOT] Renko MFI + MSS Bot (ML + RL)")
     print(f"[BOT] Brick: {BRICK_SIZE}pt | MFI({MFI_PERIOD}) OB={MFI_OVERBOUGHT}/OS={MFI_OVERSOLD}")
-    print(f"[BOT] ENTRY: MFI exhaustion -> 15s MSS confirmation -> enter")
+    print(f"[BOT] ENTRY: 15s MSS trend shift -> MFI exhaustion confirms -> enter")
     print(f"[BOT] EXIT: opposite MFI signal / TP hit / trail profit / SL (RL-chosen)")
     print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
           f"{TRADE_SESSION_END.strftime('%H:%M')} ET")
