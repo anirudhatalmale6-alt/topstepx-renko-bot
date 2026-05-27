@@ -360,7 +360,7 @@ ML_SKIP_THRESHOLD = 0.25
 class TradeFilter:
     """Online logistic regression — learns to skip bad setups."""
 
-    N_FEATURES = 6
+    N_FEATURES = 9
 
     def __init__(self, data_file: str):
         self.data_file = data_file
@@ -379,12 +379,30 @@ class TradeFilter:
     def _featurize(self, features: dict) -> list:
         consec = min(features.get("consecutive_bricks", 1), 10) / 10.0
         mom = features.get("momentum_pts", 0.0) / 5.0
-        hour = (features.get("hour", 12) - 12) / 4.0
-        day = (datetime.now(ET).weekday() - 2) / 2.0
+        hour = features.get("hour", 12)
+        minute = features.get("minute", 0)
+        hour_frac = (hour + minute / 60.0) / 24.0
+        hour_sin = math.sin(2 * math.pi * hour_frac)
+        hour_cos = math.cos(2 * math.pi * hour_frac)
+        weekday = datetime.now(ET).weekday()
+        day_sin = math.sin(2 * math.pi * weekday / 7.0)
+        day_cos = math.cos(2 * math.pi * weekday / 7.0)
         recent = self.recent_outcomes[-10:]
         recent_wr = sum(1 for p in recent if p > 0) / max(len(recent), 1)
         bricks = min(features.get("brick_count", 50), 200) / 200.0
-        return [consec, mom, hour, day, recent_wr, bricks]
+        if 18 <= hour or hour < 4:
+            session = 0.0
+        elif hour < 10:
+            session = 0.15
+        elif hour < 12:
+            session = 0.35
+        elif hour < 14:
+            session = 0.65
+        elif hour < 16:
+            session = 0.85
+        else:
+            session = 1.0
+        return [consec, mom, hour_sin, hour_cos, day_sin, day_cos, recent_wr, bricks, session]
 
     def _predict(self, x: list) -> float:
         z = self.bias + sum(w * xi for w, xi in zip(self.weights, x))
@@ -424,7 +442,9 @@ class TradeFilter:
             print(f"[ML] Save error: {e}")
 
     def extract_features(self, price: float, renko: RenkoBrickBuilder) -> dict:
-        hour = datetime.now(ET).hour
+        now_et = datetime.now(ET)
+        hour = now_et.hour
+        minute = now_et.minute
         consec = renko.consecutive_count()
         last_dir = renko.last_direction() or "none"
         closes = renko.get_closes(10)
@@ -448,6 +468,7 @@ class TradeFilter:
             "momentum": momentum,
             "momentum_pts": round(mom_pts, 2),
             "hour": hour,
+            "minute": minute,
             "price": round(price, 2),
             "brick_count": len(renko.bricks),
         }
