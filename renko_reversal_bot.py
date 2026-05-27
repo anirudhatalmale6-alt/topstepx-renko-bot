@@ -1,12 +1,14 @@
 """
-TopstepX Renko Reversal Bot
-============================
+TopstepX Renko Reversal Bot (ML + RL)
+=======================================
 Strategy: Renko brick reversal on 30-second price sampling
 - Build Renko bricks (0.25 pt brick size) from 30s price samples
 - Entry: brick color flips (red->green = LONG, green->red = SHORT)
-- Exit: immediate on next brick reversal OR TP hit
-- TP: $20 total PnL, SL: fixed 20 pts
-- ML (logistic regression) learns to skip bad setups over time
+- Exit: brick reversal / TP limit / trailing profit / SL
+- ML (logistic regression) skips bad setups
+- RL (Q-learning) optimizes SL, trail-activation, trail-pullback per market state
+- TP profit-lock: moves limit order into profit as trail floor rises
+- DCA: adds 1 contract at -$80, max 2 contracts
 
 Usage:
     python renko_reversal_bot.py --symbols "NQ:1" --tick-interval 1
@@ -503,6 +505,97 @@ class TradeFilter:
 
 
 # ============================================================
+# Reinforcement Learning — Parameter Optimizer
+# ============================================================
+
+RL_ACTIONS = [
+    {"sl_pts": 10, "trail_activate": 20.0, "trail_pullback": 0.25, "label": "tight"},
+    {"sl_pts": 15, "trail_activate": 30.0, "trail_pullback": 0.30, "label": "conservative"},
+    {"sl_pts": 20, "trail_activate": 40.0, "trail_pullback": 0.35, "label": "balanced"},
+    {"sl_pts": 30, "trail_activate": 60.0, "trail_pullback": 0.40, "label": "moderate"},
+    {"sl_pts": 40, "trail_activate": 80.0, "trail_pullback": 0.45, "label": "wide"},
+    {"sl_pts": 50, "trail_activate": 100.0, "trail_pullback": 0.50, "label": "runner"},
+]
+
+RL_WARMUP = 20
+RL_EPSILON_START = 0.30
+RL_EPSILON_MIN = 0.10
+RL_EPSILON_DECAY = 0.995
+RL_LR = 0.10
+
+
+class ParamRL:
+    """Q-learning — learns optimal SL, trail-activate, trail-pullback per market state."""
+
+    def __init__(self, data_file: str):
+        self.data_file = data_file
+        self.n_actions = len(RL_ACTIONS)
+        self.q_table = {}
+        self.epsilon = RL_EPSILON_START
+        self.total_trades = 0
+        self._load()
+
+    def _state_key(self, features: dict) -> str:
+        consec = features.get("consecutive_bricks", 1)
+        vol = "trending" if consec >= 8 else ("normal" if consec >= 3 else "choppy")
+        mom = features.get("momentum_pts", 0.0)
+        mom_s = "up" if mom > 2 else ("down" if mom < -2 else "flat")
+        h = features.get("hour", 12)
+        h_s = "off" if (h < 10 or h >= 18) else ("morning" if h < 12 else ("midday" if h < 14 else "afternoon"))
+        return f"{vol}_{mom_s}_{h_s}"
+
+    def choose(self, features: dict) -> tuple:
+        if self.total_trades < RL_WARMUP:
+            return 2, RL_ACTIONS[2]
+        key = self._state_key(features)
+        if key not in self.q_table:
+            self.q_table[key] = [0.0] * self.n_actions
+        if random.random() < self.epsilon:
+            idx = random.randint(0, self.n_actions - 1)
+        else:
+            q = self.q_table[key]
+            idx = q.index(max(q))
+        return idx, RL_ACTIONS[idx]
+
+    def update(self, features: dict, action_idx: int, reward: float):
+        key = self._state_key(features)
+        if key not in self.q_table:
+            self.q_table[key] = [0.0] * self.n_actions
+        old = self.q_table[key][action_idx]
+        self.q_table[key][action_idx] = old + RL_LR * (reward - old)
+        self.total_trades += 1
+        self.epsilon = max(RL_EPSILON_MIN, self.epsilon * RL_EPSILON_DECAY)
+        self._save()
+        best_idx = self.q_table[key].index(max(self.q_table[key]))
+        print(f"[RL] state={key} action={RL_ACTIONS[action_idx]['label']} "
+              f"reward=${reward:.2f} | best={RL_ACTIONS[best_idx]['label']} "
+              f"eps={self.epsilon:.3f} ({self.total_trades} trades)")
+
+    def _load(self):
+        if os.path.exists(self.data_file):
+            try:
+                with open(self.data_file, "r") as f:
+                    d = json.load(f)
+                self.q_table = d.get("q_table", {})
+                self.epsilon = d.get("epsilon", RL_EPSILON_START)
+                self.total_trades = d.get("total_trades", 0)
+                print(f"[RL] Loaded: {self.total_trades} trades, eps={self.epsilon:.3f}, "
+                      f"{len(self.q_table)} states")
+            except Exception as e:
+                print(f"[RL] Load error: {e}")
+
+    def _save(self):
+        try:
+            tmp = self.data_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"q_table": self.q_table, "epsilon": self.epsilon,
+                           "total_trades": self.total_trades}, f)
+            os.replace(tmp, self.data_file)
+        except Exception as e:
+            print(f"[RL] Save error: {e}")
+
+
+# ============================================================
 # Per-Symbol Strategy State
 # ============================================================
 
@@ -545,6 +638,10 @@ class SymbolState:
         self._entry_prices = []
 
         self.ml = TradeFilter(os.path.join(os.getcwd(), f"ml_state_{symbol}.json"))
+        self.rl = ParamRL(os.path.join(os.getcwd(), f"rl_state_{symbol}.json"))
+        self._rl_action_idx = None
+        self._rl_params = None
+        self._tp_lock_pnl = 0.0
 
         self.ctx = None
         self._suite_client = None
@@ -638,10 +735,13 @@ class SymbolState:
         now = datetime.now(ET).strftime("%H:%M:%S")
 
         features = self.extract_features()
+        self._rl_action_idx, self._rl_params = self.rl.choose(features)
 
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG x{qty} @ {price:.2f} | "
-              f"TP=${DCA_TP_DOLLARS} | SL={DEFAULT_SL_PTS}pts | DCA at -${abs(DCA_ADD_THRESHOLD)} | "
-              f"Session P&L: ${self.live_pnl:.2f}")
+              f"TP=${DCA_TP_DOLLARS} | SL={self._rl_params['sl_pts']}pts "
+              f"({self._rl_params['label']}) | trail=${self._rl_params['trail_activate']:.0f}/"
+              f"{100*self._rl_params['trail_pullback']:.0f}% | "
+              f"DCA at -${abs(DCA_ADD_THRESHOLD)} | Session P&L: ${self.live_pnl:.2f}")
 
         try:
             response = await asyncio.wait_for(
@@ -657,9 +757,10 @@ class SymbolState:
                 self._dca_done = False
                 self.entry_time = time.time()
                 self.entry_features = features
-                self.active_sl_pts = DEFAULT_SL_PTS
+                self.active_sl_pts = self._rl_params["sl_pts"]
                 self.trade_mae = 0.0
                 self.trade_mfe = 0.0
+                self._tp_lock_pnl = 0.0
                 threading.Thread(target=send_signals, args=(
                     self.tg_token, self.tg_chat, self.tg_keys,
                     "LONG", self.symbol, price, qty),
@@ -685,10 +786,13 @@ class SymbolState:
         now = datetime.now(ET).strftime("%H:%M:%S")
 
         features = self.extract_features()
+        self._rl_action_idx, self._rl_params = self.rl.choose(features)
 
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT x{qty} @ {price:.2f} | "
-              f"TP=${DCA_TP_DOLLARS} | SL={DEFAULT_SL_PTS}pts | DCA at -${abs(DCA_ADD_THRESHOLD)} | "
-              f"Session P&L: ${self.live_pnl:.2f}")
+              f"TP=${DCA_TP_DOLLARS} | SL={self._rl_params['sl_pts']}pts "
+              f"({self._rl_params['label']}) | trail=${self._rl_params['trail_activate']:.0f}/"
+              f"{100*self._rl_params['trail_pullback']:.0f}% | "
+              f"DCA at -${abs(DCA_ADD_THRESHOLD)} | Session P&L: ${self.live_pnl:.2f}")
 
         try:
             response = await asyncio.wait_for(
@@ -704,9 +808,10 @@ class SymbolState:
                 self._dca_done = False
                 self.entry_time = time.time()
                 self.entry_features = features
-                self.active_sl_pts = DEFAULT_SL_PTS
+                self.active_sl_pts = self._rl_params["sl_pts"]
                 self.trade_mae = 0.0
                 self.trade_mfe = 0.0
+                self._tp_lock_pnl = 0.0
                 threading.Thread(target=send_signals, args=(
                     self.tg_token, self.tg_chat, self.tg_keys,
                     "SHORT", self.symbol, price, qty),
@@ -793,6 +898,9 @@ class SymbolState:
               f"@ {price:.2f} | Trade: ${trade_pnl:.2f} | Session: ${self.live_pnl:.2f} | "
               f"{reason}")
 
+        rl_idx = self._rl_action_idx
+        rl_feat = self.entry_features
+
         self.position = 0
         self.contracts_held = 0
         self._tp_limit_order_id = None
@@ -800,6 +908,7 @@ class SymbolState:
         self._trail_profit_active = False
         self._trail_profit_peak = 0.0
         self._trail_profit_floor = 0.0
+        self._tp_lock_pnl = 0.0
 
         threading.Thread(target=send_signals, args=(
             self.tg_token, self.tg_chat, self.tg_keys,
@@ -814,16 +923,20 @@ class SymbolState:
                   f"actual ${real_trade_pnl:.2f}")
             trade_pnl = real_trade_pnl
 
-        feat = self._pending_rl["features"] if self._pending_rl else self.entry_features
+        feat = self._pending_rl["features"] if self._pending_rl else rl_feat
         m = self._pending_rl.get("mae", self.trade_mae) if self._pending_rl else self.trade_mae
         mf = self._pending_rl.get("mfe", self.trade_mfe) if self._pending_rl else self.trade_mfe
 
         if feat:
             self.ml.record_trade(feat, trade_pnl, source="live",
                                  entered=True, mae=m, mfe=mf)
+            if rl_idx is not None:
+                self.rl.update(feat, rl_idx, trade_pnl)
 
         self._pending_rl = None
         self.entry_features = None
+        self._rl_action_idx = None
+        self._rl_params = None
 
     def tick(self, price: float, ts: float = None):
         """Process a tick. DCA Renko reversal strategy."""
@@ -861,19 +974,25 @@ class SymbolState:
             self.trade_mfe = max(self.trade_mfe, unrealized)
             self.trade_mae = min(self.trade_mae, unrealized)
 
-            # TRAILING PROFIT: lock in gains once profit exceeds threshold
-            if unrealized >= TRAIL_PROFIT_ACTIVATE:
+            # RL-chosen parameters (fall back to defaults if no RL params set)
+            trail_act = self._rl_params["trail_activate"] if self._rl_params else TRAIL_PROFIT_ACTIVATE
+            trail_pb = self._rl_params["trail_pullback"] if self._rl_params else TRAIL_PROFIT_PULLBACK
+            sl_pts = self._rl_params["sl_pts"] if self._rl_params else DEFAULT_SL_PTS
+
+            # TRAILING PROFIT: lock in gains (RL-chosen activation & pullback)
+            if unrealized >= trail_act:
                 if not self._trail_profit_active:
                     self._trail_profit_active = True
                     self._trail_profit_peak = unrealized
-                    self._trail_profit_floor = unrealized * (1.0 - TRAIL_PROFIT_PULLBACK)
+                    self._trail_profit_floor = unrealized * (1.0 - trail_pb)
                     now_str = datetime.now(ET).strftime("%H:%M:%S")
                     direction = "LONG" if self.position == 1 else "SHORT"
                     print(f"[{now_str}] [{self.symbol} TRAIL-PROFIT] {direction} "
-                          f"activated at ${unrealized:.0f} | floor=${self._trail_profit_floor:.0f}")
+                          f"activated at ${unrealized:.0f} | floor=${self._trail_profit_floor:.0f} "
+                          f"(RL: {self._rl_params['label'] if self._rl_params else 'default'})")
                 elif unrealized > self._trail_profit_peak:
                     self._trail_profit_peak = unrealized
-                    self._trail_profit_floor = unrealized * (1.0 - TRAIL_PROFIT_PULLBACK)
+                    self._trail_profit_floor = unrealized * (1.0 - trail_pb)
 
             if self._trail_profit_active and unrealized <= self._trail_profit_floor:
                 now_str = datetime.now(ET).strftime("%H:%M:%S")
@@ -886,6 +1005,14 @@ class SymbolState:
                 if self._tp_limit_order_id:
                     actions.append(("cancel_tp_limit",))
                 actions.append(("flatten", price, "TRAIL_PROFIT"))
+                return actions
+
+            # TP PROFIT-LOCK: move TP limit into profit as trail floor rises
+            if self._trail_profit_active and self._trail_profit_floor > self._tp_lock_pnl + 15.0:
+                self._tp_lock_pnl = self._trail_profit_floor
+                if self._tp_limit_order_id:
+                    actions.append(("cancel_tp_limit",))
+                actions.append(("tp_lock", price))
                 return actions
 
             # TP check: place limit order for guaranteed $20 net
@@ -910,7 +1037,27 @@ class SymbolState:
                     actions.append(("dca_add", price))
                     return actions
 
-            # No SL — bot relies on DCA, trail profit, and brick reversal exits only
+            # SL check (RL-chosen distance)
+            if self.position == 1 and price <= self.entry_price - sl_pts:
+                now_str = datetime.now(ET).strftime("%H:%M:%S")
+                print(f"[{now_str}] [{self.symbol} SL-HIT] LONG @ {price:.2f} <= "
+                      f"SL {self.entry_price - sl_pts:.2f} ({sl_pts}pts)")
+                self._pending_rl = {"features": self.entry_features,
+                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
+                if self._tp_limit_order_id:
+                    actions.append(("cancel_tp_limit",))
+                actions.append(("flatten", price, "SL"))
+                return actions
+            elif self.position == -1 and price >= self.entry_price + sl_pts:
+                now_str = datetime.now(ET).strftime("%H:%M:%S")
+                print(f"[{now_str}] [{self.symbol} SL-HIT] SHORT @ {price:.2f} >= "
+                      f"SL {self.entry_price + sl_pts:.2f} ({sl_pts}pts)")
+                self._pending_rl = {"features": self.entry_features,
+                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
+                if self._tp_limit_order_id:
+                    actions.append(("cancel_tp_limit",))
+                actions.append(("flatten", price, "SL"))
+                return actions
 
         # Process new bricks
         if new_bricks:
@@ -1026,6 +1173,9 @@ class SymbolState:
             "prev_brick_dir": self._prev_brick_dir,
             "dca_done": self._dca_done,
             "entry_prices": self._entry_prices,
+            "rl_action_idx": self._rl_action_idx,
+            "rl_params": self._rl_params,
+            "tp_lock_pnl": self._tp_lock_pnl,
             "candle_current": self.candles._current,
             "candle_history": self.candles.candles[-20:],
             "bb_candle_current": self.bb_candles._current,
@@ -1039,6 +1189,9 @@ class SymbolState:
         self._prev_brick_dir = state.get("prev_brick_dir")
         self._dca_done = state.get("dca_done", False)
         self._entry_prices = state.get("entry_prices", [])
+        self._rl_action_idx = state.get("rl_action_idx")
+        self._rl_params = state.get("rl_params")
+        self._tp_lock_pnl = state.get("tp_lock_pnl", 0.0)
 
         renko_bricks = state.get("renko_bricks", [])
         if renko_bricks:
@@ -1198,23 +1351,34 @@ class RenkoReversalBot:
                             kwargs={"ntfy_topic": st.ntfy_topic,
                                     "tp_webhooks": st.tp_webhooks}, daemon=True).start()
 
-                        async def _deferred_ml(st_ref, feat, pnl_before, m, mf):
+                        rl_idx = st._rl_action_idx
+                        st._rl_action_idx = None
+                        st._rl_params = None
+                        st._tp_lock_pnl = 0.0
+
+                        async def _deferred_ml(st_ref, feat, pnl_before, m, mf, rl_i):
                             try:
                                 await st_ref._sync_pnl_from_platform()
                                 real_pnl = st_ref.live_pnl - pnl_before + pnl_est
                                 st_ref.ml.record_trade(feat, real_pnl, source="platform_close",
                                                        entered=True, mae=m, mfe=mf)
+                                if rl_i is not None:
+                                    st_ref.rl.update(feat, rl_i, real_pnl)
                             except Exception:
                                 st_ref.ml.record_trade(feat, pnl_est, source="platform_close_est",
                                                        entered=True, mae=m, mfe=mf)
+                                if rl_i is not None:
+                                    st_ref.rl.update(feat, rl_i, pnl_est)
 
                         pnl_before = st.live_pnl - pnl_est
                         try:
                             loop = asyncio.get_event_loop()
-                            loop.create_task(_deferred_ml(st, features, pnl_before, mae, mfe))
+                            loop.create_task(_deferred_ml(st, features, pnl_before, mae, mfe, rl_idx))
                         except Exception:
                             st.ml.record_trade(features, pnl_est, source="platform_close_est",
                                                entered=True, mae=mae, mfe=mfe)
+                            if rl_idx is not None:
+                                st.rl.update(features, rl_idx, pnl_est)
                         break
             except Exception as e:
                 print(f"[WS] Position event error: {e}")
@@ -1268,7 +1432,8 @@ class RenkoReversalBot:
         print(f"[BOT] ENTRY: brick color flip -> enter 1 contract")
         print(f"[BOT] DCA: add 1 more at -${abs(DCA_ADD_THRESHOLD)}, max {DCA_MAX_CONTRACTS} contracts")
         print(f"[BOT] EXIT: TP=${DCA_TP_DOLLARS} total PnL / opposite brick color")
-        print(f"[BOT] ML: logistic regression skips bad setups, SL={DEFAULT_SL_PTS}pts fixed")
+        print(f"[BOT] ML: logistic regression skips bad setups")
+        print(f"[BOT] RL: Q-learning optimizes SL/trail per market state")
         print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
               f"{TRADE_SESSION_END.strftime('%H:%M')} ET")
         print(f"[BOT] Symbols: {symbols}")
@@ -1320,10 +1485,10 @@ class RenkoReversalBot:
         print(f"[BOT] Press Ctrl+C to stop")
 
         for sym, st in self.states.items():
-            msg = (f"STATUS|Renko Reversal Bot started\n"
+            msg = (f"STATUS|Renko Reversal Bot started (ML+RL)\n"
                    f"Account: {acct}\n"
-                   f"Brick: {BRICK_SIZE}pt | TP: {DEFAULT_TP_PTS}pts (ML filter)\n"
-                   f"Mode: Brick flip entry, reversal stop\n"
+                   f"Brick: {BRICK_SIZE}pt | TP: ${DCA_TP_DOLLARS} | SL/trail: RL-adaptive\n"
+                   f"Mode: Brick flip entry, DCA, trail profit, TP lock\n"
                    f"Session P&L: ${st.live_pnl:.2f}")
             threading.Thread(target=send_telegram, args=(
                 self.tg_token, self.tg_chat, msg), daemon=True).start()
@@ -1440,6 +1605,40 @@ class RenkoReversalBot:
                             print(f"[{now_str}] [{sym} TP-LIMIT] Timeout placing limit order")
                         except Exception as e:
                             print(f"[{now_str}] [{sym} TP-LIMIT] Error: {type(e).__name__}: {e}")
+                    elif action[0] == "tp_lock":
+                        now_str = datetime.now(ET).strftime("%H:%M:%S")
+                        try:
+                            contract_id = st.ctx.instrument_info.id
+                            avg_price = st.entry_price
+                            size = st.contracts_held
+                            if avg_price and size > 0:
+                                floor_pnl = st._trail_profit_floor
+                                fees = FEE_PER_CONTRACT * size
+                                required_raw = floor_pnl + fees
+                                tick_size = MINTICK_VALUES.get(sym, 0.25)
+                                if st.position == 1:
+                                    lock_price = avg_price + required_raw / (st.pv * size)
+                                    lock_price = math.ceil(lock_price / tick_size) * tick_size
+                                    side = 1
+                                else:
+                                    lock_price = avg_price - required_raw / (st.pv * size)
+                                    lock_price = math.floor(lock_price / tick_size) * tick_size
+                                    side = 0
+                                response = await asyncio.wait_for(
+                                    st.ctx.orders.place_limit_order(
+                                        contract_id=contract_id, side=side,
+                                        size=size, limit_price=lock_price),
+                                    timeout=15.0)
+                                if response.success:
+                                    st._tp_limit_order_id = response.orderId
+                                    st._tp_limit_price = lock_price
+                                    dir_str = "LONG" if st.position == 1 else "SHORT"
+                                    print(f"[{now_str}] [{sym} TP-LOCK] {dir_str} limit moved to "
+                                          f"{lock_price:.2f} (locking ${floor_pnl:.0f} profit)")
+                                else:
+                                    print(f"[{now_str}] [{sym} TP-LOCK] Order failed: {response}")
+                        except Exception as e:
+                            print(f"[{now_str}] [{sym} TP-LOCK] Error: {e}")
                     elif action[0] == "flatten":
                         reason = action[2] if len(action) > 2 else "signal"
                         await st._flatten(action[1], reason)
@@ -1577,10 +1776,10 @@ def main():
         print("ERROR: No symbols configured")
         return
 
-    print(f"[BOT] Renko Reversal Bot")
-    print(f"[BOT] Brick: {BRICK_SIZE}pt | TP: {DEFAULT_TP_PTS}pts (ML filter)")
+    print(f"[BOT] Renko Reversal Bot (ML + RL)")
+    print(f"[BOT] Brick: {BRICK_SIZE}pt | TP: ${DCA_TP_DOLLARS} | RL: SL/trail adaptive")
     print(f"[BOT] ENTRY: brick color flip -> enter in new direction")
-    print(f"[BOT] EXIT: brick reversal (immediate) / TP hit")
+    print(f"[BOT] EXIT: brick reversal / TP hit / trail profit / SL (RL-chosen)")
     print(f"[BOT] Session: {TRADE_SESSION_START.strftime('%H:%M')} - "
           f"{TRADE_SESSION_END.strftime('%H:%M')} ET")
     for cfg in symbol_configs:
