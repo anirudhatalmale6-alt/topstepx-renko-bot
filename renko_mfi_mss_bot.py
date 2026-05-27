@@ -144,12 +144,12 @@ DEFAULT_TP_PTS = 2
 DEFAULT_SL_PTS = 20
 
 # DCA strategy: enter 1 contract, add 1 more at -$80, TP at $20 total
-DCA_TP_DOLLARS = 20.0
+DCA_TP_DOLLARS = 100.0
 DCA_ADD_THRESHOLD = -80.0
 DCA_MAX_CONTRACTS = 2
 
 # Trailing profit: activates when unrealized >= threshold, trails back by trail_pct
-TRAIL_PROFIT_ACTIVATE = 20.0   # activate trailing profit at $20 unrealized
+TRAIL_PROFIT_ACTIVATE = 60.0   # activate trailing profit at $60 unrealized
 TRAIL_PROFIT_PULLBACK = 0.40   # allow 40% pullback from peak (keeps 60%)
 
 DAILY_LOSS_LIMIT = 1000.0
@@ -578,12 +578,12 @@ class TradeFilter:
 # ============================================================
 
 RL_ACTIONS = [
-    {"sl_pts": 10, "trail_activate": 20.0, "trail_pullback": 0.25, "label": "tight"},
-    {"sl_pts": 15, "trail_activate": 30.0, "trail_pullback": 0.30, "label": "conservative"},
-    {"sl_pts": 20, "trail_activate": 40.0, "trail_pullback": 0.35, "label": "balanced"},
-    {"sl_pts": 30, "trail_activate": 60.0, "trail_pullback": 0.40, "label": "moderate"},
-    {"sl_pts": 40, "trail_activate": 80.0, "trail_pullback": 0.45, "label": "wide"},
-    {"sl_pts": 50, "trail_activate": 100.0, "trail_pullback": 0.50, "label": "runner"},
+    {"sl_pts": 10, "trail_activate": 40.0, "trail_pullback": 0.25, "label": "tight"},
+    {"sl_pts": 15, "trail_activate": 60.0, "trail_pullback": 0.30, "label": "conservative"},
+    {"sl_pts": 20, "trail_activate": 80.0, "trail_pullback": 0.35, "label": "balanced"},
+    {"sl_pts": 30, "trail_activate": 100.0, "trail_pullback": 0.40, "label": "moderate"},
+    {"sl_pts": 40, "trail_activate": 150.0, "trail_pullback": 0.45, "label": "wide"},
+    {"sl_pts": 50, "trail_activate": 200.0, "trail_pullback": 0.50, "label": "runner"},
 ]
 
 RL_WARMUP = 20
