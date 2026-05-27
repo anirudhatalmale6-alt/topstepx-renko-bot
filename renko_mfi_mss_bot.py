@@ -578,12 +578,12 @@ class TradeFilter:
 # ============================================================
 
 RL_ACTIONS = [
-    {"sl_pts": 10, "trail_activate": 40.0, "trail_pullback": 0.25, "label": "tight"},
-    {"sl_pts": 15, "trail_activate": 60.0, "trail_pullback": 0.30, "label": "conservative"},
-    {"sl_pts": 20, "trail_activate": 80.0, "trail_pullback": 0.35, "label": "balanced"},
-    {"sl_pts": 30, "trail_activate": 100.0, "trail_pullback": 0.40, "label": "moderate"},
-    {"sl_pts": 40, "trail_activate": 150.0, "trail_pullback": 0.45, "label": "wide"},
-    {"sl_pts": 50, "trail_activate": 200.0, "trail_pullback": 0.50, "label": "runner"},
+    {"sl_pts": 10, "trail_activate": 40.0, "trail_pullback": 0.25, "dca_threshold": -50.0, "label": "tight"},
+    {"sl_pts": 15, "trail_activate": 60.0, "trail_pullback": 0.30, "dca_threshold": -80.0, "label": "conservative"},
+    {"sl_pts": 20, "trail_activate": 80.0, "trail_pullback": 0.35, "dca_threshold": -100.0, "label": "balanced"},
+    {"sl_pts": 30, "trail_activate": 100.0, "trail_pullback": 0.40, "dca_threshold": -120.0, "label": "moderate"},
+    {"sl_pts": 40, "trail_activate": 150.0, "trail_pullback": 0.45, "dca_threshold": -150.0, "label": "wide"},
+    {"sl_pts": 50, "trail_activate": 200.0, "trail_pullback": 0.50, "dca_threshold": None, "label": "runner"},
 ]
 
 RL_WARMUP = 20
@@ -1134,12 +1134,13 @@ class SymbolState:
                 actions.append(("tp_limit", price))
                 return actions
 
-            # DCA: add 1 contract at -$80 (checked BEFORE SL so price gaps don't skip DCA)
-            if not self._dca_done and self.contracts_held < DCA_MAX_CONTRACTS:
-                if unrealized <= DCA_ADD_THRESHOLD:
+            # DCA: add 1 contract (RL-chosen threshold, None = no DCA)
+            dca_thresh = self._rl_params.get("dca_threshold") if self._rl_params else DCA_ADD_THRESHOLD
+            if dca_thresh is not None and not self._dca_done and self.contracts_held < DCA_MAX_CONTRACTS:
+                if unrealized <= dca_thresh:
                     now_str = datetime.now(ET).strftime("%H:%M:%S")
                     print(f"[{now_str}] [{self.symbol} DCA-TRIGGER] unrealized ${unrealized:.0f} "
-                          f"<= ${DCA_ADD_THRESHOLD:.0f}")
+                          f"<= ${dca_thresh:.0f} (RL: {self._rl_params['label'] if self._rl_params else 'default'})")
                     if self._tp_limit_order_id:
                         actions.append(("cancel_tp_limit",))
                     actions.append(("dca_add", price))
