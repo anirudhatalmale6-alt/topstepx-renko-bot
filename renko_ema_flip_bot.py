@@ -618,6 +618,21 @@ class SymbolState:
         except Exception as e:
             print(f"[{self.symbol}] Entry price sync failed: {e}")
 
+    async def _get_real_unrealized(self) -> float:
+        if not self._suite_client or self._start_balance is None:
+            return None
+        try:
+            accounts = await asyncio.wait_for(
+                self._suite_client.list_accounts(), timeout=8.0)
+            acct_name = os.environ.get("PROJECT_X_ACCOUNT_NAME", "")
+            for a in accounts:
+                if a.name == acct_name:
+                    real_total = a.balance - self._start_balance
+                    return real_total - self.live_pnl
+        except Exception as e:
+            print(f"[{self.symbol}] Real unrealized check failed: {e}")
+        return None
+
     async def _sync_pnl_from_platform(self) -> None:
         if not self._suite_client:
             return
@@ -760,6 +775,16 @@ class SymbolState:
         direction = "LONG" if self.position == 1 else "SHORT"
         pnl_before = self.live_pnl
 
+        real_unr = await self._get_real_unrealized()
+        if real_unr is not None:
+            if self.position == 1:
+                est_unr = (price - self.entry_price) * self.pv * self.contracts_held
+            else:
+                est_unr = (self.entry_price - price) * self.pv * self.contracts_held
+            if abs(real_unr - est_unr) > 5.0:
+                print(f"[{now_str}] [{self.symbol} PNL-CHECK] est=${est_unr:.2f} real=${real_unr:.2f} "
+                      f"(diff ${real_unr - est_unr:.2f})")
+
         try:
             await asyncio.wait_for(
                 self.ctx.positions.close_position_direct(
@@ -859,47 +884,36 @@ class SymbolState:
                 new_trail = price - self.active_trail_pts
                 if new_trail > self.trail_level:
                     self.trail_level = new_trail
-                # Check trailing stop hit
+                # Check trailing stop hit — FLIP to SHORT
                 if price <= self.trail_level:
                     now_str = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now_str}] [{self.symbol} TRAIL-STOP] LONG x{self.contracts_held} "
-                          f"price {price:.2f} <= trail {self.trail_level:.2f} "
-                          f"(trail={self.active_trail_pts}pts)")
+                    print(f"[{now_str}] [{self.symbol} TRAIL-FLIP] LONG x{self.contracts_held} "
+                          f"price {price:.2f} <= trail {self.trail_level:.2f} — FLIPPING to SHORT")
                     self._pending_rl = {"features": self.entry_features,
                                         "mae": self.trade_mae, "mfe": self.trade_mfe}
                     if self._tp_limit_order_id:
                         actions.append(("cancel_tp_limit",))
-                    actions.append(("flatten", price, "TRAILING_STOP"))
+                    actions.append(("flatten", price, "TRAIL_FLIP"))
+                    actions.append(("enter_short", price))
                     return actions
             elif self.position == -1:
                 new_trail = price + self.active_trail_pts
                 if new_trail < self.trail_level:
                     self.trail_level = new_trail
-                # Check trailing stop hit
+                # Check trailing stop hit — FLIP to LONG
                 if price >= self.trail_level:
                     now_str = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now_str}] [{self.symbol} TRAIL-STOP] SHORT x{self.contracts_held} "
-                          f"price {price:.2f} >= trail {self.trail_level:.2f} "
-                          f"(trail={self.active_trail_pts}pts)")
+                    print(f"[{now_str}] [{self.symbol} TRAIL-FLIP] SHORT x{self.contracts_held} "
+                          f"price {price:.2f} >= trail {self.trail_level:.2f} — FLIPPING to LONG")
                     self._pending_rl = {"features": self.entry_features,
                                         "mae": self.trade_mae, "mfe": self.trade_mfe}
                     if self._tp_limit_order_id:
                         actions.append(("cancel_tp_limit",))
-                    actions.append(("flatten", price, "TRAILING_STOP"))
+                    actions.append(("flatten", price, "TRAIL_FLIP"))
+                    actions.append(("enter_long", price))
                     return actions
 
-            # HARD BACKSTOP: force exit if loss exceeds per-trade max
-            if unrealized <= -HARD_BACKSTOP_PER_TRADE:
-                now_str = datetime.now(ET).strftime("%H:%M:%S")
-                direction = "LONG" if self.position == 1 else "SHORT"
-                print(f"[{now_str}] [{self.symbol} MAX-LOSS] {direction} x{self.contracts_held} "
-                      f"unrealized ${unrealized:.0f} <= -${HARD_BACKSTOP_PER_TRADE:.0f} -- FORCE EXIT")
-                self._pending_rl = {"features": self.entry_features,
-                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
-                if self._tp_limit_order_id:
-                    actions.append(("cancel_tp_limit",))
-                actions.append(("flatten", price, "MAX_LOSS"))
-                return actions
+            # No hard backstop — position flips via trailing stop only
 
             # TP limit order: when profit exceeds a threshold (e.g., 5 pts for NQ = $100)
             tp_threshold_dollars = 100.0
@@ -939,11 +953,10 @@ class SymbolState:
 
                 self._prev_brick_dir = brick["direction"]
 
-                # Entry signal: flip + EMA confirmation
-                if flip_occurred and self.position == 0 and in_trade_session() and ema is not None:
+                # Entry/flip signal: flip + EMA confirmation
+                if flip_occurred and in_trade_session() and ema is not None:
                     brick_close = brick["close"]
 
-                    # Check daily loss limit
                     if abs(self.daily_loss) >= DAILY_LOSS_LIMIT:
                         now_str2 = datetime.now(ET).strftime("%H:%M:%S")
                         print(f"[{now_str2}] [{self.symbol} DAILY-LIMIT] "
@@ -954,19 +967,30 @@ class SymbolState:
                     should_enter, reason = self.ml.should_enter(features)
 
                     if flip_to == "green" and brick_close > ema:
-                        # LONG signal: red->green flip AND close above EMA
                         print(f"[{now_str}] [{self.symbol} FLIP+EMA] {flip_from}->{flip_to} | "
                               f"close={brick_close:.2f} > EMA={ema:.2f} | {reason}")
                         if should_enter:
-                            actions.append(("enter_long", price))
+                            if self.position == -1:
+                                self._pending_rl = {"features": self.entry_features,
+                                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
+                                if self._tp_limit_order_id:
+                                    actions.append(("cancel_tp_limit",))
+                                actions.append(("flatten", price, "BRICK_FLIP"))
+                            if self.position <= 0:
+                                actions.append(("enter_long", price))
                     elif flip_to == "red" and brick_close < ema:
-                        # SHORT signal: green->red flip AND close below EMA
                         print(f"[{now_str}] [{self.symbol} FLIP+EMA] {flip_from}->{flip_to} | "
                               f"close={brick_close:.2f} < EMA={ema:.2f} | {reason}")
                         if should_enter:
-                            actions.append(("enter_short", price))
+                            if self.position == 1:
+                                self._pending_rl = {"features": self.entry_features,
+                                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
+                                if self._tp_limit_order_id:
+                                    actions.append(("cancel_tp_limit",))
+                                actions.append(("flatten", price, "BRICK_FLIP"))
+                            if self.position >= 0:
+                                actions.append(("enter_short", price))
                     elif flip_occurred:
-                        # Flip occurred but EMA not confirmed
                         print(f"[{now_str}] [{self.symbol} FLIP-NO-EMA] {flip_from}->{flip_to} | "
                               f"close={brick_close:.2f} vs EMA={ema:.2f} -- skipped (no EMA confirm)")
 

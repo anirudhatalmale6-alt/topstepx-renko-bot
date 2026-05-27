@@ -762,6 +762,16 @@ class SymbolState:
         direction = "LONG" if self.position == 1 else "SHORT"
         pnl_before = self.live_pnl
 
+        real_unr = await self._get_real_unrealized()
+        if real_unr is not None:
+            if self.position == 1:
+                est_unr = (price - self.entry_price) * self.pv * self.contracts_held
+            else:
+                est_unr = (self.entry_price - price) * self.pv * self.contracts_held
+            if abs(real_unr - est_unr) > 5.0:
+                print(f"[{now_str}] [{self.symbol} PNL-CHECK] est=${est_unr:.2f} real=${real_unr:.2f} "
+                      f"(diff ${real_unr - est_unr:.2f})")
+
         try:
             await asyncio.wait_for(
                 self.ctx.positions.close_position_direct(
@@ -900,33 +910,7 @@ class SymbolState:
                     actions.append(("dca_add", price))
                     return actions
 
-            # STOP LOSS: exit if loss exceeds SL (in points)
-            sl_dollars = self.active_sl_pts * self.pv * self.contracts_held
-            if unrealized <= -sl_dollars:
-                now_str = datetime.now(ET).strftime("%H:%M:%S")
-                direction = "LONG" if self.position == 1 else "SHORT"
-                print(f"[{now_str}] [{self.symbol} SL] {direction} x{self.contracts_held} "
-                      f"unrealized ${unrealized:.0f} <= -${sl_dollars:.0f} "
-                      f"(SL={self.active_sl_pts}pts) — STOP LOSS EXIT")
-                self._pending_rl = {"features": self.entry_features,
-                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
-                if self._tp_limit_order_id:
-                    actions.append(("cancel_tp_limit",))
-                actions.append(("flatten", price, "STOP_LOSS"))
-                return actions
-
-            # HARD BACKSTOP: force exit if loss exceeds daily limit (safety net)
-            if unrealized <= -DAILY_LOSS_LIMIT:
-                now_str = datetime.now(ET).strftime("%H:%M:%S")
-                direction = "LONG" if self.position == 1 else "SHORT"
-                print(f"[{now_str}] [{self.symbol} MAX-LOSS] {direction} x{self.contracts_held} "
-                      f"unrealized ${unrealized:.0f} <= -${DAILY_LOSS_LIMIT:.0f} — FORCE EXIT")
-                self._pending_rl = {"features": self.entry_features,
-                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
-                if self._tp_limit_order_id:
-                    actions.append(("cancel_tp_limit",))
-                actions.append(("flatten", price, "MAX_LOSS"))
-                return actions
+            # No SL — bot relies on DCA, trail profit, and brick reversal exits only
 
         # Process new bricks
         if new_bricks:
