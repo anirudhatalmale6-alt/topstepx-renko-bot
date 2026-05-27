@@ -1028,14 +1028,6 @@ class SymbolState:
                 actions.append(("flatten", price, "TRAIL_PROFIT"))
                 return actions
 
-            # TP PROFIT-LOCK: move TP limit into profit as trail floor rises
-            if self._trail_profit_active and self._trail_profit_floor > self._tp_lock_pnl + 15.0:
-                self._tp_lock_pnl = self._trail_profit_floor
-                if self._tp_limit_order_id:
-                    actions.append(("cancel_tp_limit",))
-                actions.append(("tp_lock", price))
-                return actions
-
             # TP check: place limit order for guaranteed $20 net
             if unrealized >= DCA_TP_DOLLARS and not self._tp_limit_order_id:
                 now_str = datetime.now(ET).strftime("%H:%M:%S")
@@ -1626,40 +1618,6 @@ class RenkoReversalBot:
                             print(f"[{now_str}] [{sym} TP-LIMIT] Timeout placing limit order")
                         except Exception as e:
                             print(f"[{now_str}] [{sym} TP-LIMIT] Error: {type(e).__name__}: {e}")
-                    elif action[0] == "tp_lock":
-                        now_str = datetime.now(ET).strftime("%H:%M:%S")
-                        try:
-                            contract_id = st.ctx.instrument_info.id
-                            avg_price = st.entry_price
-                            size = st.contracts_held
-                            if avg_price and size > 0:
-                                floor_pnl = st._trail_profit_floor
-                                fees = FEE_PER_CONTRACT * size
-                                required_raw = floor_pnl + fees
-                                tick_size = MINTICK_VALUES.get(sym, 0.25)
-                                if st.position == 1:
-                                    lock_price = avg_price + required_raw / (st.pv * size)
-                                    lock_price = math.ceil(lock_price / tick_size) * tick_size
-                                    side = 1
-                                else:
-                                    lock_price = avg_price - required_raw / (st.pv * size)
-                                    lock_price = math.floor(lock_price / tick_size) * tick_size
-                                    side = 0
-                                response = await asyncio.wait_for(
-                                    st.ctx.orders.place_limit_order(
-                                        contract_id=contract_id, side=side,
-                                        size=size, limit_price=lock_price),
-                                    timeout=15.0)
-                                if response.success:
-                                    st._tp_limit_order_id = response.orderId
-                                    st._tp_limit_price = lock_price
-                                    dir_str = "LONG" if st.position == 1 else "SHORT"
-                                    print(f"[{now_str}] [{sym} TP-LOCK] {dir_str} limit moved to "
-                                          f"{lock_price:.2f} (locking ${floor_pnl:.0f} profit)")
-                                else:
-                                    print(f"[{now_str}] [{sym} TP-LOCK] Order failed: {response}")
-                        except Exception as e:
-                            print(f"[{now_str}] [{sym} TP-LOCK] Error: {e}")
                     elif action[0] == "flatten":
                         reason = action[2] if len(action) > 2 else "signal"
                         await st._flatten(action[1], reason)
