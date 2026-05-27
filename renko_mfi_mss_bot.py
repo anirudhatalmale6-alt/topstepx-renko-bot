@@ -243,12 +243,16 @@ class CandleBuilder:
 
 
 MSS_SWING_LOOKBACK = 5
+MSS_PIVOT_LENGTH = 2
+MSS_MIN_SWING_FILTER = 0.0015
+MSS_WARMUP_CANDLES = 15
 
 
 class MSSDetector:
     """Detects Market Structure Shift on 15-second candles.
     Bearish MSS: ascending swing lows (bullish structure) broken to downside.
-    Bullish MSS: descending swing highs (bearish structure) broken to upside."""
+    Bullish MSS: descending swing highs (bearish structure) broken to upside.
+    Matches TradingView MSS Detector: pivot_length=2, min_swing=0.15%."""
 
     def __init__(self):
         self.swing_highs = []
@@ -257,28 +261,41 @@ class MSSDetector:
         self._bullish_triggered = False
 
     def update_swings(self, candles: list):
-        if len(candles) < 3:
+        pl = MSS_PIVOT_LENGTH
+        if len(candles) < max(pl * 2 + 1, MSS_WARMUP_CANDLES):
             return
         highs = []
         lows = []
-        for i in range(1, len(candles) - 1):
-            if candles[i]["high"] > candles[i - 1]["high"] and candles[i]["high"] > candles[i + 1]["high"]:
+        for i in range(pl, len(candles) - pl):
+            is_high = all(
+                candles[i]["high"] > candles[i - j]["high"] and
+                candles[i]["high"] > candles[i + j]["high"]
+                for j in range(1, pl + 1))
+            is_low = all(
+                candles[i]["low"] < candles[i - j]["low"] and
+                candles[i]["low"] < candles[i + j]["low"]
+                for j in range(1, pl + 1))
+            if is_high:
                 highs.append(candles[i]["high"])
-            if candles[i]["low"] < candles[i - 1]["low"] and candles[i]["low"] < candles[i + 1]["low"]:
+            if is_low:
                 lows.append(candles[i]["low"])
         self.swing_highs = highs[-MSS_SWING_LOOKBACK:]
         self.swing_lows = lows[-MSS_SWING_LOOKBACK:]
 
     def check(self, price: float) -> str:
+        min_swing = price * MSS_MIN_SWING_FILTER
+
         if len(self.swing_lows) >= 2 and self.swing_lows[-1] > self.swing_lows[-2]:
-            if price < self.swing_lows[-1] and not self._bearish_triggered:
+            swing_dist = self.swing_lows[-1] - self.swing_lows[-2]
+            if swing_dist >= min_swing and price < self.swing_lows[-1] and not self._bearish_triggered:
                 self._bearish_triggered = True
                 return "bearish"
         else:
             self._bearish_triggered = False
 
         if len(self.swing_highs) >= 2 and self.swing_highs[-1] < self.swing_highs[-2]:
-            if price > self.swing_highs[-1] and not self._bullish_triggered:
+            swing_dist = self.swing_highs[-2] - self.swing_highs[-1]
+            if swing_dist >= min_swing and price > self.swing_highs[-1] and not self._bullish_triggered:
                 self._bullish_triggered = True
                 return "bullish"
         else:
