@@ -1243,8 +1243,11 @@ class SymbolState:
 
                 self._prev_brick_dir = brick["direction"]
 
-        # Update 15s swing points — MSS shift sets pending direction for MFI entry
-        self.mss.update_swings(self.bb_candles.candles)
+        # Update MSS from Renko bricks — cleaner structure than time-based candles
+        renko_candles = [{"high": max(b["open"], b["close"]),
+                          "low": min(b["open"], b["close"])}
+                         for b in self.renko.bricks]
+        self.mss.update_swings(renko_candles)
 
         if self.position == 0 and in_trade_session():
             if abs(self.daily_loss) >= DAILY_LOSS_LIMIT:
