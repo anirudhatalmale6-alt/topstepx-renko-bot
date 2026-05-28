@@ -878,7 +878,7 @@ class SymbolState:
         self._rl_action_idx, self._rl_params = self.rl.choose(features)
 
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING LONG x{qty} @ {price:.2f} | "
-              f"TP=${DCA_TP_DOLLARS} | SL={self._rl_params['sl_pts']}pts "
+              f"TP=${DCA_TP_DOLLARS} | "
               f"({self._rl_params['label']}) | trail=${self._rl_params['trail_activate']:.0f}/"
               f"{100*self._rl_params['trail_pullback']:.0f}% | "
               f"DCA at -${abs(DCA_ADD_THRESHOLD)} | Session P&L: ${self.live_pnl:.2f}")
@@ -929,7 +929,7 @@ class SymbolState:
         self._rl_action_idx, self._rl_params = self.rl.choose(features)
 
         print(f"\n[{now}] [{self.symbol}] >>> ENTERING SHORT x{qty} @ {price:.2f} | "
-              f"TP=${DCA_TP_DOLLARS} | SL={self._rl_params['sl_pts']}pts "
+              f"TP=${DCA_TP_DOLLARS} | "
               f"({self._rl_params['label']}) | trail=${self._rl_params['trail_activate']:.0f}/"
               f"{100*self._rl_params['trail_pullback']:.0f}% | "
               f"DCA at -${abs(DCA_ADD_THRESHOLD)} | Session P&L: ${self.live_pnl:.2f}")
@@ -1119,7 +1119,6 @@ class SymbolState:
             # RL-chosen parameters (fall back to defaults if no RL params set)
             trail_act = self._rl_params["trail_activate"] if self._rl_params else TRAIL_PROFIT_ACTIVATE
             trail_pb = self._rl_params["trail_pullback"] if self._rl_params else TRAIL_PROFIT_PULLBACK
-            sl_pts = self._rl_params["sl_pts"] if self._rl_params else DEFAULT_SL_PTS
 
             # TRAILING PROFIT: lock in gains (RL-chosen activation & pullback)
             if unrealized >= trail_act:
@@ -1172,27 +1171,7 @@ class SymbolState:
                     actions.append(("dca_add", price))
                     return actions
 
-            # SL check (RL-chosen distance)
-            if self.position == 1 and price <= self.entry_price - sl_pts:
-                now_str = datetime.now(ET).strftime("%H:%M:%S")
-                print(f"[{now_str}] [{self.symbol} SL-HIT] LONG @ {price:.2f} <= "
-                      f"SL {self.entry_price - sl_pts:.2f} ({sl_pts}pts)")
-                self._pending_rl = {"features": self.entry_features,
-                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
-                if self._tp_limit_order_id:
-                    actions.append(("cancel_tp_limit",))
-                actions.append(("flatten", price, "SL"))
-                return actions
-            elif self.position == -1 and price >= self.entry_price + sl_pts:
-                now_str = datetime.now(ET).strftime("%H:%M:%S")
-                print(f"[{now_str}] [{self.symbol} SL-HIT] SHORT @ {price:.2f} >= "
-                      f"SL {self.entry_price + sl_pts:.2f} ({sl_pts}pts)")
-                self._pending_rl = {"features": self.entry_features,
-                                    "mae": self.trade_mae, "mfe": self.trade_mfe}
-                if self._tp_limit_order_id:
-                    actions.append(("cancel_tp_limit",))
-                actions.append(("flatten", price, "SL"))
-                return actions
+            # SL removed — strategy relies on MSS+MFI reversal and trailing profit for exits
 
         # Process new bricks — compute MFI on each
         if new_bricks:
