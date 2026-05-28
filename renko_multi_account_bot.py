@@ -752,12 +752,9 @@ class SignalEngine:
                     if matches_mss:
                         features = self.extract_features()
                         should_enter, reason = self.ml.should_enter(features)
-                        bb_slope = self._bb_slope()
-                        slope_str = f"slope={bb_slope:+.1f}" if bb_slope is not None else "slope=?"
-                        slope_ok = bb_slope is None or abs(bb_slope) <= BB_SLOPE_MAX
                         print(f"[{now_str}] [{self.symbol} MFI-CONFIRM] {mfi_signal.upper()} "
-                              f"-> {direction} | MSS {self._pending_mss} | {slope_str} | {reason}")
-                        if should_enter and slope_ok:
+                              f"-> {direction} | MSS {self._pending_mss} active | {reason}")
+                        if should_enter:
                             self._pending_bb_entry = {
                                 "direction": direction, "features": features,
                                 "ts": time.time(), "mss": self._pending_mss,
@@ -765,38 +762,43 @@ class SignalEngine:
                             self._pending_mss = None
                             self.mss.reset()
                             print(f"[{now_str}] [{self.symbol} BB-WAIT] {direction} armed — "
-                                  f"waiting for price to touch {'upper' if direction == 'SHORT' else 'lower'} BB")
-                        elif not slope_ok:
-                            print(f"[{now_str}] [{self.symbol} BB-SLOPE-BLOCK] {direction} blocked — "
-                                  f"BB too steep ({bb_slope:+.1f} pts > {BB_SLOPE_MAX})")
+                                  f"waiting for BB flat + band touch")
                     elif mfi_signal:
                         print(f"[{now_str}] [{self.symbol} MFI-DOT] {mfi_signal.upper()} "
                               f"-> {direction} | no matching MSS pending")
 
                 self._prev_brick_dir = brick["direction"]
 
-        # Check pending BB entry on every tick
+        # Check pending BB entry on every tick: need BB flat + price at band
         if self._pending_bb_entry and in_trade_session():
             bb = self._calc_bb()
             if bb:
                 upper, middle, lower = bb
                 direction = self._pending_bb_entry["direction"]
-                if direction == "SHORT" and price >= upper:
+                bb_slope = self._bb_slope()
+                slope_flat = bb_slope is None or abs(bb_slope) <= BB_SLOPE_MAX
+                at_band = ((direction == "SHORT" and price >= upper) or
+                           (direction == "LONG" and price <= lower))
+                if at_band and slope_flat:
                     now_str = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now_str}] [{self.symbol} BB-TRIGGER] SHORT — "
-                          f"price {price:.2f} >= upper BB {upper:.2f}")
+                    slope_str = f"{bb_slope:+.1f}" if bb_slope is not None else "?"
+                    if direction == "SHORT":
+                        print(f"[{now_str}] [{self.symbol} BB-TRIGGER] SHORT — "
+                              f"price {price:.2f} >= upper BB {upper:.2f} | slope {slope_str} (flat)")
+                    else:
+                        print(f"[{now_str}] [{self.symbol} BB-TRIGGER] LONG — "
+                              f"price {price:.2f} <= lower BB {lower:.2f} | slope {slope_str} (flat)")
                     features = self._pending_bb_entry["features"]
                     rl_idx, rl_params = self.rl.choose(features)
-                    signals.append(("enter_short", price, features, rl_idx, rl_params))
+                    if direction == "SHORT":
+                        signals.append(("enter_short", price, features, rl_idx, rl_params))
+                    else:
+                        signals.append(("enter_long", price, features, rl_idx, rl_params))
                     self._pending_bb_entry = None
-                elif direction == "LONG" and price <= lower:
+                elif at_band and not slope_flat:
                     now_str = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now_str}] [{self.symbol} BB-TRIGGER] LONG — "
-                          f"price {price:.2f} <= lower BB {lower:.2f}")
-                    features = self._pending_bb_entry["features"]
-                    rl_idx, rl_params = self.rl.choose(features)
-                    signals.append(("enter_long", price, features, rl_idx, rl_params))
-                    self._pending_bb_entry = None
+                    print(f"[{now_str}] [{self.symbol} BB-SLOPE-WAIT] {direction} — "
+                          f"at band but BB steep ({bb_slope:+.1f}), waiting to flatten")
 
         # MSS detection
         self.mss.update_swings(self.renko.bricks)
