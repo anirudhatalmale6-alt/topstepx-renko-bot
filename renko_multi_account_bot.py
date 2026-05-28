@@ -705,7 +705,7 @@ class SignalEngine:
 
     def tick(self, price, ts=None):
         """Process tick and return list of signal actions.
-        Flow: MSS shift -> MFI exhaustion -> pending BB entry -> price touches BB band -> enter
+        Flow: MSS shift -> arm pending BB entry -> BB flat + band touch -> enter
         """
         if ts is None:
             ts = time.time()
@@ -747,27 +747,7 @@ class SignalEngine:
                       f"{brick['open']:.2f} -> {brick['close']:.2f} "
                       f"(consecutive: {self.renko.consecutive_count()}) | {mfi_str} | {bb_str}{slope_str}{pend_str}")
 
-                if self._restart_cooldown_done and mfi_signal and in_trade_session():
-                    direction = "LONG" if mfi_signal == "oversold" else "SHORT"
-                    matches_mss = ((self._pending_mss == "bullish" and direction == "LONG") or
-                                   (self._pending_mss == "bearish" and direction == "SHORT"))
-                    if matches_mss:
-                        features = self.extract_features()
-                        should_enter, reason = self.ml.should_enter(features)
-                        print(f"[{now_str}] [{self.symbol} MFI-CONFIRM] {mfi_signal.upper()} "
-                              f"-> {direction} | MSS {self._pending_mss} active | {reason}")
-                        if should_enter:
-                            self._pending_bb_entry = {
-                                "direction": direction, "features": features,
-                                "ts": time.time(), "mss": self._pending_mss,
-                            }
-                            self._pending_mss = None
-                            self.mss.reset()
-                            print(f"[{now_str}] [{self.symbol} BB-WAIT] {direction} armed — "
-                                  f"waiting for BB flat + band touch")
-                    elif mfi_signal:
-                        print(f"[{now_str}] [{self.symbol} MFI-DOT] {mfi_signal.upper()} "
-                              f"-> {direction} | no matching MSS pending")
+                # MFI logged for info only — not used for entry decisions
 
                 self._mss_brick_count += 1
                 self._prev_brick_dir = brick["direction"]
@@ -811,6 +791,7 @@ class SignalEngine:
                 if self._pending_mss and self._mss_brick_count < MSS_MIN_PERSIST_BRICKS:
                     pass
                 else:
+                    direction = "LONG" if mss_signal == "bullish" else "SHORT"
                     if self._pending_bb_entry:
                         pend_dir = self._pending_bb_entry["direction"]
                         opposite = (mss_signal == "bullish" and pend_dir == "SHORT") or \
@@ -823,12 +804,22 @@ class SignalEngine:
                     self._pending_mss = mss_signal
                     self._mss_brick_count = 0
                     now_str = datetime.now(ET).strftime("%H:%M:%S")
+                    features = self.extract_features()
+                    should_enter, reason = self.ml.should_enter(features)
                     if mss_signal == "bearish":
                         print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BEARISH @ {price:.2f} "
-                              f"broke SL {self.mss.swing_lows[-1]:.2f} | waiting for MFI overbought -> SHORT")
+                              f"broke SL {self.mss.swing_lows[-1]:.2f} | {reason}")
                     else:
                         print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BULLISH @ {price:.2f} "
-                              f"broke SH {self.mss.swing_highs[-1]:.2f} | waiting for MFI oversold -> LONG")
+                              f"broke SH {self.mss.swing_highs[-1]:.2f} | {reason}")
+                    if should_enter:
+                        self._pending_bb_entry = {
+                            "direction": direction, "features": features,
+                            "ts": time.time(), "mss": mss_signal,
+                        }
+                        print(f"[{now_str}] [{self.symbol} BB-WAIT] {direction} armed — "
+                              f"waiting for BB flat + band touch")
+                    self.mss.reset()
 
         return signals
 
