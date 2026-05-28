@@ -159,6 +159,7 @@ MAX_BRICKS_PER_FEED = 10000
 MSS_SWING_LOOKBACK = 5
 MSS_MIN_SWING_PTS = 2.0
 MSS_WARMUP_BRICKS = 15
+MSS_MIN_PERSIST_BRICKS = 12
 
 BB_LENGTH = 20
 BB_MULT = 2.0
@@ -613,6 +614,7 @@ class SignalEngine:
         self.last_tick_time = 0.0
         self._prev_brick_dir = None
         self._pending_mss = None
+        self._mss_brick_count = 0
         self._restart_ts = time.time()
         self._new_bricks_since_restart = 0
         self._restart_cooldown_done = False
@@ -767,6 +769,7 @@ class SignalEngine:
                         print(f"[{now_str}] [{self.symbol} MFI-DOT] {mfi_signal.upper()} "
                               f"-> {direction} | no matching MSS pending")
 
+                self._mss_brick_count += 1
                 self._prev_brick_dir = brick["direction"]
 
         # Check pending BB entry on every tick: need BB flat + price at band
@@ -800,29 +803,32 @@ class SignalEngine:
                     print(f"[{now_str}] [{self.symbol} BB-SLOPE-WAIT] {direction} — "
                           f"at band but BB steep ({bb_slope:+.1f}), waiting to flatten")
 
-        # MSS detection
+        # MSS detection (with minimum persistence — can't flip until N bricks have passed)
         self.mss.update_swings(self.renko.bricks)
         if in_trade_session() and self._restart_cooldown_done:
             mss_signal = self.mss.check(price)
             if mss_signal and mss_signal != self._pending_mss:
-                # Cancel pending BB entry if MSS flips opposite
-                if self._pending_bb_entry:
-                    pend_dir = self._pending_bb_entry["direction"]
-                    opposite = (mss_signal == "bullish" and pend_dir == "SHORT") or \
-                               (mss_signal == "bearish" and pend_dir == "LONG")
-                    if opposite:
-                        now_str = datetime.now(ET).strftime("%H:%M:%S")
-                        print(f"[{now_str}] [{self.symbol} BB-CANCEL] {pend_dir} pending cancelled — "
-                              f"MSS flipped to {mss_signal}")
-                        self._pending_bb_entry = None
-                self._pending_mss = mss_signal
-                now_str = datetime.now(ET).strftime("%H:%M:%S")
-                if mss_signal == "bearish":
-                    print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BEARISH @ {price:.2f} "
-                          f"broke SL {self.mss.swing_lows[-1]:.2f} | waiting for MFI overbought -> SHORT")
+                if self._pending_mss and self._mss_brick_count < MSS_MIN_PERSIST_BRICKS:
+                    pass
                 else:
-                    print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BULLISH @ {price:.2f} "
-                          f"broke SH {self.mss.swing_highs[-1]:.2f} | waiting for MFI oversold -> LONG")
+                    if self._pending_bb_entry:
+                        pend_dir = self._pending_bb_entry["direction"]
+                        opposite = (mss_signal == "bullish" and pend_dir == "SHORT") or \
+                                   (mss_signal == "bearish" and pend_dir == "LONG")
+                        if opposite:
+                            now_str = datetime.now(ET).strftime("%H:%M:%S")
+                            print(f"[{now_str}] [{self.symbol} BB-CANCEL] {pend_dir} pending cancelled — "
+                                  f"MSS flipped to {mss_signal}")
+                            self._pending_bb_entry = None
+                    self._pending_mss = mss_signal
+                    self._mss_brick_count = 0
+                    now_str = datetime.now(ET).strftime("%H:%M:%S")
+                    if mss_signal == "bearish":
+                        print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BEARISH @ {price:.2f} "
+                              f"broke SL {self.mss.swing_lows[-1]:.2f} | waiting for MFI overbought -> SHORT")
+                    else:
+                        print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BULLISH @ {price:.2f} "
+                              f"broke SH {self.mss.swing_highs[-1]:.2f} | waiting for MFI oversold -> LONG")
 
         return signals
 
