@@ -703,6 +703,9 @@ class SymbolState:
         self._prev_brick_dir = None
         self._pending_mss = None  # "bearish" or "bullish" — set by MSS, waiting for MFI confirm
         self._last_entry_sig_ts = 0.0  # track last processed entry signal from primary
+        self._restart_ts = time.time()
+        self._new_bricks_since_restart = 0
+        self._restart_cooldown_done = False
 
         # MFI state
         self.brick_closes = []
@@ -1096,6 +1099,15 @@ class SymbolState:
         self.bb_candles.feed(price, ts)
         new_bricks = self.renko.feed(price)
 
+        if new_bricks and not self._restart_cooldown_done:
+            self._new_bricks_since_restart += len(new_bricks)
+            elapsed = time.time() - self._restart_ts
+            if self._new_bricks_since_restart >= 20 and elapsed >= 30:
+                self._restart_cooldown_done = True
+                now_str = datetime.now(ET).strftime("%H:%M:%S")
+                print(f"[{now_str}] [{self.symbol} COOLDOWN-DONE] "
+                      f"{self._new_bricks_since_restart} bricks in {elapsed:.0f}s — signals enabled")
+
         if self.position != 0:
             if self.position == 1:
                 unrealized = (price - self.entry_price) * self.pv * self.contracts_held
@@ -1218,7 +1230,7 @@ class SymbolState:
                         return actions
 
                 # MFI crossing — enter if MSS already confirmed the direction (PRIMARY only)
-                if self._signal_primary and mfi_signal and self.position == 0 and in_trade_session():
+                if self._signal_primary and self._restart_cooldown_done and mfi_signal and self.position == 0 and in_trade_session():
                     if mfi_signal == "oversold":
                         direction = "LONG"
                     else:
@@ -1292,7 +1304,7 @@ class SymbolState:
                 print(f"[{now_str}] [{self.symbol} DAILY-LIMIT] "
                       f"daily loss ${self.daily_loss:.0f} >= ${DAILY_LOSS_LIMIT:.0f} — no new entries")
                 self._pending_mss = None
-            elif self._signal_primary:
+            elif self._signal_primary and self._restart_cooldown_done:
                 mss_signal = self.mss.check(price)
                 if mss_signal and mss_signal != self._pending_mss:
                     self._pending_mss = mss_signal
