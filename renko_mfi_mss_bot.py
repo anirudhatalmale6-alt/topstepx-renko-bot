@@ -171,6 +171,7 @@ WATCHDOG_TIMEOUT = 300
 TICK_HEALTH_TIMEOUT = 90
 
 SHARED_SIGNAL_PATH = "/home/ec2-user/shared_mss_signal.json"
+SHARED_ENTRY_PATH = "/home/ec2-user/shared_entry_signal.json"
 
 
 def in_session() -> bool:
@@ -701,6 +702,7 @@ class SymbolState:
         self.last_tick_time = 0.0
         self._prev_brick_dir = None
         self._pending_mss = None  # "bearish" or "bullish" — set by MSS, waiting for MFI confirm
+        self._last_entry_sig_ts = 0.0  # track last processed entry signal from primary
 
         # MFI state
         self.brick_closes = []
@@ -1215,8 +1217,8 @@ class SymbolState:
                         self._prev_brick_dir = brick["direction"]
                         return actions
 
-                # MFI crossing — enter if MSS already confirmed the direction
-                if mfi_signal and self.position == 0 and in_trade_session():
+                # MFI crossing — enter if MSS already confirmed the direction (PRIMARY only)
+                if self._signal_primary and mfi_signal and self.position == 0 and in_trade_session():
                     if mfi_signal == "oversold":
                         direction = "LONG"
                     else:
@@ -1231,14 +1233,20 @@ class SymbolState:
                         if should_enter:
                             self._pending_mss = None
                             self.mss.reset()
-                            if self._signal_primary:
-                                try:
-                                    tmp = SHARED_SIGNAL_PATH + ".tmp"
-                                    with open(tmp, "w") as f:
-                                        json.dump({"pending_mss": None, "ts": time.time(), "price": price}, f)
-                                    os.replace(tmp, SHARED_SIGNAL_PATH)
-                                except Exception:
-                                    pass
+                            try:
+                                entry_sig = {"action": "enter_long" if direction == "LONG" else "enter_short",
+                                             "direction": direction, "price": price, "ts": time.time(),
+                                             "rl_idx": self._rl_action_idx, "rl_params": self._rl_params}
+                                tmp = SHARED_ENTRY_PATH + ".tmp"
+                                with open(tmp, "w") as f:
+                                    json.dump(entry_sig, f)
+                                os.replace(tmp, SHARED_ENTRY_PATH)
+                                tmp2 = SHARED_SIGNAL_PATH + ".tmp"
+                                with open(tmp2, "w") as f:
+                                    json.dump({"pending_mss": None, "ts": time.time(), "price": price}, f)
+                                os.replace(tmp2, SHARED_SIGNAL_PATH)
+                            except Exception:
+                                pass
                             actions.append(("enter_short" if direction == "SHORT" else "enter_long", price))
                             self._prev_brick_dir = brick["direction"]
                             return actions
@@ -1247,6 +1255,33 @@ class SymbolState:
                               f"-> {direction} | no matching MSS pending")
 
                 self._prev_brick_dir = brick["direction"]
+
+        # Follower bots: check shared entry signal from primary
+        if not self._signal_primary and self.position == 0 and in_trade_session():
+            if abs(self.daily_loss) < DAILY_LOSS_LIMIT:
+                try:
+                    with open(SHARED_ENTRY_PATH, "r") as f:
+                        esig = json.load(f)
+                    sig_ts = esig.get("ts", 0)
+                    if sig_ts > self._last_entry_sig_ts and (time.time() - sig_ts) < 10:
+                        self._last_entry_sig_ts = sig_ts
+                        action = esig.get("action")
+                        direction = esig.get("direction")
+                        sig_price = esig.get("price", price)
+                        if esig.get("rl_idx") is not None:
+                            self._rl_action_idx = esig["rl_idx"]
+                            self._rl_params = esig.get("rl_params", self._rl_params)
+                        now_str = datetime.now(ET).strftime("%H:%M:%S")
+                        print(f"[{now_str}] [{self.symbol} FOLLOW-ENTRY] {direction} "
+                              f"@ {price:.2f} (primary @ {sig_price:.2f}) [FOLLOW]")
+                        self._pending_mss = None
+                        self.mss.reset()
+                        actions.append((action, price))
+                        return actions
+                except (FileNotFoundError, json.JSONDecodeError):
+                    pass
+                except Exception:
+                    pass
 
         # Update MSS from Renko brick reversals
         self.mss.update_swings(self.renko.bricks)
