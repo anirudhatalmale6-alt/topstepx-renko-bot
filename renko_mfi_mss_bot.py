@@ -243,16 +243,15 @@ class CandleBuilder:
 
 
 MSS_SWING_LOOKBACK = 5
-MSS_PIVOT_LENGTH = 2
-MSS_MIN_SWING_PTS = 8.0
-MSS_WARMUP_CANDLES = 15
+MSS_MIN_SWING_PTS = 6.0
+MSS_WARMUP_BRICKS = 15
 
 
 class MSSDetector:
-    """Detects Market Structure Shift on 15-second candles.
-    Bearish MSS: ascending swing lows (bullish structure) broken to downside.
-    Bullish MSS: descending swing highs (bearish structure) broken to upside.
-    Matches TradingView MSS Detector: pivot_length=2, min_swing=8pts."""
+    """Detects Market Structure Shift on Renko bricks.
+    Swing points = direction reversals (natural for Renko).
+    Bearish MSS: ascending swing lows broken to downside.
+    Bullish MSS: descending swing highs broken to upside."""
 
     def __init__(self):
         self.swing_highs = []
@@ -260,25 +259,20 @@ class MSSDetector:
         self._bearish_triggered = False
         self._bullish_triggered = False
 
-    def update_swings(self, candles: list):
-        pl = MSS_PIVOT_LENGTH
-        if len(candles) < max(pl * 2 + 1, MSS_WARMUP_CANDLES):
+    def update_swings(self, bricks: list):
+        if len(bricks) < MSS_WARMUP_BRICKS:
             return
         highs = []
         lows = []
-        for i in range(pl, len(candles) - pl):
-            is_high = all(
-                candles[i]["high"] > candles[i - j]["high"] and
-                candles[i]["high"] > candles[i + j]["high"]
-                for j in range(1, pl + 1))
-            is_low = all(
-                candles[i]["low"] < candles[i - j]["low"] and
-                candles[i]["low"] < candles[i + j]["low"]
-                for j in range(1, pl + 1))
-            if is_high:
-                highs.append(candles[i]["high"])
-            if is_low:
-                lows.append(candles[i]["low"])
+        prev_dir = None
+        for i, brick in enumerate(bricks):
+            curr_dir = brick.get("direction")
+            if curr_dir and prev_dir and curr_dir != prev_dir:
+                if prev_dir == "green" and curr_dir == "red":
+                    highs.append(max(bricks[i - 1]["open"], bricks[i - 1]["close"]))
+                elif prev_dir == "red" and curr_dir == "green":
+                    lows.append(min(bricks[i - 1]["open"], bricks[i - 1]["close"]))
+            prev_dir = curr_dir
         self.swing_highs = highs[-MSS_SWING_LOOKBACK:]
         self.swing_lows = lows[-MSS_SWING_LOOKBACK:]
 
@@ -1243,11 +1237,8 @@ class SymbolState:
 
                 self._prev_brick_dir = brick["direction"]
 
-        # Update MSS from Renko bricks — cleaner structure than time-based candles
-        renko_candles = [{"high": max(b["open"], b["close"]),
-                          "low": min(b["open"], b["close"])}
-                         for b in self.renko.bricks]
-        self.mss.update_swings(renko_candles)
+        # Update MSS from Renko brick reversals
+        self.mss.update_swings(self.renko.bricks)
 
         if self.position == 0 and in_trade_session():
             if abs(self.daily_loss) >= DAILY_LOSS_LIMIT:
