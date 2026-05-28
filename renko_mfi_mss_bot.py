@@ -1143,20 +1143,18 @@ class SymbolState:
                       f"(peak was ${self._trail_profit_peak:.0f})")
                 self._pending_rl = {"features": self.entry_features,
                                     "mae": self.trade_mae, "mfe": self.trade_mfe}
-                if self._tp_limit_order_id:
-                    actions.append(("cancel_tp_limit",))
                 actions.append(("flatten", price, "TRAIL_PROFIT"))
                 return actions
 
-            # TP check: place limit order for guaranteed $20 net
-            if unrealized >= DCA_TP_DOLLARS and not self._tp_limit_order_id:
+            # TP check: market exit at $100 profit
+            if unrealized >= DCA_TP_DOLLARS:
                 now_str = datetime.now(ET).strftime("%H:%M:%S")
                 direction = "LONG" if self.position == 1 else "SHORT"
-                print(f"[{now_str}] [{self.symbol} TP-NEAR] {direction} x{self.contracts_held} "
-                      f"est ${unrealized:.0f} >= ${DCA_TP_DOLLARS} @ {price:.2f} — placing TP limit...")
+                print(f"[{now_str}] [{self.symbol} TP-HIT] {direction} x{self.contracts_held} "
+                      f"unrealized ${unrealized:.0f} >= ${DCA_TP_DOLLARS} @ {price:.2f} — market exit")
                 self._pending_rl = {"features": self.entry_features,
                                     "mae": self.trade_mae, "mfe": self.trade_mfe}
-                actions.append(("tp_limit", price))
+                actions.append(("flatten", price, "TP"))
                 return actions
 
             # DCA: add 1 contract (RL-chosen threshold, None = no DCA)
@@ -1166,8 +1164,6 @@ class SymbolState:
                     now_str = datetime.now(ET).strftime("%H:%M:%S")
                     print(f"[{now_str}] [{self.symbol} DCA-TRIGGER] unrealized ${unrealized:.0f} "
                           f"<= ${dca_thresh:.0f} (RL: {self._rl_params['label'] if self._rl_params else 'default'})")
-                    if self._tp_limit_order_id:
-                        actions.append(("cancel_tp_limit",))
                     actions.append(("dca_add", price))
                     return actions
 
@@ -1202,8 +1198,6 @@ class SymbolState:
                               f"— opposite MFI {mfi_signal} (PnL ${cur_pnl:.0f})")
                         self._pending_rl = {"features": self.entry_features,
                                             "mae": self.trade_mae, "mfe": self.trade_mfe}
-                        if self._tp_limit_order_id:
-                            actions.append(("cancel_tp_limit",))
                         actions.append(("flatten", price, "MFI_REVERSAL"))
                         self._prev_brick_dir = brick["direction"]
                         return actions
@@ -1619,13 +1613,7 @@ class RenkoMFIMSSBot:
                         st.live_pnl += pnl_est
                         st.position = 0
                         st.contracts_held = 0
-                        if st._tp_limit_order_id:
-                            tp_info = f" (TP limit filled @ {st._tp_limit_price:.2f})"
-                            st._tp_limit_order_id = None
-                            st._tp_limit_price = None
-                        else:
-                            tp_info = ""
-                        print(f"[WS] Platform closed {direction} {sym} — est PnL: ${pnl_est:.2f}{tp_info}")
+                        print(f"[WS] Platform closed {direction} {sym} — est PnL: ${pnl_est:.2f}")
 
                         threading.Thread(target=send_signals, args=(
                             self.tg_token, self.tg_chat, self.tg_keys,
@@ -1839,55 +1827,6 @@ class RenkoMFIMSSBot:
                         await st._enter_short(action[1])
                     elif action[0] == "dca_add":
                         await st._dca_add(action[1])
-                    elif action[0] == "cancel_tp_limit":
-                        if st._tp_limit_order_id:
-                            try:
-                                await asyncio.wait_for(
-                                    st.ctx.orders.cancel_order(st._tp_limit_order_id),
-                                    timeout=5.0)
-                                print(f"[{sym}] TP limit order {st._tp_limit_order_id} cancelled")
-                            except Exception as e:
-                                print(f"[{sym}] TP limit cancel failed: {e}")
-                            st._tp_limit_order_id = None
-                            st._tp_limit_price = None
-                    elif action[0] == "tp_limit":
-                        now_str = datetime.now(ET).strftime("%H:%M:%S")
-                        try:
-                            contract_id = st.ctx.instrument_info.id
-                            avg_price = st.entry_price
-                            size = st.contracts_held
-                            if avg_price and size > 0:
-                                fees = FEE_PER_CONTRACT * size
-                                required_raw = DCA_TP_DOLLARS + fees
-                                tick_size = MINTICK_VALUES.get(sym, 0.25)
-                                if st.position == 1:
-                                    limit_price = avg_price + required_raw / (st.pv * size)
-                                    limit_price = math.ceil(limit_price / tick_size) * tick_size
-                                    side = 1
-                                else:
-                                    limit_price = avg_price - required_raw / (st.pv * size)
-                                    limit_price = math.floor(limit_price / tick_size) * tick_size
-                                    side = 0
-                                response = await asyncio.wait_for(
-                                    st.ctx.orders.place_limit_order(
-                                        contract_id=contract_id, side=side,
-                                        size=size, limit_price=limit_price),
-                                    timeout=15.0)
-                                if response.success:
-                                    st._tp_limit_order_id = response.orderId
-                                    st._tp_limit_price = limit_price
-                                    dir_str = "LONG" if st.position == 1 else "SHORT"
-                                    print(f"[{now_str}] [{sym} TP-LIMIT] {dir_str} x{size} "
-                                          f"limit @ {limit_price:.2f} (avg entry: {avg_price:.2f}, "
-                                          f"fees: ${fees:.2f}, target net: ${DCA_TP_DOLLARS})")
-                                else:
-                                    print(f"[{now_str}] [{sym} TP-LIMIT] Order failed: {response}")
-                            else:
-                                print(f"[{now_str}] [{sym} TP-LIMIT] No position tracked locally")
-                        except asyncio.TimeoutError:
-                            print(f"[{now_str}] [{sym} TP-LIMIT] Timeout placing limit order")
-                        except Exception as e:
-                            print(f"[{now_str}] [{sym} TP-LIMIT] Error: {type(e).__name__}: {e}")
                     elif action[0] == "flatten":
                         reason = action[2] if len(action) > 2 else "signal"
                         await st._flatten(action[1], reason)
