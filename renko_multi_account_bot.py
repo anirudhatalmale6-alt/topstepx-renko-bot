@@ -1124,6 +1124,47 @@ class AccountConnection:
         except Exception:
             pass
 
+    async def _adopt_phantom_position(self, expected_side, price, features, rl_idx, rl_params, qty):
+        """After order timeout, check if platform actually filled the order."""
+        try:
+            await asyncio.sleep(2.0)
+            positions = await asyncio.wait_for(
+                self.suite.client.search_open_positions(), timeout=8.0)
+            contract_id = self.ctx.instrument_info.id
+            for p in positions:
+                if p.contractId == contract_id and p.size > 0:
+                    direction = "LONG" if expected_side == 1 else "SHORT"
+                    self.position = expected_side
+                    self.contracts_held = p.size
+                    self.entry_price = p.averagePrice
+                    self._entry_prices = [p.averagePrice]
+                    self._dca_done = False
+                    self.entry_time = time.time()
+                    self.entry_features = features
+                    self._rl_action_idx = rl_idx
+                    self._rl_params = rl_params
+                    self.active_sl_pts = rl_params["sl_pts"]
+                    self.trade_mae = 0.0
+                    self.trade_mfe = 0.0
+                    self._tp_lock_pnl = 0.0
+                    self._trail_profit_active = False
+                    self._trail_profit_peak = 0.0
+                    self._trail_profit_floor = 0.0
+                    now = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now}] [{self.name} PHANTOM-ADOPT] {direction} x{p.size} "
+                          f"@ {p.averagePrice:.2f} — order timed out but platform filled it")
+                    threading.Thread(target=send_signals, args=(
+                        self.tg_token, self.tg_chat, self.tg_keys,
+                        direction, self.symbol, p.averagePrice, p.size),
+                        kwargs={"ntfy_topic": self.ntfy_topic, "tp_webhooks": self.tp_webhooks},
+                        daemon=True).start()
+                    return True
+            print(f"[{self.name} PHANTOM-CHECK] No position found — order truly failed")
+            return False
+        except Exception as e:
+            print(f"[{self.name} PHANTOM-CHECK] Error: {e}")
+            return False
+
     async def _verify_position_on_connect(self):
         """After restart, verify restored position actually exists on the platform."""
         if not self.suite or self.position == 0:
@@ -1197,10 +1238,12 @@ class AccountConnection:
         await self._ensure_flat()
         qty = self.base_qty
         now = datetime.now(ET).strftime("%H:%M:%S")
+        dca_t = rl_params.get("dca_threshold", DCA_ADD_THRESHOLD)
+        dca_str = f"DCA at -${abs(dca_t):.0f}" if dca_t is not None else "no DCA"
         print(f"[{now}] [{self.name}] >>> LONG x{qty} @ {price:.2f} | "
               f"TP=${DCA_TP_DOLLARS} | ({rl_params['label']}) | "
               f"trail=${rl_params['trail_activate']:.0f}/{100*rl_params['trail_pullback']:.0f}% | "
-              f"DCA at -${abs(DCA_ADD_THRESHOLD)} | P&L: ${self.live_pnl:.2f}")
+              f"{dca_str} | P&L: ${self.live_pnl:.2f}")
         try:
             response = await asyncio.wait_for(asyncio.shield(
                 self.ctx.orders.place_market_order(
@@ -1234,8 +1277,11 @@ class AccountConnection:
                 print(f"[{self.name}] Order FAILED: {response}")
                 return False
         except asyncio.TimeoutError:
-            print(f"[{self.name}] Order TIMEOUT")
-            return False
+            print(f"[{self.name}] Order TIMEOUT — checking platform for phantom fill...")
+            adopted = await self._adopt_phantom_position(
+                expected_side=1, price=price, features=features,
+                rl_idx=rl_idx, rl_params=rl_params, qty=qty)
+            return adopted
         except Exception as e:
             print(f"[{self.name}] Order ERROR: {e}")
             return False
@@ -1249,10 +1295,12 @@ class AccountConnection:
         await self._ensure_flat()
         qty = self.base_qty
         now = datetime.now(ET).strftime("%H:%M:%S")
+        dca_t = rl_params.get("dca_threshold", DCA_ADD_THRESHOLD)
+        dca_str = f"DCA at -${abs(dca_t):.0f}" if dca_t is not None else "no DCA"
         print(f"[{now}] [{self.name}] >>> SHORT x{qty} @ {price:.2f} | "
               f"TP=${DCA_TP_DOLLARS} | ({rl_params['label']}) | "
               f"trail=${rl_params['trail_activate']:.0f}/{100*rl_params['trail_pullback']:.0f}% | "
-              f"DCA at -${abs(DCA_ADD_THRESHOLD)} | P&L: ${self.live_pnl:.2f}")
+              f"{dca_str} | P&L: ${self.live_pnl:.2f}")
         try:
             response = await asyncio.wait_for(asyncio.shield(
                 self.ctx.orders.place_market_order(
@@ -1286,8 +1334,11 @@ class AccountConnection:
                 print(f"[{self.name}] Order FAILED: {response}")
                 return False
         except asyncio.TimeoutError:
-            print(f"[{self.name}] Order TIMEOUT")
-            return False
+            print(f"[{self.name}] Order TIMEOUT — checking platform for phantom fill...")
+            adopted = await self._adopt_phantom_position(
+                expected_side=-1, price=price, features=features,
+                rl_idx=rl_idx, rl_params=rl_params, qty=qty)
+            return adopted
         except Exception as e:
             print(f"[{self.name}] Order ERROR: {e}")
             return False
