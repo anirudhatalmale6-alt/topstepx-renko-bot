@@ -170,6 +170,8 @@ POINT_VALUES = {
 WATCHDOG_TIMEOUT = 300
 TICK_HEALTH_TIMEOUT = 90
 
+SHARED_SIGNAL_PATH = "/home/ec2-user/shared_mss_signal.json"
+
 
 def in_session() -> bool:
     now = datetime.now(ET)
@@ -680,7 +682,7 @@ class ParamRL:
 class SymbolState:
     def __init__(self, symbol: str, base_qty: int, ntfy_topic: str,
                  tg_token: str, tg_chat: str, tg_keys: list,
-                 tp_webhooks: list = None):
+                 tp_webhooks: list = None, signal_primary: bool = False):
         self.symbol = symbol
         self.base_qty = base_qty
         self.ntfy_topic = ntfy_topic
@@ -689,6 +691,7 @@ class SymbolState:
         self.tg_keys = tg_keys
         self.tp_webhooks = tp_webhooks or []
         self.pv = POINT_VALUES.get(symbol, 20.0)
+        self._signal_primary = signal_primary
 
         self.renko = RenkoBrickBuilder(BRICK_SIZE)
         self.candles = CandleBuilder(CANDLE_SECONDS)
@@ -1228,6 +1231,14 @@ class SymbolState:
                         if should_enter:
                             self._pending_mss = None
                             self.mss.reset()
+                            if self._signal_primary:
+                                try:
+                                    tmp = SHARED_SIGNAL_PATH + ".tmp"
+                                    with open(tmp, "w") as f:
+                                        json.dump({"pending_mss": None, "ts": time.time(), "price": price}, f)
+                                    os.replace(tmp, SHARED_SIGNAL_PATH)
+                                except Exception:
+                                    pass
                             actions.append(("enter_short" if direction == "SHORT" else "enter_long", price))
                             self._prev_brick_dir = brick["direction"]
                             return actions
@@ -1246,19 +1257,55 @@ class SymbolState:
                 print(f"[{now_str}] [{self.symbol} DAILY-LIMIT] "
                       f"daily loss ${self.daily_loss:.0f} >= ${DAILY_LOSS_LIMIT:.0f} — no new entries")
                 self._pending_mss = None
-            else:
+            elif self._signal_primary:
                 mss_signal = self.mss.check(price)
                 if mss_signal and mss_signal != self._pending_mss:
                     self._pending_mss = mss_signal
                     now_str = datetime.now(ET).strftime("%H:%M:%S")
+                    try:
+                        tmp = SHARED_SIGNAL_PATH + ".tmp"
+                        with open(tmp, "w") as f:
+                            json.dump({"pending_mss": mss_signal, "ts": time.time(), "price": price}, f)
+                        os.replace(tmp, SHARED_SIGNAL_PATH)
+                    except Exception:
+                        pass
                     if mss_signal == "bearish":
                         print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BEARISH "
                               f"@ {price:.2f} broke SL {self.mss.swing_lows[-1]:.2f} "
-                              f"| waiting for MFI overbought -> SHORT")
+                              f"| waiting for MFI overbought -> SHORT [PRIMARY]")
                     else:
                         print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BULLISH "
                               f"@ {price:.2f} broke SH {self.mss.swing_highs[-1]:.2f} "
-                              f"| waiting for MFI oversold -> LONG")
+                              f"| waiting for MFI oversold -> LONG [PRIMARY]")
+            else:
+                try:
+                    with open(SHARED_SIGNAL_PATH, "r") as f:
+                        sig = json.load(f)
+                    new_mss = sig.get("pending_mss")
+                    if new_mss and new_mss != self._pending_mss and (time.time() - sig.get("ts", 0)) < 300:
+                        self._pending_mss = new_mss
+                        now_str = datetime.now(ET).strftime("%H:%M:%S")
+                        if new_mss == "bearish":
+                            print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BEARISH "
+                                  f"@ {sig.get('price', 0):.2f} "
+                                  f"| waiting for MFI overbought -> SHORT [FOLLOW]")
+                        else:
+                            print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BULLISH "
+                                  f"@ {sig.get('price', 0):.2f} "
+                                  f"| waiting for MFI oversold -> LONG [FOLLOW]")
+                except Exception:
+                    mss_signal = self.mss.check(price)
+                    if mss_signal and mss_signal != self._pending_mss:
+                        self._pending_mss = mss_signal
+                        now_str = datetime.now(ET).strftime("%H:%M:%S")
+                        if mss_signal == "bearish":
+                            print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BEARISH "
+                                  f"@ {price:.2f} broke SL {self.mss.swing_lows[-1]:.2f} "
+                                  f"| waiting for MFI overbought -> SHORT [FALLBACK]")
+                        else:
+                            print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BULLISH "
+                                  f"@ {price:.2f} broke SH {self.mss.swing_highs[-1]:.2f} "
+                                  f"| waiting for MFI oversold -> LONG [FALLBACK]")
 
         return actions
 
@@ -1366,12 +1413,14 @@ class SymbolState:
 class RenkoMFIMSSBot:
     def __init__(self, symbol_configs: list, tg_token: str = "",
                  tg_chat: str = "", tg_keys: list = None,
-                 tp_webhooks: list = None, peer_dirs: list = None):
+                 tp_webhooks: list = None, peer_dirs: list = None,
+                 signal_primary: bool = False):
         self.tg_token = tg_token
         self.tg_chat = tg_chat
         self.tg_keys = tg_keys or []
         self.tp_webhooks = tp_webhooks or []
         self.peer_dirs = peer_dirs or []
+        self.signal_primary = signal_primary
         self.running = True
         self.suite = None
         self.states = {}
@@ -1387,7 +1436,8 @@ class RenkoMFIMSSBot:
                 symbol=sym, base_qty=cfg["qty"],
                 ntfy_topic=cfg.get("ntfy_topic", ""),
                 tg_token=tg_token, tg_chat=tg_chat,
-                tg_keys=self.tg_keys, tp_webhooks=self.tp_webhooks)
+                tg_keys=self.tg_keys, tp_webhooks=self.tp_webhooks,
+                signal_primary=signal_primary)
 
     def _symbols_list(self) -> list:
         return list(self.states.keys())
@@ -1940,6 +1990,7 @@ def main():
     parser.add_argument("--tick-interval", type=int, default=1)
     parser.add_argument("--tp-webhooks", default="", help="Comma-separated TradersPost URLs")
     parser.add_argument("--peer-dirs", default="", help="Comma-separated peer bot directories for state sync")
+    parser.add_argument("--signal-primary", action="store_true", help="This bot is the MSS signal authority")
     args = parser.parse_args()
 
     keys = [k.strip() for k in args.tg_keys.split(",") if k.strip()] if args.tg_keys else []
@@ -2003,6 +2054,7 @@ def main():
             tg_keys=keys,
             tp_webhooks=tp_webhooks,
             peer_dirs=peer_dirs,
+            signal_primary=args.signal_primary,
         )
         current_bot = bot
 
