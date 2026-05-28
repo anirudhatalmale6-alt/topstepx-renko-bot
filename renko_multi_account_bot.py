@@ -618,6 +618,7 @@ class SignalEngine:
         self._pending_bb_entry = None  # {"direction": "LONG"/"SHORT", "features": ..., "ts": ...}
         self._bb_candle_closes = []
         self._max_bb_candle_history = 500
+        self._mss_level = None  # price level where MSS triggered
 
         self.brick_closes = []
         self.brick_opens = []
@@ -689,7 +690,7 @@ class SignalEngine:
 
     def tick(self, price, ts=None):
         """Process tick and return list of signal actions.
-        Flow: MSS shift -> MFI exhaustion -> pending BB entry -> price touches BB band -> enter
+        Flow: MSS shift (record level) -> BB confirms level as S/R -> MFI zone -> BB band touch -> enter
         """
         if ts is None:
             ts = time.time()
@@ -724,33 +725,18 @@ class SignalEngine:
                 mfi_str = f"MFI={self.mfi_value:.1f}" if self.mfi_value is not None else "MFI warming"
                 bb = self._calc_bb()
                 bb_str = f"BB[{bb[2]:.1f}/{bb[1]:.1f}/{bb[0]:.1f}]" if bb else "BB warming"
-                pend_str = f" | PENDING {self._pending_bb_entry['direction']}" if self._pending_bb_entry else ""
+                if self._pending_bb_entry:
+                    pend_str = f" | PENDING {self._pending_bb_entry['direction']}"
+                elif self._pending_mss:
+                    pend_str = f" | MSS {self._pending_mss['dir'].upper()} lvl={self._pending_mss['level']:.2f}"
+                else:
+                    pend_str = ""
                 print(f"[{now_str}] [{self.symbol} BRICK] {brick['direction'].upper()} "
                       f"{brick['open']:.2f} -> {brick['close']:.2f} "
                       f"(consecutive: {self.renko.consecutive_count()}) | {mfi_str} | {bb_str}{pend_str}")
 
-                # MFI confirms exhaustion -> set pending BB entry (wait for price to touch BB band)
-                if self._restart_cooldown_done and mfi_signal and in_trade_session():
-                    direction = "LONG" if mfi_signal == "oversold" else "SHORT"
-                    matches_mss = ((self._pending_mss == "bullish" and direction == "LONG") or
-                                   (self._pending_mss == "bearish" and direction == "SHORT"))
-                    if matches_mss:
-                        features = self.extract_features()
-                        should_enter, reason = self.ml.should_enter(features)
-                        print(f"[{now_str}] [{self.symbol} MFI-CONFIRM] {mfi_signal.upper()} "
-                              f"-> {direction} | MSS {self._pending_mss} active | {reason}")
-                        if should_enter:
-                            self._pending_bb_entry = {
-                                "direction": direction, "features": features,
-                                "ts": time.time(), "mss": self._pending_mss,
-                            }
-                            self._pending_mss = None
-                            self.mss.reset()
-                            print(f"[{now_str}] [{self.symbol} BB-WAIT] {direction} armed — "
-                                  f"waiting for price to touch {'upper' if direction == 'SHORT' else 'lower'} BB")
-                    else:
-                        print(f"[{now_str}] [{self.symbol} MFI-DOT] {mfi_signal.upper()} "
-                              f"-> {direction} | no matching MSS pending")
+                if mfi_signal:
+                    print(f"[{now_str}] [{self.symbol} MFI-CROSS] {mfi_signal.upper()} | MFI={self.mfi_value:.1f}")
 
                 self._prev_brick_dir = brick["direction"]
 
@@ -781,7 +767,8 @@ class SignalEngine:
         self.mss.update_swings(self.renko.bricks)
         if in_trade_session() and self._restart_cooldown_done:
             mss_signal = self.mss.check(price)
-            if mss_signal and mss_signal != self._pending_mss:
+            cur_dir = self._pending_mss["dir"] if self._pending_mss else None
+            if mss_signal and mss_signal != cur_dir:
                 # Cancel pending BB entry if MSS flips opposite
                 if self._pending_bb_entry:
                     pend_dir = self._pending_bb_entry["direction"]
@@ -792,14 +779,59 @@ class SignalEngine:
                         print(f"[{now_str}] [{self.symbol} BB-CANCEL] {pend_dir} pending cancelled — "
                               f"MSS flipped to {mss_signal}")
                         self._pending_bb_entry = None
-                self._pending_mss = mss_signal
-                now_str = datetime.now(ET).strftime("%H:%M:%S")
                 if mss_signal == "bearish":
+                    mss_level = self.mss.swing_lows[-1] if self.mss.swing_lows else price
+                    self._pending_mss = {"dir": "bearish", "level": mss_level}
+                    self._mss_level = mss_level
+                    now_str = datetime.now(ET).strftime("%H:%M:%S")
                     print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BEARISH @ {price:.2f} "
-                          f"broke SL {self.mss.swing_lows[-1]:.2f} | waiting for MFI overbought -> SHORT")
+                          f"broke SL {mss_level:.2f} | waiting for BB below {mss_level:.2f} + MFI overbought")
                 else:
+                    mss_level = self.mss.swing_highs[-1] if self.mss.swing_highs else price
+                    self._pending_mss = {"dir": "bullish", "level": mss_level}
+                    self._mss_level = mss_level
+                    now_str = datetime.now(ET).strftime("%H:%M:%S")
                     print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BULLISH @ {price:.2f} "
-                          f"broke SH {self.mss.swing_highs[-1]:.2f} | waiting for MFI oversold -> LONG")
+                          f"broke SH {mss_level:.2f} | waiting for BB above {mss_level:.2f} + MFI oversold")
+
+        # Continuous check: MSS + BB position + MFI zone -> arm pending BB entry
+        if (self._pending_mss and not self._pending_bb_entry
+                and self._restart_cooldown_done and in_trade_session()):
+            bb = self._calc_bb()
+            if bb and self.mfi_value is not None:
+                upper, middle, lower = bb
+                mss_dir = self._pending_mss["dir"]
+                mss_lvl = self._pending_mss["level"]
+                if mss_dir == "bearish" and middle < mss_lvl and self.mfi_value >= MFI_OVERBOUGHT:
+                    features = self.extract_features()
+                    should_enter, reason = self.ml.should_enter(features)
+                    now_str = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now_str}] [{self.symbol} CONFIRMED] SHORT — BB mid {middle:.2f} < MSS {mss_lvl:.2f} "
+                          f"(resistance) + MFI {self.mfi_value:.1f} overbought | {reason}")
+                    if should_enter:
+                        self._pending_bb_entry = {
+                            "direction": "SHORT", "features": features,
+                            "ts": time.time(), "mss_level": mss_lvl,
+                        }
+                        self._pending_mss = None
+                        self.mss.reset()
+                        print(f"[{now_str}] [{self.symbol} BB-WAIT] SHORT armed — "
+                              f"waiting for price to touch upper BB {upper:.2f}")
+                elif mss_dir == "bullish" and middle > mss_lvl and self.mfi_value <= MFI_OVERSOLD:
+                    features = self.extract_features()
+                    should_enter, reason = self.ml.should_enter(features)
+                    now_str = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now_str}] [{self.symbol} CONFIRMED] LONG — BB mid {middle:.2f} > MSS {mss_lvl:.2f} "
+                          f"(support) + MFI {self.mfi_value:.1f} oversold | {reason}")
+                    if should_enter:
+                        self._pending_bb_entry = {
+                            "direction": "LONG", "features": features,
+                            "ts": time.time(), "mss_level": mss_lvl,
+                        }
+                        self._pending_mss = None
+                        self.mss.reset()
+                        print(f"[{now_str}] [{self.symbol} BB-WAIT] LONG armed — "
+                              f"waiting for price to touch lower BB {lower:.2f}")
 
         return signals
 
@@ -811,6 +843,7 @@ class SignalEngine:
             "renko_bricks": self.renko.bricks[-50:],
             "prev_brick_dir": self._prev_brick_dir,
             "pending_mss": self._pending_mss,
+            "mss_level": self._mss_level,
             "pending_bb_entry": self._pending_bb_entry,
             "bb_candle_closes": self._bb_candle_closes[-200:],
             "brick_closes": self.brick_closes[-200:],
@@ -831,7 +864,12 @@ class SignalEngine:
             self.renko._last_close = state.get("renko_last_close")
             self.renko._last_direction = state.get("renko_last_dir")
         self._prev_brick_dir = state.get("prev_brick_dir")
-        self._pending_mss = state.get("pending_mss")
+        raw_mss = state.get("pending_mss")
+        if isinstance(raw_mss, str):
+            self._pending_mss = {"dir": raw_mss, "level": 0} if raw_mss else None
+        else:
+            self._pending_mss = raw_mss
+        self._mss_level = state.get("mss_level")
         self._pending_bb_entry = state.get("pending_bb_entry")
         self._bb_candle_closes = state.get("bb_candle_closes", [])
         self.brick_closes = state.get("brick_closes", [])
@@ -854,7 +892,8 @@ class SignalEngine:
             self.bb_candles.candles = bch
         print(f"  [{self.symbol}] Signal engine restored: {len(self.renko.bricks)} bricks, "
               f"MFI={round(self.mfi_value or 0, 1)}, BB candles={len(self._bb_candle_closes)}, "
-              f"pending_mss={self._pending_mss}, pending_bb={self._pending_bb_entry is not None}")
+              f"pending_mss={self._pending_mss['dir'] if self._pending_mss else None}, "
+              f"mss_level={self._mss_level}, pending_bb={self._pending_bb_entry is not None}")
 
 
 # ============================================================
