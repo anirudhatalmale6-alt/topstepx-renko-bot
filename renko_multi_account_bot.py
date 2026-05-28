@@ -162,6 +162,8 @@ MSS_WARMUP_BRICKS = 15
 
 BB_LENGTH = 20
 BB_MULT = 2.0
+BB_SLOPE_LOOKBACK = 5
+BB_SLOPE_MAX = 6.0
 
 
 def in_session():
@@ -684,6 +686,18 @@ class SignalEngine:
         lower = middle - BB_MULT * std
         return upper, middle, lower
 
+    def _bb_slope(self):
+        """BB middle movement over last BB_SLOPE_LOOKBACK candles. Returns abs change or None."""
+        n = len(self._bb_candle_closes)
+        need = BB_LENGTH + BB_SLOPE_LOOKBACK
+        if n < need:
+            return None
+        cur = self._bb_candle_closes[-BB_LENGTH:]
+        old = self._bb_candle_closes[-(BB_LENGTH + BB_SLOPE_LOOKBACK):-BB_SLOPE_LOOKBACK]
+        mid_now = sum(cur) / BB_LENGTH
+        mid_old = sum(old) / BB_LENGTH
+        return mid_now - mid_old
+
     def extract_features(self):
         return self.ml.extract_features(price=self.last_price, renko=self.renko)
 
@@ -724,10 +738,12 @@ class SignalEngine:
                 mfi_str = f"MFI={self.mfi_value:.1f}" if self.mfi_value is not None else "MFI warming"
                 bb = self._calc_bb()
                 bb_str = f"BB[{bb[2]:.1f}/{bb[1]:.1f}/{bb[0]:.1f}]" if bb else "BB warming"
+                slope = self._bb_slope()
+                slope_str = f" s={slope:+.1f}" if slope is not None else ""
                 pend_str = f" | PENDING {self._pending_bb_entry['direction']}" if self._pending_bb_entry else ""
                 print(f"[{now_str}] [{self.symbol} BRICK] {brick['direction'].upper()} "
                       f"{brick['open']:.2f} -> {brick['close']:.2f} "
-                      f"(consecutive: {self.renko.consecutive_count()}) | {mfi_str} | {bb_str}{pend_str}")
+                      f"(consecutive: {self.renko.consecutive_count()}) | {mfi_str} | {bb_str}{slope_str}{pend_str}")
 
                 if self._restart_cooldown_done and mfi_signal and in_trade_session():
                     direction = "LONG" if mfi_signal == "oversold" else "SHORT"
@@ -736,9 +752,12 @@ class SignalEngine:
                     if matches_mss:
                         features = self.extract_features()
                         should_enter, reason = self.ml.should_enter(features)
+                        bb_slope = self._bb_slope()
+                        slope_str = f"slope={bb_slope:+.1f}" if bb_slope is not None else "slope=?"
+                        slope_ok = bb_slope is None or abs(bb_slope) <= BB_SLOPE_MAX
                         print(f"[{now_str}] [{self.symbol} MFI-CONFIRM] {mfi_signal.upper()} "
-                              f"-> {direction} | MSS {self._pending_mss} active | {reason}")
-                        if should_enter:
+                              f"-> {direction} | MSS {self._pending_mss} | {slope_str} | {reason}")
+                        if should_enter and slope_ok:
                             self._pending_bb_entry = {
                                 "direction": direction, "features": features,
                                 "ts": time.time(), "mss": self._pending_mss,
@@ -747,6 +766,9 @@ class SignalEngine:
                             self.mss.reset()
                             print(f"[{now_str}] [{self.symbol} BB-WAIT] {direction} armed — "
                                   f"waiting for price to touch {'upper' if direction == 'SHORT' else 'lower'} BB")
+                        elif not slope_ok:
+                            print(f"[{now_str}] [{self.symbol} BB-SLOPE-BLOCK] {direction} blocked — "
+                                  f"BB too steep ({bb_slope:+.1f} pts > {BB_SLOPE_MAX})")
                     elif mfi_signal:
                         print(f"[{now_str}] [{self.symbol} MFI-DOT] {mfi_signal.upper()} "
                               f"-> {direction} | no matching MSS pending")
