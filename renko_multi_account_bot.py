@@ -146,6 +146,16 @@ POINT_VALUES = {
 WATCHDOG_TIMEOUT = 300
 TICK_HEALTH_TIMEOUT = 90
 
+RECONNECT_COOLDOWN_BASE = 5
+RECONNECT_COOLDOWN_MAX = 120
+RECONNECT_COOLDOWN_OK = 30
+FROZEN_FEED_THRESHOLD = 180
+STALE_DATA_THRESHOLD = 600
+HEARTBEAT_INTERVAL = 1800
+POSITION_POLL_INTERVAL = 30
+PLATFORM_FLAT_THRESHOLD = 3
+MAX_BRICKS_PER_FEED = 10000
+
 MSS_SWING_LOOKBACK = 5
 MSS_MIN_SWING_PTS = 2.0
 MSS_WARMUP_BRICKS = 15
@@ -284,32 +294,39 @@ class RenkoBrickBuilder:
             self._last_close = round(price / self.brick_size) * self.brick_size
             return new_bricks
         ref = self._last_close
+        iters = 0
         if self._last_direction == "green" or self._last_direction is None:
-            while price >= ref + self.brick_size:
+            while price >= ref + self.brick_size and iters < MAX_BRICKS_PER_FEED:
+                iters += 1
                 new_bricks.append({"open": ref, "close": ref + self.brick_size,
                                    "direction": "green", "time": time.time()})
                 ref += self.brick_size
                 self._last_direction = "green"
             if not new_bricks:
                 reversal_ref = self._last_close
-                while price <= reversal_ref - 2 * self.brick_size:
+                while price <= reversal_ref - 2 * self.brick_size and iters < MAX_BRICKS_PER_FEED:
+                    iters += 1
                     new_bricks.append({"open": reversal_ref, "close": reversal_ref - self.brick_size,
                                        "direction": "red", "time": time.time()})
                     reversal_ref -= self.brick_size
                     self._last_direction = "red"
         elif self._last_direction == "red":
-            while price <= ref - self.brick_size:
+            while price <= ref - self.brick_size and iters < MAX_BRICKS_PER_FEED:
+                iters += 1
                 new_bricks.append({"open": ref, "close": ref - self.brick_size,
                                    "direction": "red", "time": time.time()})
                 ref -= self.brick_size
                 self._last_direction = "red"
             if not new_bricks:
                 reversal_ref = self._last_close
-                while price >= reversal_ref + 2 * self.brick_size:
+                while price >= reversal_ref + 2 * self.brick_size and iters < MAX_BRICKS_PER_FEED:
+                    iters += 1
                     new_bricks.append({"open": reversal_ref, "close": reversal_ref + self.brick_size,
                                        "direction": "green", "time": time.time()})
                     reversal_ref += self.brick_size
                     self._last_direction = "green"
+        if iters >= MAX_BRICKS_PER_FEED:
+            print(f"[RENKO] WARNING: hit safety cap {MAX_BRICKS_PER_FEED} bricks — price={price}")
         if new_bricks:
             self._last_close = new_bricks[-1]["close"]
             self.bricks.extend(new_bricks)
@@ -889,6 +906,32 @@ class AccountConnection:
         self._pnl_session_day = None
 
         self.connected = False
+        self.config_file = None
+        self._last_price_change_time = time.time()
+        self._last_known_price = None
+        self._last_position_poll = 0
+        self._platform_flat_streak = 0
+
+    def _update_accounts_json(self):
+        """Write back new account_name to accounts.json after auto-switch."""
+        if not self.config_file or not os.path.exists(self.config_file):
+            return
+        try:
+            with open(self.config_file, "r") as f:
+                accounts = json.load(f)
+            for acct in accounts:
+                if acct.get("name") == self.name:
+                    if acct.get("account_name") != self.account_name:
+                        old = acct["account_name"]
+                        acct["account_name"] = self.account_name
+                        tmp = self.config_file + ".tmp"
+                        with open(tmp, "w") as f:
+                            json.dump(accounts, f, indent=2)
+                        os.replace(tmp, self.config_file)
+                        print(f"[{self.name}] accounts.json updated: {old} -> {self.account_name}")
+                    break
+        except Exception as e:
+            print(f"[{self.name}] accounts.json update error: {e}")
 
     async def connect(self, symbols):
         from project_x_py import TradingSuite
@@ -915,6 +958,7 @@ class AccountConnection:
                     os.environ["PROJECT_X_ACCOUNT_NAME"] = new_acct
                     self.suite = await TradingSuite.create(
                         instruments=symbols, timeframes=["1sec"], initial_days=1)
+                    self._update_accounts_json()
                 else:
                     raise
             else:
@@ -923,6 +967,9 @@ class AccountConnection:
         self.ctx = self.suite[self.symbol]
         self._register_handlers()
         self.connected = True
+        self._last_price_change_time = time.time()
+        self._last_known_price = None
+        self._platform_flat_streak = 0
         print(f"[{self.name}] Connected: {self.account_name} | contract: {self.ctx.instrument_info.id}")
 
         await self._verify_position_on_connect()
@@ -981,6 +1028,58 @@ class AccountConnection:
 
         conn.on("GatewayUserPosition", on_position_event)
         conn.on("PositionUpdate", on_position_event)
+
+        def on_gateway_logout(*args):
+            now_str = datetime.now(ET).strftime("%H:%M:%S")
+            print(f"[{now_str}] [{self.name} WS] GatewayLogout received")
+            self._gateway_logout = True
+
+        conn.on("GatewayLogout", on_gateway_logout)
+        self._gateway_logout = False
+
+    async def reconcile_position(self):
+        """Periodic safety check: verify bot position matches platform."""
+        now_ts = time.time()
+        if now_ts - self._last_position_poll < POSITION_POLL_INTERVAL:
+            return
+        self._last_position_poll = now_ts
+        if not self.suite or not self.ctx:
+            return
+        try:
+            positions = await asyncio.wait_for(
+                self.suite.client.search_open_positions(), timeout=8.0)
+            contract_id = self.ctx.instrument_info.id
+            real_pos = 0
+            for p in positions:
+                if p.contractId == contract_id and p.size > 0:
+                    real_pos = p.size
+                    break
+            if self.position != 0 and real_pos == 0:
+                self._platform_flat_streak += 1
+                if self._platform_flat_streak >= PLATFORM_FLAT_THRESHOLD:
+                    direction = "LONG" if self.position == 1 else "SHORT"
+                    price = getattr(self, '_last_price', 0.0)
+                    if self.position == 1:
+                        pnl_est = (price - self.entry_price) * self.pv * self.contracts_held
+                    else:
+                        pnl_est = (self.entry_price - price) * self.pv * self.contracts_held
+                    now_str = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now_str}] [{self.name} POS-SYNC] Platform closed {direction} "
+                          f"externally. Est PnL: ${pnl_est:+.2f}")
+                    self.live_pnl += pnl_est
+                    self.position = 0
+                    self.contracts_held = 0
+                    self.entry_price = 0.0
+                    self._platform_flat_streak = 0
+                    threading.Thread(target=send_telegram,
+                                     args=(self.tg_token, self.tg_chat,
+                                           f"SYNC|{self.name} {direction} closed externally. "
+                                           f"PnL: ${pnl_est:+.2f}"),
+                                     daemon=True).start()
+            else:
+                self._platform_flat_streak = 0
+        except Exception:
+            pass
 
     async def _sync_entry_price_from_platform(self):
         if not self.suite or self.position == 0:
@@ -1079,9 +1178,9 @@ class AccountConnection:
               f"trail=${rl_params['trail_activate']:.0f}/{100*rl_params['trail_pullback']:.0f}% | "
               f"DCA at -${abs(DCA_ADD_THRESHOLD)} | P&L: ${self.live_pnl:.2f}")
         try:
-            response = await asyncio.wait_for(
+            response = await asyncio.wait_for(asyncio.shield(
                 self.ctx.orders.place_market_order(
-                    contract_id=self.ctx.instrument_info.id, side=0, size=qty),
+                    contract_id=self.ctx.instrument_info.id, side=0, size=qty)),
                 timeout=15.0)
             if response.success:
                 self.position = 1
@@ -1131,9 +1230,9 @@ class AccountConnection:
               f"trail=${rl_params['trail_activate']:.0f}/{100*rl_params['trail_pullback']:.0f}% | "
               f"DCA at -${abs(DCA_ADD_THRESHOLD)} | P&L: ${self.live_pnl:.2f}")
         try:
-            response = await asyncio.wait_for(
+            response = await asyncio.wait_for(asyncio.shield(
                 self.ctx.orders.place_market_order(
-                    contract_id=self.ctx.instrument_info.id, side=1, size=qty),
+                    contract_id=self.ctx.instrument_info.id, side=1, size=qty)),
                 timeout=15.0)
             if response.success:
                 self.position = -1
@@ -1179,9 +1278,9 @@ class AccountConnection:
         print(f"[{now}] [{self.name} DCA] {direction} x{qty} @ {price:.2f} | "
               f"Now {self.contracts_held + qty} contracts")
         try:
-            response = await asyncio.wait_for(
+            response = await asyncio.wait_for(asyncio.shield(
                 self.ctx.orders.place_market_order(
-                    contract_id=self.ctx.instrument_info.id, side=side, size=qty),
+                    contract_id=self.ctx.instrument_info.id, side=side, size=qty)),
                 timeout=15.0)
             if response.success:
                 self._entry_prices.append(price)
@@ -1206,10 +1305,13 @@ class AccountConnection:
         pnl_before = self.live_pnl
 
         try:
-            await asyncio.wait_for(
+            await asyncio.wait_for(asyncio.shield(
                 self.ctx.positions.close_position_direct(
-                    contract_id=self.ctx.instrument_info.id),
+                    contract_id=self.ctx.instrument_info.id)),
                 timeout=15.0)
+        except asyncio.TimeoutError:
+            print(f"[{self.name}] CLOSE TIMEOUT — position may still be open!")
+            return
         except Exception as e:
             print(f"[{self.name}] CLOSE ERROR: {e}")
             return
@@ -1373,7 +1475,7 @@ class AccountConnection:
 class MultiAccountBot:
     def __init__(self, accounts_config, symbol, base_qty,
                  tg_token="", tg_chat="", tg_keys=None, tp_webhooks=None,
-                 data_dir="."):
+                 data_dir=".", config_file=None):
         self.symbol = symbol
         self.base_qty = base_qty
         self.tg_token = tg_token
@@ -1382,6 +1484,7 @@ class MultiAccountBot:
         self.tp_webhooks = tp_webhooks or []
         self.running = True
         self.data_dir = data_dir
+        self.config_file = config_file
         self.state_file = os.path.join(data_dir, "bot_state_multi.json")
 
         self.engine = SignalEngine(symbol, data_dir)
@@ -1400,12 +1503,17 @@ class MultiAccountBot:
                 ntfy_topic=acfg.get("ntfy_topic", ""),
                 tp_webhooks=self.tp_webhooks,
             )
+            acc.config_file = config_file
             self.accounts.append(acc)
 
         self.last_tick_time = time.time()
         self.last_real_tick_time = 0.0
-        self._reconnect_count = 0
-        self._max_reconnects = 5
+
+        self._reconnecting = False
+        self._reconnect_failures = 0
+        self._reconnect_cooldown = RECONNECT_COOLDOWN_BASE
+        self._last_reconnect_time = 0
+        self._last_heartbeat = 0
 
     def save_all_state(self):
         try:
@@ -1451,6 +1559,63 @@ class MultiAccountBot:
         print(f"[BOT] Connected {len(connected)}/{len(self.accounts)} accounts")
         if not connected:
             raise RuntimeError("No accounts connected")
+
+    async def _auto_reconnect(self):
+        """Reconnect all accounts with exponential backoff, preserve indicators."""
+        self._reconnecting = True
+        self._last_reconnect_time = time.time()
+        now_str = datetime.now(ET).strftime("%H:%M:%S")
+        print(f"[{now_str}] [RECONNECT] attempt #{self._reconnect_failures + 1}, indicators preserved...")
+        threading.Thread(target=send_telegram,
+                         args=(self.tg_token, self.tg_chat,
+                               f"STATUS|Auto-reconnecting ({now_str} ET)"),
+                         daemon=True).start()
+        for acc in self.accounts:
+            if acc.connected and acc.suite:
+                try:
+                    await acc.suite.disconnect()
+                except Exception:
+                    pass
+                acc.connected = False
+        await asyncio.sleep(2)
+        try:
+            await self.connect_all()
+            self._reconnect_failures = 0
+            self._reconnect_cooldown = RECONNECT_COOLDOWN_OK
+            self.last_real_tick_time = time.time()
+            now_str = datetime.now(ET).strftime("%H:%M:%S")
+            print(f"[{now_str}] [RECONNECT] WebSocket restored")
+            threading.Thread(target=send_telegram,
+                             args=(self.tg_token, self.tg_chat,
+                                   f"STATUS|RECONNECTED ({now_str} ET)"),
+                             daemon=True).start()
+        except Exception as e:
+            self._reconnect_failures += 1
+            self._reconnect_cooldown = min(
+                RECONNECT_COOLDOWN_BASE * (2 ** (self._reconnect_failures - 1)),
+                RECONNECT_COOLDOWN_MAX)
+            now_str = datetime.now(ET).strftime("%H:%M:%S")
+            print(f"[{now_str}] [RECONNECT] Failed (#{self._reconnect_failures}): {e} — "
+                  f"retry in {self._reconnect_cooldown}s")
+        finally:
+            self._reconnecting = False
+
+    def _send_heartbeat(self):
+        now_str = datetime.now(ET).strftime("%H:%M:%S")
+        acct_lines = []
+        for acc in self.accounts:
+            if not acc.connected:
+                acct_lines.append(f"  {acc.name}: DISCONNECTED")
+                continue
+            pos_str = {0: "FLAT", 1: "LONG", -1: "SHORT"}[acc.position]
+            acct_lines.append(f"  {acc.name}: {pos_str} x{acc.contracts_held} | ${acc.live_pnl:.2f}")
+        mfi_str = f"MFI={self.engine.mfi_value:.1f}" if self.engine.mfi_value else "MFI=?"
+        msg = (f"HEARTBEAT|{now_str} ET\n"
+               f"{mfi_str} | Bricks: {len(self.engine.renko.bricks)}\n"
+               + "\n".join(acct_lines))
+        threading.Thread(target=send_telegram,
+                         args=(self.tg_token, self.tg_chat, msg),
+                         daemon=True).start()
 
     async def _broadcast_entry(self, direction, price, features, rl_idx, rl_params):
         """Place entry on ALL accounts simultaneously."""
@@ -1508,7 +1673,9 @@ class MultiAccountBot:
 
         self.last_tick_time = time.time()
         self.last_real_tick_time = time.time()
-        self._reconnect_count = 0
+        self._reconnect_failures = 0
+        self._reconnect_cooldown = RECONNECT_COOLDOWN_BASE
+        self._last_heartbeat = time.time()
         _last_seen_price = None
         _was_in_session = False
         last_save = time.time()
@@ -1531,9 +1698,12 @@ class MultiAccountBot:
 
             if not _was_in_session:
                 self.last_real_tick_time = time.time()
-                self._reconnect_count = 0
+                self._reconnect_failures = 0
+                self._reconnect_cooldown = RECONNECT_COOLDOWN_BASE
                 _last_seen_price = None
                 _was_in_session = True
+                for acc in self.accounts:
+                    acc._last_price_change_time = time.time()
                 print(f"[SESSION] Active — monitoring")
 
             # Get price from first connected account
@@ -1558,7 +1728,9 @@ class MultiAccountBot:
             if price_changed:
                 _last_seen_price = price
                 self.last_real_tick_time = time.time()
-                self._reconnect_count = 0
+                for acc in self.accounts:
+                    acc._last_price_change_time = time.time()
+                    acc._last_known_price = price
 
             # Update all accounts' last price (for WS handler)
             for acc in self.accounts:
@@ -1593,40 +1765,53 @@ class MultiAccountBot:
                         await self._broadcast_entry("SHORT", ep, features, rl_idx, rl_params)
 
             now = time.time()
+
+            # --- Frozen-feed detection ---
+            need_reconnect = False
+            for acc in self.accounts:
+                if not acc.connected:
+                    continue
+                feed_age = now - acc._last_price_change_time
+                if feed_age > FROZEN_FEED_THRESHOLD and in_session() and not in_blackout():
+                    print(f"[{acc.name}] FROZEN FEED: no price change for {feed_age:.0f}s")
+                    need_reconnect = True
+                    break
+                if acc._gateway_logout:
+                    print(f"[{acc.name}] GatewayLogout received — reconnecting")
+                    acc._gateway_logout = False
+                    need_reconnect = True
+                    break
+
+            # --- Stale data bailout ---
             tick_gap = now - self.last_real_tick_time
+            if not need_reconnect and tick_gap > STALE_DATA_THRESHOLD and in_session() and not in_blackout():
+                print(f"[HEALTH] Global stale: no real tick for {tick_gap:.0f}s")
+                need_reconnect = True
 
-            # Health check / reconnect
-            if not price_changed and tick_gap > TICK_HEALTH_TIMEOUT:
-                self._reconnect_count += 1
-                if self._reconnect_count > self._max_reconnects:
-                    print(f"[HEALTH] {self._reconnect_count} reconnects failed — restarting")
-                    self.save_all_state()
-                    import sys
-                    sys.exit(1)
-                print(f"[HEALTH] Stale for {tick_gap:.0f}s — reconnecting "
-                      f"({self._reconnect_count}/{self._max_reconnects})")
-                try:
-                    for acc in self.accounts:
-                        if acc.connected and acc.suite:
-                            try:
-                                await acc.suite.disconnect()
-                            except Exception:
-                                pass
-                    await asyncio.sleep(5)
-                    await self.connect_all()
+            # --- Auto-reconnect with exponential backoff ---
+            if need_reconnect and not self._reconnecting:
+                cooldown_ok = (now - self._last_reconnect_time) > self._reconnect_cooldown
+                if cooldown_ok:
+                    await self._auto_reconnect()
                     _last_seen_price = None
-                    self.last_real_tick_time = time.time()
-                    self.last_tick_time = time.time()
-                    print(f"[HEALTH] Reconnected")
-                except Exception as e:
-                    print(f"[HEALTH] Reconnect failed: {e}")
-                    await asyncio.sleep(10)
-                continue
+                    continue
 
+            # --- Position reconciliation (periodic HTTP poll) ---
+            for acc in self.accounts:
+                if acc.connected and acc.position != 0:
+                    await acc.reconcile_position()
+
+            # --- Heartbeat ---
+            if now - self._last_heartbeat > HEARTBEAT_INTERVAL:
+                self._send_heartbeat()
+                self._last_heartbeat = now
+
+            # --- Periodic save ---
             if now - last_save > 15:
                 self.save_all_state()
                 last_save = now
 
+            # --- Status log ---
             if now - last_status > 300:
                 now_str = datetime.now(ET).strftime("%H:%M:%S")
                 brick_str = (f"Last brick: {self.engine.renko.last_direction() or 'none'} "
@@ -1641,6 +1826,7 @@ class MultiAccountBot:
                     print(f"    [{acc.name}] {pos_str} x{acc.contracts_held} | P&L: ${acc.live_pnl:.2f}")
                 last_status = now
 
+            # --- GC + memory ---
             if now - last_gc > 120:
                 gc.collect()
                 import resource
@@ -1648,6 +1834,7 @@ class MultiAccountBot:
                 print(f"[{datetime.now(ET).strftime('%H:%M:%S')}] [MEM] RSS: {rss_mb:.0f}MB")
                 last_gc = now
 
+            # --- PRAC account auto-switch check ---
             if now - last_acct_check > 60:
                 last_acct_check = now
                 for acc in self.accounts:
@@ -1669,6 +1856,7 @@ class MultiAccountBot:
                     except Exception:
                         pass
 
+            # --- Watchdog ---
             if time.time() - self.last_tick_time > WATCHDOG_TIMEOUT:
                 print(f"[WATCHDOG] No ticks for {time.time() - self.last_tick_time:.0f}s — killing")
                 self.save_all_state()
@@ -1753,6 +1941,7 @@ def main():
             tg_keys=keys,
             tp_webhooks=tp_webhooks,
             data_dir=args.data_dir,
+            config_file=args.config,
         )
         current_bot = bot
 
