@@ -150,6 +150,9 @@ MSS_SWING_LOOKBACK = 5
 MSS_MIN_SWING_PTS = 2.0
 MSS_WARMUP_BRICKS = 15
 
+BB_LENGTH = 20
+BB_MULT = 2.0
+
 
 def in_session():
     now = datetime.now(ET)
@@ -647,6 +650,20 @@ class SignalEngine:
         self.mfi_value = new_mfi
         return signal
 
+    def _calc_bb(self, price):
+        """Calculate Bollinger Bands(20,2) on Renko brick closes.
+        Returns (upper, middle, lower) or None if not enough data."""
+        closes = self.brick_closes
+        if len(closes) < BB_LENGTH:
+            return None
+        recent = closes[-BB_LENGTH:]
+        middle = sum(recent) / BB_LENGTH
+        variance = sum((c - middle) ** 2 for c in recent) / BB_LENGTH
+        std = variance ** 0.5
+        upper = middle + BB_MULT * std
+        lower = middle - BB_MULT * std
+        return upper, middle, lower
+
     def extract_features(self):
         return self.ml.extract_features(price=self.last_price, renko=self.renko)
 
@@ -655,7 +672,7 @@ class SignalEngine:
         Possible actions:
           ("enter_long", price, features, rl_idx, rl_params)
           ("enter_short", price, features, rl_idx, rl_params)
-          ("mfi_exit", direction_to_exit, price)  -- "LONG" or "SHORT"
+          (no MFI exit — trade holds until TP or trailing profit)
         """
         if ts is None:
             ts = time.time()
@@ -682,18 +699,13 @@ class SignalEngine:
                 self._add_brick_data(brick["open"], brick["close"])
                 mfi_signal = self._calc_mfi()
                 mfi_str = f"MFI={self.mfi_value:.1f}" if self.mfi_value is not None else "MFI warming"
+                bb = self._calc_bb(price)
+                bb_str = f"BB[{bb[2]:.1f}/{bb[1]:.1f}/{bb[0]:.1f}]" if bb else "BB warming"
                 print(f"[{now_str}] [{self.symbol} BRICK] {brick['direction'].upper()} "
                       f"{brick['open']:.2f} -> {brick['close']:.2f} "
-                      f"(consecutive: {self.renko.consecutive_count()}) | {mfi_str}")
+                      f"(consecutive: {self.renko.consecutive_count()}) | {mfi_str} | {bb_str}")
 
-                # MFI reversal -> exit signal for all accounts holding opposite direction
-                if mfi_signal:
-                    if mfi_signal == "overbought":
-                        signals.append(("mfi_exit", "LONG", price))
-                    elif mfi_signal == "oversold":
-                        signals.append(("mfi_exit", "SHORT", price))
-
-                # MFI entry signal
+                # MFI entry signal (no MFI exit — once in trade, hold until TP or trailing profit)
                 if self._restart_cooldown_done and mfi_signal and in_trade_session():
                     direction = "LONG" if mfi_signal == "oversold" else "SHORT"
                     matches_mss = ((self._pending_mss == "bullish" and direction == "LONG") or
@@ -704,13 +716,29 @@ class SignalEngine:
                         print(f"[{now_str}] [{self.symbol} MFI-CONFIRM] {mfi_signal.upper()} "
                               f"-> {direction} | MSS {self._pending_mss} active | {reason}")
                         if should_enter:
-                            rl_idx, rl_params = self.rl.choose(features)
-                            self._pending_mss = None
-                            self.mss.reset()
-                            if direction == "LONG":
-                                signals.append(("enter_long", price, features, rl_idx, rl_params))
+                            bb = self._calc_bb(price)
+                            if bb is None:
+                                bb_ok = True
+                                bb_str = "BB warming"
                             else:
-                                signals.append(("enter_short", price, features, rl_idx, rl_params))
+                                upper, middle, lower = bb
+                                if direction == "SHORT":
+                                    bb_ok = price >= middle
+                                    bb_str = f"BB: price {price:.2f} >= mid {middle:.2f}" if bb_ok else \
+                                             f"BB: price {price:.2f} < mid {middle:.2f} BLOCKED"
+                                else:
+                                    bb_ok = price <= middle
+                                    bb_str = f"BB: price {price:.2f} <= mid {middle:.2f}" if bb_ok else \
+                                             f"BB: price {price:.2f} > mid {middle:.2f} BLOCKED"
+                            print(f"[{now_str}] [{self.symbol} BB-CHECK] {direction} | {bb_str}")
+                            if bb_ok:
+                                rl_idx, rl_params = self.rl.choose(features)
+                                self._pending_mss = None
+                                self.mss.reset()
+                                if direction == "LONG":
+                                    signals.append(("enter_long", price, features, rl_idx, rl_params))
+                                else:
+                                    signals.append(("enter_short", price, features, rl_idx, rl_params))
                     else:
                         print(f"[{now_str}] [{self.symbol} MFI-DOT] {mfi_signal.upper()} "
                               f"-> {direction} | no matching MSS pending")
@@ -1489,10 +1517,7 @@ class MultiAccountBot:
             signals = self.engine.tick(price, self.last_tick_time)
 
             for sig in signals:
-                if sig[0] == "mfi_exit":
-                    direction_to_exit = sig[1]
-                    await self._broadcast_flatten(direction_to_exit, sig[2], "MFI_REVERSAL")
-                elif sig[0] == "enter_long":
+                if sig[0] == "enter_long":
                     _, ep, features, rl_idx, rl_params = sig
                     # Check if any account already has a position
                     any_in_position = any(a.position != 0 for a in self.accounts if a.connected)
