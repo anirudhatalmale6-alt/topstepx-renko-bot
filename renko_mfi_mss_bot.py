@@ -1366,11 +1366,12 @@ class SymbolState:
 class RenkoMFIMSSBot:
     def __init__(self, symbol_configs: list, tg_token: str = "",
                  tg_chat: str = "", tg_keys: list = None,
-                 tp_webhooks: list = None):
+                 tp_webhooks: list = None, peer_dirs: list = None):
         self.tg_token = tg_token
         self.tg_chat = tg_chat
         self.tg_keys = tg_keys or []
         self.tp_webhooks = tp_webhooks or []
+        self.peer_dirs = peer_dirs or []
         self.running = True
         self.suite = None
         self.states = {}
@@ -1414,6 +1415,87 @@ class RenkoMFIMSSBot:
         except Exception as e:
             print(f"[STATE] Load error: {e}")
             return False
+
+    def sync_from_peers(self):
+        if not self.peer_dirs:
+            return
+        my_ts = 0.0
+        for sym, st in self.states.items():
+            try:
+                with open(self.state_file, "r") as f:
+                    own = json.load(f)
+                if sym in own:
+                    my_ts = own[sym].get("saved_at", 0.0)
+            except Exception:
+                pass
+            break
+
+        best_peer = None
+        best_ts = my_ts
+        for peer_dir in self.peer_dirs:
+            peer_file = os.path.join(peer_dir, "bot_state_mfi_mss.json")
+            if not os.path.exists(peer_file):
+                continue
+            try:
+                with open(peer_file, "r") as f:
+                    peer_state = json.load(f)
+                for sym in self.states:
+                    if sym in peer_state:
+                        pts = peer_state[sym].get("saved_at", 0.0)
+                        if pts > best_ts:
+                            best_ts = pts
+                            best_peer = (peer_dir, peer_state)
+            except Exception:
+                continue
+
+        if best_peer is None:
+            print("[PEER-SYNC] No peer has more recent state")
+            return
+
+        peer_dir, peer_state = best_peer
+        age_diff = best_ts - my_ts
+        print(f"[PEER-SYNC] Found newer state from {os.path.basename(peer_dir)} "
+              f"({age_diff:.0f}s newer)")
+
+        MARKET_KEYS = [
+            "renko_last_close", "renko_last_dir", "renko_bricks", "prev_brick_dir",
+            "brick_closes", "brick_opens", "brick_typicals", "brick_volumes",
+            "mfi_value", "prev_mfi_value", "pending_mss",
+            "candle_current", "candle_history", "bb_candle_current", "bb_candle_history",
+        ]
+
+        for sym, st in self.states.items():
+            if sym not in peer_state:
+                continue
+            ps = peer_state[sym]
+            renko_bricks = ps.get("renko_bricks", [])
+            if renko_bricks:
+                st.renko.bricks = renko_bricks
+                st.renko._last_close = ps.get("renko_last_close")
+                st.renko._last_direction = ps.get("renko_last_dir")
+            st._prev_brick_dir = ps.get("prev_brick_dir", st._prev_brick_dir)
+            st.brick_closes = ps.get("brick_closes", st.brick_closes)
+            st.brick_opens = ps.get("brick_opens", st.brick_opens)
+            st.brick_typicals = ps.get("brick_typicals", st.brick_typicals)
+            st.brick_volumes = ps.get("brick_volumes", st.brick_volumes)
+            st.mfi_value = ps.get("mfi_value", st.mfi_value)
+            st.prev_mfi_value = ps.get("prev_mfi_value", st.prev_mfi_value)
+            st._pending_mss = ps.get("pending_mss", st._pending_mss)
+            cc = ps.get("candle_current")
+            if cc:
+                st.candles._current = cc
+            ch = ps.get("candle_history", [])
+            if ch:
+                st.candles.candles = ch
+            bcc = ps.get("bb_candle_current")
+            if bcc:
+                st.bb_candles._current = bcc
+            bch = ps.get("bb_candle_history", [])
+            if bch:
+                st.bb_candles.candles = bch
+
+            print(f"  [{sym}] Synced from peer: {len(renko_bricks)} bricks, "
+                  f"MFI={round(st.mfi_value or 0, 1)}, pending_mss={st._pending_mss}")
 
     def _register_websocket_handlers(self):
         conn = self.suite.realtime.user_connection
@@ -1563,6 +1645,7 @@ class RenkoMFIMSSBot:
         print(f"[BOT] Symbols: {symbols}")
 
         self.load_all_state()
+        self.sync_from_peers()
 
         try:
             self.suite = await TradingSuite.create(
@@ -1856,10 +1939,12 @@ def main():
     parser.add_argument("--tg-keys", default="", help="Comma-separated passkeys")
     parser.add_argument("--tick-interval", type=int, default=1)
     parser.add_argument("--tp-webhooks", default="", help="Comma-separated TradersPost URLs")
+    parser.add_argument("--peer-dirs", default="", help="Comma-separated peer bot directories for state sync")
     args = parser.parse_args()
 
     keys = [k.strip() for k in args.tg_keys.split(",") if k.strip()] if args.tg_keys else []
     tp_webhooks = [u.strip() for u in args.tp_webhooks.split(",") if u.strip()] if args.tp_webhooks else []
+    peer_dirs = [d.strip() for d in args.peer_dirs.split(",") if d.strip()] if args.peer_dirs else []
     symbol_configs = parse_symbol_configs(args.symbols)
 
     if not symbol_configs:
@@ -1917,6 +2002,7 @@ def main():
             tg_chat=args.tg_chat,
             tg_keys=keys,
             tp_webhooks=tp_webhooks,
+            peer_dirs=peer_dirs,
         )
         current_bot = bot
 
