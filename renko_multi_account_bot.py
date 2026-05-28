@@ -739,39 +739,42 @@ class SignalEngine:
 
         # Check pending BB entry on every tick
         if self._pending_bb_entry and in_trade_session():
-            age = time.time() - self._pending_bb_entry["ts"]
-            if age > 300:
-                now_str = datetime.now(ET).strftime("%H:%M:%S")
-                print(f"[{now_str}] [{self.symbol} BB-EXPIRED] "
-                      f"{self._pending_bb_entry['direction']} pending expired after {age:.0f}s")
-                self._pending_bb_entry = None
-            else:
-                bb = self._calc_bb()
-                if bb:
-                    upper, middle, lower = bb
-                    direction = self._pending_bb_entry["direction"]
-                    if direction == "SHORT" and price >= upper:
-                        now_str = datetime.now(ET).strftime("%H:%M:%S")
-                        print(f"[{now_str}] [{self.symbol} BB-TRIGGER] SHORT — "
-                              f"price {price:.2f} >= upper BB {upper:.2f}")
-                        features = self._pending_bb_entry["features"]
-                        rl_idx, rl_params = self.rl.choose(features)
-                        signals.append(("enter_short", price, features, rl_idx, rl_params))
-                        self._pending_bb_entry = None
-                    elif direction == "LONG" and price <= lower:
-                        now_str = datetime.now(ET).strftime("%H:%M:%S")
-                        print(f"[{now_str}] [{self.symbol} BB-TRIGGER] LONG — "
-                              f"price {price:.2f} <= lower BB {lower:.2f}")
-                        features = self._pending_bb_entry["features"]
-                        rl_idx, rl_params = self.rl.choose(features)
-                        signals.append(("enter_long", price, features, rl_idx, rl_params))
-                        self._pending_bb_entry = None
+            bb = self._calc_bb()
+            if bb:
+                upper, middle, lower = bb
+                direction = self._pending_bb_entry["direction"]
+                if direction == "SHORT" and price >= upper:
+                    now_str = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now_str}] [{self.symbol} BB-TRIGGER] SHORT — "
+                          f"price {price:.2f} >= upper BB {upper:.2f}")
+                    features = self._pending_bb_entry["features"]
+                    rl_idx, rl_params = self.rl.choose(features)
+                    signals.append(("enter_short", price, features, rl_idx, rl_params))
+                    self._pending_bb_entry = None
+                elif direction == "LONG" and price <= lower:
+                    now_str = datetime.now(ET).strftime("%H:%M:%S")
+                    print(f"[{now_str}] [{self.symbol} BB-TRIGGER] LONG — "
+                          f"price {price:.2f} <= lower BB {lower:.2f}")
+                    features = self._pending_bb_entry["features"]
+                    rl_idx, rl_params = self.rl.choose(features)
+                    signals.append(("enter_long", price, features, rl_idx, rl_params))
+                    self._pending_bb_entry = None
 
         # MSS detection
         self.mss.update_swings(self.renko.bricks)
         if in_trade_session() and self._restart_cooldown_done:
             mss_signal = self.mss.check(price)
             if mss_signal and mss_signal != self._pending_mss:
+                # Cancel pending BB entry if MSS flips opposite
+                if self._pending_bb_entry:
+                    pend_dir = self._pending_bb_entry["direction"]
+                    opposite = (mss_signal == "bullish" and pend_dir == "SHORT") or \
+                               (mss_signal == "bearish" and pend_dir == "LONG")
+                    if opposite:
+                        now_str = datetime.now(ET).strftime("%H:%M:%S")
+                        print(f"[{now_str}] [{self.symbol} BB-CANCEL] {pend_dir} pending cancelled — "
+                              f"MSS flipped to {mss_signal}")
+                        self._pending_bb_entry = None
                 self._pending_mss = mss_signal
                 now_str = datetime.now(ET).strftime("%H:%M:%S")
                 if mss_signal == "bearish":
@@ -922,6 +925,7 @@ class AccountConnection:
         self.connected = True
         print(f"[{self.name}] Connected: {self.account_name} | contract: {self.ctx.instrument_info.id}")
 
+        await self._verify_position_on_connect()
         await self._sync_pnl_from_platform()
 
     def _register_handlers(self):
@@ -996,6 +1000,38 @@ class AccountConnection:
                     break
         except Exception:
             pass
+
+    async def _verify_position_on_connect(self):
+        """After restart, verify restored position actually exists on the platform."""
+        if not self.suite or self.position == 0:
+            return
+        try:
+            positions = await asyncio.wait_for(
+                self.suite.client.search_open_positions(), timeout=8.0)
+            contract_id = self.ctx.instrument_info.id
+            found = False
+            for p in positions:
+                if p.contractId == contract_id and p.size > 0:
+                    found = True
+                    self.contracts_held = p.size
+                    self.entry_price = p.averagePrice
+                    direction = "LONG" if self.position == 1 else "SHORT"
+                    print(f"[{self.name} POS-VERIFY] {direction} x{p.size} confirmed @ {p.averagePrice:.2f}")
+                    break
+            if not found:
+                old_dir = "LONG" if self.position == 1 else "SHORT"
+                print(f"[{self.name} POS-VERIFY] {old_dir} x{self.contracts_held} NOT FOUND on platform — clearing phantom position")
+                self.position = 0
+                self.contracts_held = 0
+                self.entry_price = 0.0
+                self.entry_time = 0.0
+                self._dca_done = False
+                self._entry_prices = []
+                self._trail_profit_active = False
+                self._trail_profit_peak = 0.0
+                self._trail_profit_floor = 0.0
+        except Exception as e:
+            print(f"[{self.name} POS-VERIFY] Error: {e}")
 
     async def _sync_pnl_from_platform(self):
         if not self.suite or self.position != 0:
