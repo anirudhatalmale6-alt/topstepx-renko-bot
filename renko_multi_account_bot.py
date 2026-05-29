@@ -786,8 +786,10 @@ class SignalEngine:
                 bb_slope = self._bb_slope()
                 slope_flat = bb_slope is None or abs(bb_slope) <= BB_SLOPE_MAX
 
-                # SHORT: bear MSS level exists, BB middle below resistance, price at upper BB
-                if self._mss_bear_level and middle < self._mss_bear_level and price >= upper:
+                bb_range = upper - lower
+                # SHORT: bear MSS level above 60% of BB range (60% of band is below resistance)
+                bb_60 = lower + 0.6 * bb_range if bb_range > 0 else middle
+                if self._mss_bear_level and self._mss_bear_level >= bb_60 and price >= upper:
                     if slope_flat:
                         features = self.extract_features()
                         should_enter, reason = self.ml.should_enter(features)
@@ -795,7 +797,7 @@ class SignalEngine:
                         slope_str = f"{bb_slope:+.1f}" if bb_slope is not None else "?"
                         print(f"[{now_str}] [{self.symbol} BB-CONFIRM] SHORT — "
                               f"price {price:.2f} >= upper BB {upper:.2f} | "
-                              f"BB mid {middle:.2f} < MSS resist {self._mss_bear_level:.2f} | "
+                              f"MSS resist {self._mss_bear_level:.2f} >= BB 60% {bb_60:.2f} | "
                               f"slope {slope_str} | {reason}")
                         if should_enter:
                             rl_idx, rl_params = self.rl.choose(features)
@@ -807,8 +809,9 @@ class SignalEngine:
                         print(f"[{now_str}] [{self.symbol} BB-SLOPE-WAIT] SHORT — "
                               f"at upper BB + MSS confirmed but slope steep ({bb_slope:+.1f})")
 
-                # LONG: bull MSS level exists, BB middle above support, price at lower BB
-                elif self._mss_bull_level and middle > self._mss_bull_level and price <= lower:
+                # LONG: bull MSS level below 40% of BB range (60% of band is above support)
+                bb_40 = lower + 0.4 * bb_range if bb_range > 0 else middle
+                if self._mss_bull_level and self._mss_bull_level <= bb_40 and price <= lower:
                     if slope_flat:
                         features = self.extract_features()
                         should_enter, reason = self.ml.should_enter(features)
@@ -816,7 +819,7 @@ class SignalEngine:
                         slope_str = f"{bb_slope:+.1f}" if bb_slope is not None else "?"
                         print(f"[{now_str}] [{self.symbol} BB-CONFIRM] LONG — "
                               f"price {price:.2f} <= lower BB {lower:.2f} | "
-                              f"BB mid {middle:.2f} > MSS support {self._mss_bull_level:.2f} | "
+                              f"MSS support {self._mss_bull_level:.2f} <= BB 40% {bb_40:.2f} | "
                               f"slope {slope_str} | {reason}")
                         if should_enter:
                             rl_idx, rl_params = self.rl.choose(features)
