@@ -3,18 +3,21 @@
     "name": "Nirmaljit",
     "username": "nirmaljitsingh2012@gmail.com",
     "api_key": "+bl7RBUffN2Gl+SJzf2pX7e4Kgt81OmBaTm3XdNEhNY=",
-    "account_name": "PRAC-V2-343477-16097780"
+    "account_name": "PRAC-V2-343477-16097780",
+    "bb_threshold": 0.8
   },
   {
     "name": "Grant",
     "username": "thegranthorton4@gmail.com",
     "api_key": "rHtygbeavzC0lSEXoVkPmZ/ELrgBQyfi8jrictkQ4Fc=",
-    "account_name": "PRAC-V2-309980-44990600"
+    "account_name": "PRAC-V2-309980-44990600",
+    "bb_threshold": 0.6
   },
   {
     "name": "Abhi",
     "username": "Abhishaq",
     "api_key": "OyJLthWTWTtZBwgL7mTi0k7+r0JdSf0tAqCLCs/xdU0=",
-    "account_name": "PRAC-V2-123158-11147497"
+    "account_name": "PRAC-V2-123158-11147497",
+    "bb_threshold": 0.6
   }
 ]

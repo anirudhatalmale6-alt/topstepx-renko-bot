@@ -787,49 +787,51 @@ class SignalEngine:
                 slope_flat = bb_slope is None or abs(bb_slope) <= BB_SLOPE_MAX
 
                 bb_range = upper - lower
-                # SHORT: bear MSS level above 60% of BB range (60% of band is below resistance)
-                bb_60 = lower + 0.6 * bb_range if bb_range > 0 else middle
-                if self._mss_bear_level and self._mss_bear_level >= bb_60 and price >= upper:
-                    if slope_flat:
-                        features = self.extract_features()
-                        should_enter, reason = self.ml.should_enter(features)
-                        now_str = datetime.now(ET).strftime("%H:%M:%S")
-                        slope_str = f"{bb_slope:+.1f}" if bb_slope is not None else "?"
-                        print(f"[{now_str}] [{self.symbol} BB-CONFIRM] SHORT — "
-                              f"price {price:.2f} >= upper BB {upper:.2f} | "
-                              f"MSS resist {self._mss_bear_level:.2f} >= BB 60% {bb_60:.2f} | "
-                              f"slope {slope_str} | {reason}")
-                        if should_enter:
-                            rl_idx, rl_params = self.rl.choose(features)
-                            signals.append(("enter_short", price, features, rl_idx, rl_params))
-                            self._mss_bear_level = None
-                            self._mss_bull_level = None
-                    else:
-                        now_str = datetime.now(ET).strftime("%H:%M:%S")
-                        print(f"[{now_str}] [{self.symbol} BB-SLOPE-WAIT] SHORT — "
-                              f"at upper BB + MSS confirmed but slope steep ({bb_slope:+.1f})")
+                # SHORT: bear MSS level position in BB band (0.6 = 60% below)
+                if self._mss_bear_level and bb_range > 0 and price >= upper:
+                    mss_bb_pct = (self._mss_bear_level - lower) / bb_range
+                    if mss_bb_pct >= 0.6:
+                        if slope_flat:
+                            features = self.extract_features()
+                            should_enter, reason = self.ml.should_enter(features)
+                            now_str = datetime.now(ET).strftime("%H:%M:%S")
+                            slope_str = f"{bb_slope:+.1f}" if bb_slope is not None else "?"
+                            print(f"[{now_str}] [{self.symbol} BB-CONFIRM] SHORT — "
+                                  f"price {price:.2f} >= upper BB {upper:.2f} | "
+                                  f"MSS resist {self._mss_bear_level:.2f} @ BB {mss_bb_pct:.0%} | "
+                                  f"slope {slope_str} | {reason}")
+                            if should_enter:
+                                rl_idx, rl_params = self.rl.choose(features)
+                                signals.append(("enter_short", price, features, rl_idx, rl_params, mss_bb_pct))
+                                self._mss_bear_level = None
+                                self._mss_bull_level = None
+                        else:
+                            now_str = datetime.now(ET).strftime("%H:%M:%S")
+                            print(f"[{now_str}] [{self.symbol} BB-SLOPE-WAIT] SHORT — "
+                                  f"at upper BB + MSS confirmed but slope steep ({bb_slope:+.1f})")
 
-                # LONG: bull MSS level below 40% of BB range (60% of band is above support)
-                bb_40 = lower + 0.4 * bb_range if bb_range > 0 else middle
-                if self._mss_bull_level and self._mss_bull_level <= bb_40 and price <= lower:
-                    if slope_flat:
-                        features = self.extract_features()
-                        should_enter, reason = self.ml.should_enter(features)
-                        now_str = datetime.now(ET).strftime("%H:%M:%S")
-                        slope_str = f"{bb_slope:+.1f}" if bb_slope is not None else "?"
-                        print(f"[{now_str}] [{self.symbol} BB-CONFIRM] LONG — "
-                              f"price {price:.2f} <= lower BB {lower:.2f} | "
-                              f"MSS support {self._mss_bull_level:.2f} <= BB 40% {bb_40:.2f} | "
-                              f"slope {slope_str} | {reason}")
-                        if should_enter:
-                            rl_idx, rl_params = self.rl.choose(features)
-                            signals.append(("enter_long", price, features, rl_idx, rl_params))
-                            self._mss_bear_level = None
-                            self._mss_bull_level = None
-                    else:
-                        now_str = datetime.now(ET).strftime("%H:%M:%S")
-                        print(f"[{now_str}] [{self.symbol} BB-SLOPE-WAIT] LONG — "
-                              f"at lower BB + MSS confirmed but slope steep ({bb_slope:+.1f})")
+                # LONG: bull MSS level position in BB band (0.4 = 60% above)
+                if self._mss_bull_level and bb_range > 0 and price <= lower:
+                    mss_bb_pct = (self._mss_bull_level - lower) / bb_range
+                    if mss_bb_pct <= 0.4:
+                        if slope_flat:
+                            features = self.extract_features()
+                            should_enter, reason = self.ml.should_enter(features)
+                            now_str = datetime.now(ET).strftime("%H:%M:%S")
+                            slope_str = f"{bb_slope:+.1f}" if bb_slope is not None else "?"
+                            print(f"[{now_str}] [{self.symbol} BB-CONFIRM] LONG — "
+                                  f"price {price:.2f} <= lower BB {lower:.2f} | "
+                                  f"MSS support {self._mss_bull_level:.2f} @ BB {mss_bb_pct:.0%} | "
+                                  f"slope {slope_str} | {reason}")
+                            if should_enter:
+                                rl_idx, rl_params = self.rl.choose(features)
+                                signals.append(("enter_long", price, features, rl_idx, rl_params, mss_bb_pct))
+                                self._mss_bear_level = None
+                                self._mss_bull_level = None
+                        else:
+                            now_str = datetime.now(ET).strftime("%H:%M:%S")
+                            print(f"[{now_str}] [{self.symbol} BB-SLOPE-WAIT] LONG — "
+                                  f"at lower BB + MSS confirmed but slope steep ({bb_slope:+.1f})")
 
         return signals
 
@@ -905,13 +907,15 @@ class AccountConnection:
     """Manages one TopstepX account: connection, position, PnL."""
 
     def __init__(self, name, username, api_key, account_name, symbol, base_qty,
-                 tg_token="", tg_chat="", tg_keys=None, ntfy_topic="", tp_webhooks=None):
+                 tg_token="", tg_chat="", tg_keys=None, ntfy_topic="", tp_webhooks=None,
+                 bb_threshold=0.6):
         self.name = name
         self.username = username
         self.api_key = api_key
         self.account_name = account_name
         self.symbol = symbol
         self.base_qty = base_qty
+        self.bb_threshold = bb_threshold
         self.pv = POINT_VALUES.get(symbol, 20.0)
         self.tg_token = tg_token
         self.tg_chat = tg_chat
@@ -1010,7 +1014,7 @@ class AccountConnection:
         self._last_price_change_time = time.time()
         self._last_known_price = None
         self._platform_flat_streak = 0
-        print(f"[{self.name}] Connected: {self.account_name} | contract: {self.ctx.instrument_info.id}")
+        print(f"[{self.name}] Connected: {self.account_name} | contract: {self.ctx.instrument_info.id} | BB threshold: {self.bb_threshold:.0%}")
 
         await self._verify_position_on_connect()
         await self._sync_pnl_from_platform()
@@ -1593,6 +1597,7 @@ class MultiAccountBot:
                 tg_keys=self.tg_keys,
                 ntfy_topic=acfg.get("ntfy_topic", ""),
                 tp_webhooks=self.tp_webhooks,
+                bb_threshold=acfg.get("bb_threshold", 0.6),
             )
             acc.config_file = config_file
             self.accounts.append(acc)
@@ -1708,13 +1713,26 @@ class MultiAccountBot:
                          args=(self.tg_token, self.tg_chat, msg),
                          daemon=True).start()
 
-    async def _broadcast_entry(self, direction, price, features, rl_idx, rl_params):
-        """Place entry on ALL accounts simultaneously."""
+    async def _broadcast_entry(self, direction, price, features, rl_idx, rl_params, mss_bb_pct=1.0):
+        """Place entry on accounts whose BB threshold is met."""
         tasks = []
         for acc in self.accounts:
             if not acc.connected or acc.position != 0:
                 continue
             if abs(acc.daily_loss) >= DAILY_LOSS_LIMIT:
+                continue
+            # For SHORT: mss_bb_pct is how high in BB band (0.8 = 80% below)
+            # For LONG: mss_bb_pct is how low in BB band (0.2 = 80% above)
+            # Account threshold: higher = stricter for SHORT, lower = stricter for LONG
+            if direction == "SHORT" and mss_bb_pct < acc.bb_threshold:
+                now_str = datetime.now(ET).strftime("%H:%M:%S")
+                print(f"[{now_str}] [{acc.name} BB-SKIP] SHORT — MSS @ BB {mss_bb_pct:.0%} "
+                      f"< threshold {acc.bb_threshold:.0%}")
+                continue
+            if direction == "LONG" and mss_bb_pct > (1.0 - acc.bb_threshold):
+                now_str = datetime.now(ET).strftime("%H:%M:%S")
+                print(f"[{now_str}] [{acc.name} BB-SKIP] LONG — MSS @ BB {mss_bb_pct:.0%} "
+                      f"> threshold {1.0 - acc.bb_threshold:.0%}")
                 continue
             if direction == "LONG":
                 tasks.append(acc.enter_long(price, features, rl_idx, rl_params))
@@ -1844,16 +1862,15 @@ class MultiAccountBot:
 
             for sig in signals:
                 if sig[0] == "enter_long":
-                    _, ep, features, rl_idx, rl_params = sig
-                    # Check if any account already has a position
+                    _, ep, features, rl_idx, rl_params, mss_bb_pct = sig
                     any_in_position = any(a.position != 0 for a in self.accounts if a.connected)
                     if not any_in_position:
-                        await self._broadcast_entry("LONG", ep, features, rl_idx, rl_params)
+                        await self._broadcast_entry("LONG", ep, features, rl_idx, rl_params, mss_bb_pct)
                 elif sig[0] == "enter_short":
-                    _, ep, features, rl_idx, rl_params = sig
+                    _, ep, features, rl_idx, rl_params, mss_bb_pct = sig
                     any_in_position = any(a.position != 0 for a in self.accounts if a.connected)
                     if not any_in_position:
-                        await self._broadcast_entry("SHORT", ep, features, rl_idx, rl_params)
+                        await self._broadcast_entry("SHORT", ep, features, rl_idx, rl_params, mss_bb_pct)
 
             now = time.time()
 
