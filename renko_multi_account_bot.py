@@ -619,6 +619,8 @@ class SignalEngine:
         self._new_bricks_since_restart = 0
         self._restart_cooldown_done = False
 
+        self._mss_bull_level = None   # swing high level (support for LONG)
+        self._mss_bear_level = None   # swing low level (resistance for SHORT)
         self._pending_bb_entry = None  # {"direction": "LONG"/"SHORT", "features": ..., "ts": ...}
         self._bb_candle_closes = []
         self._max_bb_candle_history = 500
@@ -705,7 +707,9 @@ class SignalEngine:
 
     def tick(self, price, ts=None):
         """Process tick and return list of signal actions.
-        Flow: MSS shift -> arm pending BB entry -> BB flat + band touch -> enter
+        Flow: Queue both MSS levels -> BB confirms whichever side first -> enter
+        - SHORT: bear MSS level (resistance) exists, BB middle below it, price at upper BB
+        - LONG: bull MSS level (support) exists, BB middle above it, price at lower BB
         """
         if ts is None:
             ts = time.time()
@@ -742,84 +746,87 @@ class SignalEngine:
                 bb_str = f"BB[{bb[2]:.1f}/{bb[1]:.1f}/{bb[0]:.1f}]" if bb else "BB warming"
                 slope = self._bb_slope()
                 slope_str = f" s={slope:+.1f}" if slope is not None else ""
-                pend_str = f" | PENDING {self._pending_bb_entry['direction']}" if self._pending_bb_entry else ""
+                lvl_str = ""
+                if self._mss_bull_level:
+                    lvl_str += f" | BULL@{self._mss_bull_level:.1f}"
+                if self._mss_bear_level:
+                    lvl_str += f" | BEAR@{self._mss_bear_level:.1f}"
                 print(f"[{now_str}] [{self.symbol} BRICK] {brick['direction'].upper()} "
                       f"{brick['open']:.2f} -> {brick['close']:.2f} "
-                      f"(consecutive: {self.renko.consecutive_count()}) | {mfi_str} | {bb_str}{slope_str}{pend_str}")
-
-                # MFI logged for info only — not used for entry decisions
+                      f"(consecutive: {self.renko.consecutive_count()}) | {mfi_str} | {bb_str}{slope_str}{lvl_str}")
 
                 self._mss_brick_count += 1
                 self._prev_brick_dir = brick["direction"]
 
-        # Check pending BB entry on every tick: need BB flat + price at band
-        if self._pending_bb_entry and in_trade_session():
-            bb = self._calc_bb()
-            if bb:
-                upper, middle, lower = bb
-                direction = self._pending_bb_entry["direction"]
-                bb_slope = self._bb_slope()
-                slope_flat = bb_slope is None or abs(bb_slope) <= BB_SLOPE_MAX
-                at_band = ((direction == "SHORT" and price >= upper) or
-                           (direction == "LONG" and price <= lower))
-                if at_band and slope_flat:
-                    now_str = datetime.now(ET).strftime("%H:%M:%S")
-                    slope_str = f"{bb_slope:+.1f}" if bb_slope is not None else "?"
-                    if direction == "SHORT":
-                        print(f"[{now_str}] [{self.symbol} BB-TRIGGER] SHORT — "
-                              f"price {price:.2f} >= upper BB {upper:.2f} | slope {slope_str} (flat)")
-                    else:
-                        print(f"[{now_str}] [{self.symbol} BB-TRIGGER] LONG — "
-                              f"price {price:.2f} <= lower BB {lower:.2f} | slope {slope_str} (flat)")
-                    features = self._pending_bb_entry["features"]
-                    rl_idx, rl_params = self.rl.choose(features)
-                    if direction == "SHORT":
-                        signals.append(("enter_short", price, features, rl_idx, rl_params))
-                    else:
-                        signals.append(("enter_long", price, features, rl_idx, rl_params))
-                    self._pending_bb_entry = None
-                elif at_band and not slope_flat:
-                    now_str = datetime.now(ET).strftime("%H:%M:%S")
-                    print(f"[{now_str}] [{self.symbol} BB-SLOPE-WAIT] {direction} — "
-                          f"at band but BB steep ({bb_slope:+.1f}), waiting to flatten")
-
-        # MSS detection (with minimum persistence — can't flip until N bricks have passed)
+        # MSS detection — queue both bull and bear levels simultaneously
         self.mss.update_swings(self.renko.bricks)
         if in_trade_session() and self._restart_cooldown_done:
             mss_signal = self.mss.check(price)
-            if mss_signal and mss_signal != self._pending_mss:
-                if self._pending_mss and self._mss_brick_count < MSS_MIN_PERSIST_BRICKS:
-                    pass
-                else:
-                    direction = "LONG" if mss_signal == "bullish" else "SHORT"
-                    if self._pending_bb_entry:
-                        pend_dir = self._pending_bb_entry["direction"]
-                        opposite = (mss_signal == "bullish" and pend_dir == "SHORT") or \
-                                   (mss_signal == "bearish" and pend_dir == "LONG")
-                        if opposite:
-                            now_str = datetime.now(ET).strftime("%H:%M:%S")
-                            print(f"[{now_str}] [{self.symbol} BB-CANCEL] {pend_dir} pending cancelled — "
-                                  f"MSS flipped to {mss_signal}")
-                            self._pending_bb_entry = None
-                    self._pending_mss = mss_signal
-                    self._mss_brick_count = 0
-                    now_str = datetime.now(ET).strftime("%H:%M:%S")
-                    features = self.extract_features()
-                    should_enter, reason = self.ml.should_enter(features)
-                    if mss_signal == "bearish":
-                        print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BEARISH @ {price:.2f} "
-                              f"broke SL {self.mss.swing_lows[-1]:.2f} | {reason}")
+            if mss_signal:
+                now_str = datetime.now(ET).strftime("%H:%M:%S")
+                if mss_signal == "bearish" and self.mss.swing_lows:
+                    new_level = self.mss.swing_lows[-1]
+                    old = f" (was {self._mss_bear_level:.2f})" if self._mss_bear_level else ""
+                    self._mss_bear_level = new_level
+                    print(f"[{now_str}] [{self.symbol} MSS-BEAR] RESISTANCE @ {new_level:.2f}{old} "
+                          f"— queued for SHORT when BB middle below + upper band touch")
+                elif mss_signal == "bullish" and self.mss.swing_highs:
+                    new_level = self.mss.swing_highs[-1]
+                    old = f" (was {self._mss_bull_level:.2f})" if self._mss_bull_level else ""
+                    self._mss_bull_level = new_level
+                    print(f"[{now_str}] [{self.symbol} MSS-BULL] SUPPORT @ {new_level:.2f}{old} "
+                          f"— queued for LONG when BB middle above + lower band touch")
+                self.mss.reset()
+
+        # Check both MSS levels against BB on every tick
+        if in_trade_session() and self._restart_cooldown_done:
+            bb = self._calc_bb()
+            if bb and (self._mss_bear_level or self._mss_bull_level):
+                upper, middle, lower = bb
+                bb_slope = self._bb_slope()
+                slope_flat = bb_slope is None or abs(bb_slope) <= BB_SLOPE_MAX
+
+                # SHORT: bear MSS level exists, BB middle below resistance, price at upper BB
+                if self._mss_bear_level and middle < self._mss_bear_level and price >= upper:
+                    if slope_flat:
+                        features = self.extract_features()
+                        should_enter, reason = self.ml.should_enter(features)
+                        now_str = datetime.now(ET).strftime("%H:%M:%S")
+                        slope_str = f"{bb_slope:+.1f}" if bb_slope is not None else "?"
+                        print(f"[{now_str}] [{self.symbol} BB-CONFIRM] SHORT — "
+                              f"price {price:.2f} >= upper BB {upper:.2f} | "
+                              f"BB mid {middle:.2f} < MSS resist {self._mss_bear_level:.2f} | "
+                              f"slope {slope_str} | {reason}")
+                        if should_enter:
+                            rl_idx, rl_params = self.rl.choose(features)
+                            signals.append(("enter_short", price, features, rl_idx, rl_params))
+                            self._mss_bear_level = None
+                            self._mss_bull_level = None
                     else:
-                        print(f"[{now_str}] [{self.symbol} MSS-SHIFT] BULLISH @ {price:.2f} "
-                              f"broke SH {self.mss.swing_highs[-1]:.2f} | {reason}")
-                    if should_enter:
-                        self._pending_bb_entry = {
-                            "direction": direction, "features": features,
-                            "ts": time.time(), "mss": mss_signal,
-                        }
-                        print(f"[{now_str}] [{self.symbol} BB-WAIT] {direction} armed — "
-                              f"waiting for BB flat + band touch")
-                    self.mss.reset()
+                        now_str = datetime.now(ET).strftime("%H:%M:%S")
+                        print(f"[{now_str}] [{self.symbol} BB-SLOPE-WAIT] SHORT — "
+                              f"at upper BB + MSS confirmed but slope steep ({bb_slope:+.1f})")
+
+                # LONG: bull MSS level exists, BB middle above support, price at lower BB
+                elif self._mss_bull_level and middle > self._mss_bull_level and price <= lower:
+                    if slope_flat:
+                        features = self.extract_features()
+                        should_enter, reason = self.ml.should_enter(features)
+                        now_str = datetime.now(ET).strftime("%H:%M:%S")
+                        slope_str = f"{bb_slope:+.1f}" if bb_slope is not None else "?"
+                        print(f"[{now_str}] [{self.symbol} BB-CONFIRM] LONG — "
+                              f"price {price:.2f} <= lower BB {lower:.2f} | "
+                              f"BB mid {middle:.2f} > MSS support {self._mss_bull_level:.2f} | "
+                              f"slope {slope_str} | {reason}")
+                        if should_enter:
+                            rl_idx, rl_params = self.rl.choose(features)
+                            signals.append(("enter_long", price, features, rl_idx, rl_params))
+                            self._mss_bear_level = None
+                            self._mss_bull_level = None
+                    else:
+                        now_str = datetime.now(ET).strftime("%H:%M:%S")
+                        print(f"[{now_str}] [{self.symbol} BB-SLOPE-WAIT] LONG — "
+                              f"at lower BB + MSS confirmed but slope steep ({bb_slope:+.1f})")
 
         return signals
 
@@ -831,6 +838,8 @@ class SignalEngine:
             "renko_bricks": self.renko.bricks[-50:],
             "prev_brick_dir": self._prev_brick_dir,
             "pending_mss": self._pending_mss,
+            "mss_bull_level": self._mss_bull_level,
+            "mss_bear_level": self._mss_bear_level,
             "pending_bb_entry": self._pending_bb_entry,
             "bb_candle_closes": self._bb_candle_closes[-200:],
             "brick_closes": self.brick_closes[-200:],
@@ -856,6 +865,8 @@ class SignalEngine:
             self._pending_mss = raw_mss.get("dir")
         else:
             self._pending_mss = raw_mss
+        self._mss_bull_level = state.get("mss_bull_level")
+        self._mss_bear_level = state.get("mss_bear_level")
         self._pending_bb_entry = state.get("pending_bb_entry")
         self._bb_candle_closes = state.get("bb_candle_closes", [])
         self.brick_closes = state.get("brick_closes", [])
@@ -876,9 +887,11 @@ class SignalEngine:
         bch = state.get("bb_candle_history", [])
         if bch:
             self.bb_candles.candles = bch
+        bull_str = f"{self._mss_bull_level:.1f}" if self._mss_bull_level else "none"
+        bear_str = f"{self._mss_bear_level:.1f}" if self._mss_bear_level else "none"
         print(f"  [{self.symbol}] Signal engine restored: {len(self.renko.bricks)} bricks, "
               f"MFI={round(self.mfi_value or 0, 1)}, BB candles={len(self._bb_candle_closes)}, "
-              f"pending_mss={self._pending_mss}, pending_bb={self._pending_bb_entry is not None}")
+              f"MSS bull={bull_str} bear={bear_str}")
 
 
 # ============================================================
