@@ -918,6 +918,8 @@ class SignalEngine:
         self.candles_15m = CandleBuilder(900)
         self._15m_candle_closes = []
         self._15m_ema_length = 5
+        self.candles_1h = CandleBuilder(3600)
+        self.candles_4h = CandleBuilder(14400)
         self.pavp = PivotAnchoredVP(num_rows=89, value_area_pct=0.68)
         self.trendline = TrendLineDetector()
         self.mss = MSSDetector()
@@ -1200,6 +1202,38 @@ class SignalEngine:
             return color == "red"
         return False
 
+    def _candle_color(self, builder):
+        """Get forming candle color: 'green', 'red', or None."""
+        candle = builder._current
+        if candle is None and builder.candles:
+            candle = builder.candles[-1]
+        if candle is None:
+            return None
+        if candle["close"] > candle["open"]:
+            return "green"
+        if candle["close"] < candle["open"]:
+            return "red"
+        return None
+
+    def get_mtf_alignment(self):
+        """Check multi-timeframe candle alignment (5m, 15m, 1h, 4h).
+        Returns dict with per-TF color and overall alignment direction."""
+        colors = {
+            "5m": self._candle_color(self.candles_5m),
+            "15m": self._candle_color(self.candles_15m),
+            "1h": self._candle_color(self.candles_1h),
+            "4h": self._candle_color(self.candles_4h),
+        }
+        all_green = all(c == "green" for c in colors.values())
+        all_red = all(c == "red" for c in colors.values())
+        if all_green:
+            alignment = "LONG"
+        elif all_red:
+            alignment = "SHORT"
+        else:
+            alignment = None
+        return {"colors": colors, "alignment": alignment}
+
     def get_5m_state(self):
         """Returns 5min market state: trend direction, ranging, MSS levels."""
         trend = self.trendline_5m.get_trend()
@@ -1312,6 +1346,10 @@ class SignalEngine:
             self._15m_candle_closes.append(completed_15m["close"])
             if len(self._15m_candle_closes) > 50:
                 self._15m_candle_closes = self._15m_candle_closes[-50:]
+
+        # Feed 1h and 4h candles for MTF alignment filter
+        self.candles_1h.feed(price, ts)
+        self.candles_4h.feed(price, ts)
 
         self.bb_candles.feed(price, ts)
         new_bricks = self.renko.feed(price)
@@ -1582,6 +1620,7 @@ class AccountConnection:
         self._rl_tp = None
         self._rl_tp_action_idx = None
         self._rl_tp_params = None
+        self.mtf_filter_enabled = False
 
         self.suite = None
         self.ctx = None
@@ -2889,6 +2928,9 @@ class MultiAccountBot:
             if acc.rl_tp_enabled:
                 acc._rl_tp = TpSlRL(os.path.join(data_dir, f"rl_tp_state_{acfg['name']}_{symbol}.json"))
                 print(f"[{acc.name}] RL TP/SL optimizer: ENABLED ({len(RL_TP_ACTIONS)} actions)")
+            acc.mtf_filter_enabled = acfg.get("mtf_filter_enabled", False)
+            if acc.mtf_filter_enabled:
+                print(f"[{acc.name}] MTF filter (5m/15m/1h/4h): ENABLED")
             acc._trade_log_file = os.path.join(data_dir, f"trade_log_{acfg['name']}.json")
             acc._candle_color_check = lambda: self.engine.get_filter_candle_color() if hasattr(self, 'engine') else None
             acc.config_file = config_file
@@ -3282,6 +3324,18 @@ class MultiAccountBot:
                 print(f"[{now_str}] [{acc.name} BB-SKIP] LONG — MSS @ BB {mss_bb_pct:.0%} "
                       f"> threshold {1.0 - acc.bb_threshold:.0%}")
                 continue
+            if acc.mtf_filter_enabled:
+                mtf = self.engine.get_mtf_alignment()
+                now_str = datetime.now(ET).strftime("%H:%M:%S")
+                colors = mtf["colors"]
+                color_str = " | ".join(f"{tf}={c or 'doji'}" for tf, c in colors.items())
+                if mtf["alignment"] is None:
+                    print(f"[{now_str}] [{acc.name} MTF-SKIP] {direction} — timeframes disagree: {color_str}")
+                    continue
+                if mtf["alignment"] != direction:
+                    print(f"[{now_str}] [{acc.name} MTF-SKIP] {direction} — all TFs say {mtf['alignment']}: {color_str}")
+                    continue
+                print(f"[{now_str}] [{acc.name} MTF-OK] {direction} — all 4 TFs agree: {color_str}")
             if acc.channel_filter and not (acc.reverse_mode or acc.trendline_mode or acc.bb_reversal_mode or acc.hvn_trail_mode):
                 ch = self.engine.channel_state(CHANNEL_LOOKBACK, CHANNEL_SLOPE_MIN)
                 if ch:
@@ -3725,15 +3779,16 @@ class MultiAccountBot:
         for a in self.accounts:
             if not a.connected:
                 continue
+            mtf_tag = " +MTF(5m/15m/1h/4h)" if a.mtf_filter_enabled else ""
             if a.rl_tp_enabled:
-                acct_list.append(f"{a.name}({a.account_name})\n  RL TP/SL (dynamic, {len(RL_TP_ACTIONS)} configs)")
+                acct_list.append(f"{a.name}({a.account_name})\n  RL TP/SL (dynamic, {len(RL_TP_ACTIONS)} configs){mtf_tag}")
             elif a.reverse_mode:
                 tp_dollars = a.reverse_tp_pts * a.pv
                 sl_dollars = a.reverse_sl_pts * a.pv
                 filt = " no15m" if getattr(a, 'no_15m_filter', False) else " 15m"
-                acct_list.append(f"{a.name}({a.account_name})\n  REVERSE TP=${tp_dollars:.0f}({a.reverse_tp_pts}pt) SL=${sl_dollars:.0f}({a.reverse_sl_pts}pt){filt}")
+                acct_list.append(f"{a.name}({a.account_name})\n  REVERSE TP=${tp_dollars:.0f}({a.reverse_tp_pts}pt) SL=${sl_dollars:.0f}({a.reverse_sl_pts}pt){filt}{mtf_tag}")
             else:
-                acct_list.append(f"{a.name}({a.account_name})\n  TP=${DCA_TP_DOLLARS}")
+                acct_list.append(f"{a.name}({a.account_name})\n  TP=${DCA_TP_DOLLARS}{mtf_tag}")
         msg = (f"STATUS|Multi-Account Bot started\n"
                f"Accounts:\n" + "\n".join(acct_list) + f"\n"
                f"Brick: {BRICK_SIZE}pt")
