@@ -2090,7 +2090,16 @@ class AccountConnection:
                 pb = self._pending_pullback
                 sig_price = pb["signal_price"]
                 ref_price = pb.get("original_signal", sig_price)
-                if pb.get("hull_deferred"):
+                if pb.get("mtf_pending_wait"):
+                    age = time.time() - pb.get("time", 0)
+                    if age > 3600:
+                        print(f"[{now_str}] [{self.name} CRASH-MTF-EXPIRE] {pb['direction']} — "
+                              f"MTF signal too old ({age:.0f}s), clearing")
+                        self._pending_pullback = None
+                    else:
+                        print(f"[{now_str}] [{self.name} CRASH-RECOVER] Restored MTF-pending "
+                              f"{pb['direction']} signal — waiting for all 4 TFs to align")
+                elif pb.get("hull_deferred"):
                     print(f"[{now_str}] [{self.name} CRASH-RECOVER] Restored Hull-deferred "
                           f"{pb['direction']} signal — waiting for Hull to confirm")
                 else:
@@ -3329,11 +3338,15 @@ class MultiAccountBot:
                 now_str = datetime.now(ET).strftime("%H:%M:%S")
                 colors = mtf["colors"]
                 color_str = " | ".join(f"{tf}={c or 'doji'}" for tf, c in colors.items())
-                if mtf["alignment"] is None:
-                    print(f"[{now_str}] [{acc.name} MTF-SKIP] {direction} — timeframes disagree: {color_str}")
-                    continue
                 if mtf["alignment"] != direction:
-                    print(f"[{now_str}] [{acc.name} MTF-SKIP] {direction} — all TFs say {mtf['alignment']}: {color_str}")
+                    if not acc._pending_pullback or not acc._pending_pullback.get("mtf_pending_wait"):
+                        acc._pending_pullback = {
+                            "direction": direction, "signal_price": price, "original_signal": price,
+                            "features": features, "rl_idx": rl_idx, "rl_params": rl_params,
+                            "mss_level": mss_level, "time": time.time(), "mtf_pending_wait": True,
+                        }
+                        reason = "timeframes disagree" if mtf["alignment"] is None else f"all TFs say {mtf['alignment']}"
+                        print(f"[{now_str}] [{acc.name} MTF-PENDING] {direction} — {reason}: {color_str} — signal queued, waiting for alignment")
                     continue
                 print(f"[{now_str}] [{acc.name} MTF-OK] {direction} — all 4 TFs agree: {color_str}")
             if acc.channel_filter and not (acc.reverse_mode or acc.trendline_mode or acc.bb_reversal_mode or acc.hvn_trail_mode):
@@ -3911,6 +3924,37 @@ class MultiAccountBot:
                             now_str = datetime.now(ET).strftime("%H:%M:%S")
                             print(f"[{now_str}] [{acc.name} HULL-SKIP] {pb['direction']} — "
                                   f"price moved ${profit_move:.0f} profit while waiting for Hull, skipping")
+                            acc._pending_pullback = None
+                    continue
+                if pb.get("mtf_pending_wait"):
+                    mtf = self.engine.get_mtf_alignment()
+                    colors = mtf["colors"]
+                    color_str = " | ".join(f"{tf}={c or 'doji'}" for tf, c in colors.items())
+                    pv = acc.pv
+                    ref_price = pb.get("original_signal", pb["signal_price"])
+                    if pb["direction"] == "SHORT":
+                        profit_move = (ref_price - price) * pv
+                    else:
+                        profit_move = (price - ref_price) * pv
+                    if profit_move >= DCA_TP_DOLLARS:
+                        now_str = datetime.now(ET).strftime("%H:%M:%S")
+                        print(f"[{now_str}] [{acc.name} MTF-EXPIRE] {pb['direction']} — "
+                              f"price moved ${profit_move:.0f} profit while waiting, signal expired")
+                        acc._pending_pullback = None
+                    elif time.time() - pb["time"] > 3600:
+                        now_str = datetime.now(ET).strftime("%H:%M:%S")
+                        print(f"[{now_str}] [{acc.name} MTF-EXPIRE] {pb['direction']} — "
+                              f"signal older than 1 hour, expired")
+                        acc._pending_pullback = None
+                    elif mtf["alignment"] == pb["direction"]:
+                        now_str = datetime.now(ET).strftime("%H:%M:%S")
+                        print(f"[{now_str}] [{acc.name} MTF-ALIGNED] {pb['direction']} — "
+                              f"all 4 TFs now agree: {color_str} — entering @ {price:.2f}")
+                        if pb["direction"] == "LONG":
+                            success = await acc.enter_long(price, pb["features"], pb["rl_idx"], pb["rl_params"], mss_level=pb.get("mss_level"))
+                        else:
+                            success = await acc.enter_short(price, pb["features"], pb["rl_idx"], pb["rl_params"], mss_level=pb.get("mss_level"))
+                        if success:
                             acc._pending_pullback = None
                     continue
                 if pb.get("filter_candle_wait"):
